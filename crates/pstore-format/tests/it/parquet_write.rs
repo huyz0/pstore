@@ -321,3 +321,42 @@ fn an_empty_page_is_a_file_of_no_rows_body() {
     assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
     assert_eq!(reader.get_row_iter(None).unwrap().count(), 0);
 }
+
+#[test]
+fn long_runs_of_one_level_read_back() {
+    within(long_runs_of_one_level_read_back_body);
+}
+
+/// Runs of a level past 63 take a two-byte header: 200 rows holding `a`, 100 not, and a
+/// vector of 150 floats a row (a repetition run of 149).
+fn long_runs_of_one_level_read_back_body() {
+    let docs: Vec<Document> = (0..300)
+        .map(|i| {
+            let mut d = Document::new(format!("d{i:05}"), (0..150).map(|k| k as f32).collect());
+            if i < 200 {
+                d.attrs.insert("a".to_owned(), Value::Int(i as i64));
+            }
+            d
+        })
+        .collect();
+    let (file, _) = write(&docs, &[DEFAULT_FIELD.to_owned()], &[], &json);
+    let reader = SerializedFileReader::new(bytes::Bytes::from(file)).unwrap();
+    let want: Vec<f32> = (0..150).map(|k| k as f32).collect();
+    let mut n = 0;
+    for (i, row) in reader.get_row_iter(None).unwrap().enumerate() {
+        let row = row.unwrap();
+        let got: BTreeMap<&String, &Field> = row.get_column_iter().collect();
+        let a = if i < 200 {
+            Field::Long(i as i64)
+        } else {
+            Field::Null
+        };
+        assert_eq!(got[&"a".to_owned()], &a, "row {i}");
+        match got[&DEFAULT_FIELD.to_owned()] {
+            Field::ListInternal(l) => assert_eq!(floats(l), want, "row {i}"),
+            other => panic!("row {i}: {other:?}"),
+        }
+        n += 1;
+    }
+    assert_eq!(n, 300);
+}
