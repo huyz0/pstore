@@ -822,14 +822,15 @@ async fn candidates<S: BlobStore + Clone>(
         let canonical = scope.as_ref().map(|_| format!("{f:?}"));
         for &(i, t, o) in items {
             if legs.iter().any(|(j, _)| runs(i, *j)) {
-                let key = scope.as_ref().zip(canonical.as_ref()).map(|(s, c)| {
-                    (
-                        s.tenant.clone(),
-                        t.segment.as_str().to_owned(),
-                        c.clone(),
-                    )
-                });
-                if let Some(hit) = scope.as_ref().zip(key.as_ref()).and_then(|(s, k)| s.cache.get(k)) {
+                let key = scope
+                    .as_ref()
+                    .zip(canonical.as_ref())
+                    .map(|(s, c)| (s.tenant.clone(), t.segment.as_str().to_owned(), c.clone()));
+                if let Some(hit) = scope
+                    .as_ref()
+                    .zip(key.as_ref())
+                    .and_then(|(s, k)| s.cache.get(k))
+                {
                     cached.push((i, hit));
                     continue;
                 }

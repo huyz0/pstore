@@ -968,8 +968,8 @@ impl<S: BlobStore + 'static> Api<S> {
         *self
             .masks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = (bytes > 0)
-            .then(|| Arc::new(pstore_query::masks::MaskCache::new(bytes)));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (bytes > 0).then(|| Arc::new(pstore_query::masks::MaskCache::new(bytes)));
     }
 
     /// The filter-mask cache its engines share (M234), if it keeps one.
@@ -4646,11 +4646,7 @@ async fn index_summary<S: BlobStore + 'static>(
         updated_at: s.written_ms.map(rfc3339_ms),
         approx_logical_bytes: s.bytes,
         read_only: s.read_only,
-        storage: StorageSettings::of(
-            s.storage,
-            engine.block_options(),
-            engine.has_mask_cache(),
-        ),
+        storage: StorageSettings::of(s.storage, engine.block_options(), engine.has_mask_cache()),
         progress: progress.map(|p| IndexProgress {
             status: if p.rows > 0 { "updating" } else { "up-to-date" },
             unindexed_rows: p.rows,

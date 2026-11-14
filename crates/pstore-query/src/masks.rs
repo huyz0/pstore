@@ -184,18 +184,18 @@ mod tests {
 
     #[test]
     fn the_least_recently_used_goes_first() {
-        // Room for three entries of 1,000 rows.
-        let c = MaskCache::new(cost(999, 1) * 3 + cost(999, 1) / 2);
-        for n in 0..3 {
+        // Room for eight entries of 1,000 rows, the most an eighth each allows.
+        let c = MaskCache::new(cost(999, 1) * 8 + cost(999, 1) / 2);
+        for n in 0..8 {
             c.insert(key(n), mask(999));
         }
-        assert_eq!(c.len(), 3);
+        assert_eq!(c.len(), 8);
         // Used: 0 is now newer than 1.
         assert!(c.get(&key(0)).is_some());
-        c.insert(key(3), mask(999));
-        assert_eq!(c.len(), 3);
+        c.insert(key(8), mask(999));
+        assert_eq!(c.len(), 8);
         assert!(c.get(&key(1)).is_none(), "the least recently used stays");
-        for n in [0, 2, 3] {
+        for n in [0, 2, 3, 4, 5, 6, 7, 8] {
             assert!(c.get(&key(n)).is_some(), "{n} evicted");
         }
         assert!(c.held() <= c.budget());

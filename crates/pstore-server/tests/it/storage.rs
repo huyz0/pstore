@@ -69,7 +69,10 @@ fn the_cluster_default_is_read_from_the_environment() {
     );
     // M234: the filter-mask cache's budget.
     let c = Config::from_vars(vars(&[("PSTORE_LANE", "1")])).unwrap();
-    assert_eq!(c.filter_cache_bytes, pstore_server::DEFAULT_FILTER_CACHE_BYTES);
+    assert_eq!(
+        c.filter_cache_bytes,
+        pstore_server::DEFAULT_FILTER_CACHE_BYTES
+    );
     for (v, want) in [("0", 0), ("1048576", 1 << 20)] {
         let c = Config::from_vars(vars(&[
             ("PSTORE_LANE", "1"),

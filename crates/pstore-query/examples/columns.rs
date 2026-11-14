@@ -443,7 +443,7 @@ async fn run(rows: usize) {
             field: pstore_format::DEFAULT_FIELD.to_owned(),
             query: vec![0.6, 0.8],
             limit: 10,
-            tune: pstore_index::Query::default(),
+            tune: pstore_index::vec_index::Query::default(),
         }];
         for (label, p) in predicates(rows, &docs) {
             let ask = |scope: Option<pstore_query::masks::Scope>| {
@@ -477,7 +477,11 @@ async fn run(rows: usize) {
             };
             let warm = fresh();
             let want = ask(None).await;
-            assert_eq!(ask(warm.clone()).await, want, "{label}: a miss answered otherwise");
+            assert_eq!(
+                ask(warm.clone()).await,
+                want,
+                "{label}: a miss answered otherwise"
+            );
             let mut cells = Vec::new();
             for arm in 0..3 {
                 let scope = || match arm {
@@ -486,7 +490,11 @@ async fn run(rows: usize) {
                     _ => warm.clone(),
                 };
                 let bytes0 = acct.bytes(tenant, OpClass::Read);
-                assert_eq!(ask(scope()).await, want, "{label}: arm {arm} answered otherwise");
+                assert_eq!(
+                    ask(scope()).await,
+                    want,
+                    "{label}: arm {arm} answered otherwise"
+                );
                 let moved = acct.bytes(tenant, OpClass::Read) - bytes0;
                 let mut times = Vec::with_capacity(RUNS);
                 for _ in 0..RUNS {

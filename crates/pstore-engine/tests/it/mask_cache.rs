@@ -17,7 +17,7 @@
 use pstore_blob::{Accounted, MemoryStore, OpClass, TenantView};
 use pstore_engine::{Engine, Storage};
 use pstore_format::{Document, Value};
-use pstore_index::Query;
+use pstore_index::vec_index::Query;
 use pstore_query::masks::MaskCache;
 use pstore_query::{Fusion, Op, Predicate, Prefetch};
 use pstore_types::{LaneId, TenantId};
@@ -147,7 +147,10 @@ async fn a_cached_mask_answers_as_a_computed_one() {
     let (_, first) = ask(&cs, &cached, 0.5, &every).await;
     let (_, second) = ask(&cs, &cached, 2.5, &every).await;
     let (_, plain_second) = ask(&ps, &plain, 2.5, &every).await;
-    assert!(second < first && second < plain_second, "{first} then {second}, plain {plain_second}");
+    assert!(
+        second < first && second < plain_second,
+        "{first} then {second}, plain {plain_second}"
+    );
 
     // The index overrides the cache off: the same shape of query reads as an uncached one.
     cached
@@ -160,11 +163,16 @@ async fn a_cached_mask_answers_as_a_computed_one() {
         .unwrap();
     let off = Predicate::Cmp("q".to_owned(), Op::Lt, Value::Int(7));
     let held = cache.len();
-    let (a1, _) = ask(&cs, &cached, 0.1, &off).await;
-    let (a2, with) = ask(&cs, &cached, 1.1, &off).await;
+    let (a1, first) = ask(&cs, &cached, 0.1, &off).await;
+    let (a2, again) = ask(&cs, &cached, 0.1, &off).await;
     let (b1, _) = ask(&ps, &plain, 0.1, &off).await;
-    let (b2, without) = ask(&ps, &plain, 1.1, &off).await;
-    assert_eq!((a1, a2), (b1, b2));
-    assert_eq!(with, without, "an index that opts out still read from the cache");
-    assert_eq!(cache.len(), held, "an index that opts out still filled the cache");
+    assert_eq!((&a1, &a2), (&b1, &b1));
+    // Its HEAD now holds the override, a few bytes more than the plain one's: compared with
+    // its own first query, the same query again reads every block again.
+    assert_eq!(again, first, "an index that opts out still read from the cache");
+    assert_eq!(
+        cache.len(),
+        held,
+        "an index that opts out still filled the cache"
+    );
 }
