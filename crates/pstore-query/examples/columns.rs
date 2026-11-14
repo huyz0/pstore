@@ -31,7 +31,9 @@
 
 use pstore_blob::{Accounted, BlobStore, Key, MemoryStore, OpClass};
 use pstore_format::{BlockOptions, Document, Projection, Segment, SegmentWriter, Value};
-use pstore_query::{Aggregate, AggregateSpec, Aggregator, Op, Predicate, Target};
+use pstore_query::{
+    Aggregate, AggregateSpec, Aggregator, Op, Order, OrderBy, Predicate, Selector, Target,
+};
 use pstore_types::TenantId;
 use std::time::Instant;
 
@@ -249,6 +251,45 @@ fn aggregations() -> Vec<(&'static str, AggregateSpec, Option<Predicate>)> {
             spec("c", Aggregate::Count(None)),
             Some(eq("category", Value::Str("cat-07".into()))),
         ),
+        // M233: shapes statistics never answer, so every block is decoded.
+        (
+            "sum(price) where customer = (one batch)",
+            spec("s", Aggregate::Sum("price".into())),
+            Some(eq("customer", Value::Str("cust-00100".into()))),
+        ),
+        (
+            "sum(price) by category (grouped)",
+            AggregateSpec {
+                labels: vec![("s".to_owned(), Aggregate::Sum("price".into()))],
+                group_by: vec![pstore_query::GroupKey::value("category")],
+                top_k: 50,
+            },
+            None,
+        ),
+    ]
+}
+
+/// The order-bys M233 measures: a top 10 by one key, unfiltered, under a selective filter and
+/// under one admitting every row.
+fn orders() -> Vec<(&'static str, Order, Option<Predicate>)> {
+    let by = |attr: &str, desc: bool| {
+        Order::from(OrderBy {
+            attr: attr.to_owned(),
+            desc,
+        })
+    };
+    vec![
+        ("top 10 by price desc", by("price", true), None),
+        (
+            "top 10 by price where category =",
+            by("price", false),
+            Some(eq("category", Value::Str("cat-07".into()))),
+        ),
+        (
+            "top 10 by rating where price >= 1 (all)",
+            by("rating", true),
+            Some(Predicate::Cmp("price".into(), Op::Gte, Value::Int(1))),
+        ),
     ]
 }
 
@@ -389,6 +430,42 @@ async fn run(rows: usize) {
                 "{label:<40} {gets:>5} {moved:>11} {:>10.3}  {:?}",
                 median(times),
                 answer[0].1
+            );
+        }
+        // M233: order-bys, through the same path.
+        println!(
+            "{:<40} {:>5} {:>11} {:>10}  first",
+            "order-by", "GETs", "bytes", "ms"
+        );
+        for (label, by, filter) in orders() {
+            let run = || async {
+                let mut s = Selector::new(by.clone(), 10);
+                pstore_query::select(
+                    &view,
+                    std::slice::from_ref(&target),
+                    filter.as_ref(),
+                    &none,
+                    &mut s,
+                )
+                .await
+                .expect("select");
+                s.into_sorted()
+            };
+            let gets0 = acct.count(tenant, OpClass::Read);
+            let bytes0 = acct.bytes(tenant, OpClass::Read);
+            let answer = run().await;
+            let gets = acct.count(tenant, OpClass::Read) - gets0;
+            let moved = acct.bytes(tenant, OpClass::Read) - bytes0;
+            let mut times = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let t = Instant::now();
+                assert_eq!(run().await, answer, "a run answered otherwise");
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!(
+                "{label:<40} {gets:>5} {moved:>11} {:>10.3}  {}",
+                median(times),
+                answer.first().map_or("", |d| d.id.as_str())
             );
         }
     }
