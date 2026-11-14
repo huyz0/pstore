@@ -18,6 +18,11 @@ its `Or` admitting always; `Count(attr)` counting rows; a block with a deleted r
 answered block also fetched; `Min`/`Max` extremes dropped; a grouped spec answered; a shadowed
 segment answered; the mixed-kind check dropped at build. No `cargo mutants` run is claimed.
 
+CI's `cargo mutants` on #58 timed out on `answers_block`'s `count() == 0` as `!=`: a block whose
+rows never hold the attribute was fetched rather than answered, the same answer at more bytes.
+`a_block_without_the_attribute_is_answered_and_one_without_its_zone_is_not` (`pstore-query`
+unit test) pins it, red under that mutant and green without it.
+
 1. `block_statistics_answer_what_the_rows_do`: green. 300 random filters plus 6 fixed, each
    under four specs (covered attributes, every attribute, `q`, `sparse`) and grouped by `s`,
    with and without rows held unfolded; deletes in two of three segments.

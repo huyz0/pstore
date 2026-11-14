@@ -1326,4 +1326,35 @@ mod tests {
         g.offer(&doc("z", Value::Int(1)));
         assert_eq!(g.finish()[0].1[0], Total::Int(8));
     }
+
+    /// A block whose rows never hold the attribute answers `Min` from its statistics, since
+    /// there is nothing to add; one holding it with no zone does not (M232, CI mutation
+    /// review: `count() == 0` as `!=` only fetched the empty block, and the suite timed out).
+    #[test]
+    fn a_block_without_the_attribute_is_answered_and_one_without_its_zone_is_not() {
+        let mut with = Document::new("a", vec![1.0]);
+        with.attrs.insert("p".to_owned(), Value::Int(3));
+        let without = Document::new("b", vec![1.0]);
+        let stats = std::sync::Arc::new(
+            pstore_format::aggregates::Aggregates::build(&[&[with][..], &[without][..]], 1 << 16)
+                .unwrap(),
+        );
+        let a = Aggregator::new(Spec {
+            labels: vec![("lo".to_owned(), Aggregate::Min("p".to_owned()))],
+            group_by: vec![],
+            top_k: 10,
+        });
+        let empty = pstore_format::Zones {
+            aggregates: Some((stats.clone(), 1)),
+            ..pstore_format::Zones::default()
+        };
+        assert!(a.answers_block(&empty));
+        let mut zoned = pstore_format::Zones {
+            aggregates: Some((stats, 0)),
+            ..pstore_format::Zones::default()
+        };
+        assert!(!a.answers_block(&zoned));
+        zoned.ints.insert("p".to_owned(), (3, 3));
+        assert!(a.answers_block(&zoned));
+    }
 }
