@@ -14,7 +14,9 @@ Parquet file (`application/vnd.apache.parquet`): `as_of` (default the present HE
 which the response names), `after` (the last id of the previous page), `limit` (rows, at most
 100,000, default 10,000) and `include_vectors`. A page is a whole Parquet file with one row
 group, so a client saves each and reads them as one dataset. The response's
-`x-pstore-epoch` and `x-pstore-next-after` (absent on the last page) drive the loop.
+`x-pstore-epoch` and `x-pstore-next-after` (absent on the last page) drive the loop; the file's
+metadata carries both too (`pstore.epoch`, `pstore.next_after`), so a generated client, which
+returns only the body, pages without headers.
 
 The file, written by a writer of our own in `pstore-format` (`parquet::write`, the reverse of
 M70's footer reader, no new runtime dependency):
@@ -25,24 +27,25 @@ M70's footer reader, no new runtime dependency):
   `TIMESTAMP(MICROS, UTC)`; `Uint` as `INT64` `UINT_64`; `Uuid` as
   `FIXED_LEN_BYTE_ARRAY(16)` `UUID`; anything else (bytes, arrays, mixed kinds) as
   `BYTE_ARRAY` `JSON`, the value as the API writes it.
-- With `include_vectors`, `vector` as a required list of `FLOAT`, and each named dense field
-  likewise (optional: a row may lack one).
+- With `include_vectors`, `vector` as an optional list of `FLOAT` (a row may lack it). A
+  named dense field holding one vector a row is written likewise under its name; one holding
+  several vectors a row is left out, and its name returned to the caller.
 - `PLAIN` encoding, uncompressed, v1 data pages, one page a column chunk; the file's
-  key-value metadata names the index, the epoch and the pstore version.
+  key-value metadata names the index and the epoch.
 
 Not delivered: writing to a customer's bucket (the client stores the pages), the sparse
-field, compression and dictionary encoding (a consumer compresses on rewrite).
+field, named vector fields through the endpoint (it exports the default field only), compression and dictionary encoding (a consumer compresses on rewrite).
 
 No setting: it is a request, and costs nothing when not asked.
 
 ## Acceptance criteria
 1. Read back by an independent reader: for seeded documents over every `Value` kind,
    absent attributes, mixed kinds under one name, empty strings, extreme ints, uint64 above
-   `i64::MAX`, `-0.0`, NaN, and vectors, the official `parquet` crate (a dev-dependency only)
+   `i64::MAX`, `-0.0`, and vectors (NaN is not a value: the API's JSON cannot carry one), the official `parquet` crate (a dev-dependency only)
    reads every page's schema and every value back as written.
 2. The loop: paging an index with deletes, a replacement and unfolded rows written after `E`
-   by `after` and `limit` returns, across all pages, exactly the rows M199's JSON export
-   returns at `E`, each once; the last page names no next.
+   by `after` and `limit` returns, across all pages, exactly the rows the index held at `E`,
+   each once, in id order, with their attributes; the last page names no next.
 3. Refusals by name: a `limit` of 0 or over 100,000, an `as_of` past the present or below the
    reap horizon, an absent index (`404`).
 4. Cost recorded in `VERIFIED.md` (`provisional`): bytes and time of a 10,000-row page at

@@ -8,6 +8,7 @@
 
 mod chunks;
 mod list;
+pub mod write;
 
 pub(crate) use chunks::decode_chunks;
 

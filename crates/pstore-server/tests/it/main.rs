@@ -59,6 +59,7 @@ mod named_dense;
 mod null_elements;
 mod numeric_scoring;
 mod openapi;
+mod parquet_export;
 mod order;
 mod order_keys;
 mod patch;

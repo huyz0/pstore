@@ -432,6 +432,94 @@
         }
       }
     },
+    "/v1/indexes/{index}/export.parquet": {
+      "get": {
+        "operationId": "export_parquet",
+        "summary": "One page of the index's rows at one epoch, in id order, as a Parquet file (M235). The epoch, and the next page's after when another follows, are in the file's key-value metadata (pstore.epoch, pstore.next_after) and the x-pstore-epoch and x-pstore-next-after headers.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000,
+              "default": 10000
+            },
+            "description": "The most rows the page holds."
+          },
+          {
+            "name": "include_vectors",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Include the default vector field as a list of floats."
+          },
+          {
+            "name": "as_of",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "The epoch to read; the present one by default. Pass the first page's epoch to every later page."
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Rows with an id after this one: the previous page's next_after."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/vnd.apache.parquet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/indexes/{index}/warm": {
       "post": {
         "operationId": "warm_index",
