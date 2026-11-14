@@ -18,6 +18,12 @@ were admitted; `Selector::would_keep` inverted and refusing a selector not yet f
 the `order` unit tests, which check the selector against a sort); an aggregation building no
 attribute; an order-by's first pass dropping the filter. No `cargo mutants` run is claimed.
 
+CI's `cargo mutants` on #58 found `visit_opened_at`'s `t.shadowed && !shadow.is_empty()` as `||`
+missed: no engine path pairs an unshadowed target with a non-empty shadow, so no engine test
+could tell. `the_shadow_hides_rows_only_in_a_shadowed_target` (`pstore-query` `tests/it/shadow.rs`)
+holds the visit's contract: red under that mutant (`d1` hidden in an unshadowed target), green
+without it.
+
 1. `late_materialization_answers_as_whole_rows_do`: green. 201 filters (none, and 200 random
    over `q`, `p`, `s`, `sparse` and the id, every op, under `And`, `Or`, `Not`), each through
    an ungrouped and a grouped aggregation, an order-by of two keys at two offsets, and a

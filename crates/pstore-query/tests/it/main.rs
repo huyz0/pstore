@@ -23,6 +23,7 @@ mod parallel_legs;
 mod parallel_masks;
 mod prefix;
 mod several_fields;
+mod shadow;
 mod sparse_rows;
 mod splittable;
 mod text_field;
