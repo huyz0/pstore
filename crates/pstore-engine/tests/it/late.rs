@@ -18,7 +18,8 @@ use pstore_blob::MemoryStore;
 use pstore_engine::{Consistency, Engine};
 use pstore_format::{BlockOptions, Document, Value};
 use pstore_query::{
-    Aggregate, AggregateSpec, Expr, GroupKey, ID_ATTRIBUTE, Op, Order, OrderBy, Predicate,
+    Aggregate, AggregateSpec, Aggregator, Expr, GroupKey, ID_ATTRIBUTE, Op, Order, OrderBy,
+    Predicate, Selector,
 };
 use pstore_types::{LaneId, TenantId};
 use std::sync::Arc;
@@ -54,6 +55,20 @@ fn doc(i: usize) -> Document {
         Value::Str(format!("tag-{i}-{}", "x".repeat(i % 9))),
     );
     d
+}
+
+/// The rows both engines hold once [`pair`] is done, by id: the model they are checked against.
+fn visible() -> std::collections::BTreeMap<String, Document> {
+    let mut rows: std::collections::BTreeMap<String, Document> =
+        (0..1520).map(doc).map(|d| (d.id.clone(), d)).collect();
+    rows.remove("d00007");
+    rows.remove("d00777");
+    for i in 40..90 {
+        let mut d = doc(i + 3_000);
+        d.id = format!("d{i:05}");
+        rows.insert(d.id.clone(), d);
+    }
+    rows
 }
 
 /// Two engines over two stores, given the same writes, deletes and unfolded rows: one sealing
@@ -158,18 +173,32 @@ async fn late_materialization_answers_as_whole_rows_do() {
         .chain((0..200).map(|_| Some(predicate(&mut r, 2))))
         .collect();
     let ev = Consistency::Eventual;
+    let model = visible();
     for f in &filters {
         let f = f.as_ref();
+        let admitted: Vec<&Document> = model
+            .values()
+            .filter(|d| f.is_none_or(|f| f.admits(&d.id, &d.attrs)))
+            .collect();
         for grouped in [false, true] {
             let a = late.aggregate_as("idx", spec(grouped), f, None, ev).await;
             let b = whole.aggregate_as("idx", spec(grouped), f, None, ev).await;
-            assert_eq!(
-                a.unwrap().groups,
-                b.unwrap().groups,
-                "grouped {grouped}: {f:?}"
-            );
+            let a = a.unwrap().groups;
+            assert_eq!(a, b.unwrap().groups, "grouped {grouped}: {f:?}");
+            let mut want = Aggregator::new(spec(grouped));
+            for d in &admitted {
+                want.offer(d);
+            }
+            assert_eq!(a, want.finish(), "model, grouped {grouped}: {f:?}");
         }
         for (offset, limit) in [(0, 7), (5, 30)] {
+            let mut want = Selector::new(order.clone(), offset + limit);
+            for d in &admitted {
+                let mut d = (*d).clone();
+                d.vectors.clear();
+                want.offer(d);
+            }
+            let want: Vec<Document> = want.into_sorted().into_iter().skip(offset).collect();
             let a = late
                 .ordered_as("idx", order.clone(), f, offset, limit, None, ev)
                 .await
@@ -179,6 +208,7 @@ async fn late_materialization_answers_as_whole_rows_do() {
                 .await
                 .unwrap();
             assert_eq!(a.rows, b.rows, "order {offset}+{limit}: {f:?}");
+            assert_eq!(a.rows, want, "model, order {offset}+{limit}: {f:?}");
             assert_eq!(a.unfolded, b.unfolded);
         }
         let a = late
