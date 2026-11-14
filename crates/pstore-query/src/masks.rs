@@ -217,14 +217,32 @@ mod tests {
             c.insert(key(n), mask(999));
         }
         assert_eq!(c.len(), 8);
-        // Held entries are not empty (CI's mutation review of #59: `is_empty` as `true` missed).
+        // Held entries are not empty, and what is held is what they cost (CI's mutation review
+        // of #59: `is_empty` as `true`, and an eviction's `held -= c` as `/=`, missed).
         assert!(!c.is_empty());
+        let held: usize = [1, 8, 9, 10, 11, 12, 13, 14]
+            .iter()
+            .map(|n| cost(999, *n))
+            .sum();
+        assert_eq!(c.held(), held);
         for n in [0, 2, 3, 4, 5, 6, 7] {
             assert!(c.get(&key(n)).is_none(), "{n} held");
         }
         for n in [1, 8, 9, 10, 11, 12, 13, 14] {
             assert!(c.get(&key(n)).is_some(), "{n} evicted");
         }
+    }
+
+    /// Entries that fill the budget exactly are all held (CI's mutation review of #59:
+    /// `held + cost > budget` as `>=` evicted one to make room it already had).
+    #[test]
+    fn entries_filling_the_budget_exactly_are_all_held() {
+        let c = MaskCache::new(cost(999, 1) * 8);
+        for n in 0..8 {
+            c.insert(key(n), mask(999));
+        }
+        assert_eq!(c.len(), 8);
+        assert_eq!(c.held(), c.budget());
     }
 
     #[test]
