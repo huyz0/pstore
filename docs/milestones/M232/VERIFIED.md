@@ -22,6 +22,11 @@ CI's `cargo mutants` on #58 timed out on `answers_block`'s `count() == 0` as `!=
 rows never hold the attribute was fetched rather than answered, the same answer at more bytes.
 `a_block_without_the_attribute_is_answered_and_one_without_its_zone_is_not` (`pstore-query`
 unit test) pins it, red under that mutant and green without it.
+The same run found `Rows::any_in`'s two bounds as `<=`, `must_admit`'s `And` and `Or` arms
+deleted, and the aggregation visit's `t.shadowed && !shadow.is_empty()` as `||` missed.
+`a_range_includes_its_start_and_excludes_its_end`, `and_and_or_admit_a_block_whole_as_their_clauses_do`
+and `an_aggregation_hides_shadowed_rows_only_in_a_shadowed_target` now pin them; each mutant was
+applied by a script, its test seen red, and reverted.
 
 1. `block_statistics_answer_what_the_rows_do`: green. 300 random filters plus 6 fixed, each
    under four specs (covered attributes, every attribute, `q`, `sparse`) and grouped by `s`,

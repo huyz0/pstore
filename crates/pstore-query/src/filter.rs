@@ -1785,4 +1785,35 @@ mod tests {
                 .is_empty()
         );
     }
+
+    /// `And` and `Or` admit a block whole exactly as their clauses do (M232, CI mutation
+    /// review of #58: either arm deleted only fetched the block, so no answer changed).
+    #[test]
+    fn and_and_or_admit_a_block_whole_as_their_clauses_do() {
+        let docs: Vec<pstore_format::Document> = [5, 7]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut d = pstore_format::Document::new(format!("d{i}"), vec![1.0]);
+                d.attrs.insert("p".to_owned(), Value::Int(*p));
+                d
+            })
+            .collect();
+        let stats = pstore_format::aggregates::Aggregates::build(&[&docs[..]], 1 << 16)
+            .map(std::sync::Arc::new);
+        let mut zones = Zones {
+            aggregates: stats.map(|s| (s, 0)),
+            ..Zones::default()
+        };
+        zones.ints.insert("p".to_owned(), (5, 7));
+        let yes = Predicate::Cmp("p".to_owned(), Op::Gte, Value::Int(5));
+        let no = Predicate::Cmp("p".to_owned(), Op::Lt, Value::Int(5));
+        assert!(yes.must_admit(&zones, 2) && !no.must_admit(&zones, 2));
+        let and = |a: &Predicate, b: &Predicate| Predicate::And(vec![a.clone(), b.clone()]);
+        let or = |a: &Predicate, b: &Predicate| Predicate::Or(vec![a.clone(), b.clone()]);
+        assert!(and(&yes, &yes).must_admit(&zones, 2));
+        assert!(!and(&yes, &no).must_admit(&zones, 2));
+        assert!(or(&no, &yes).must_admit(&zones, 2));
+        assert!(!or(&no, &no).must_admit(&zones, 2));
+    }
 }

@@ -15,7 +15,9 @@
 
 use pstore_blob::{BlobStore, Key, MemoryStore};
 use pstore_format::{Document, SegmentWriter, Value};
-use pstore_query::{OrderBy, Selector, Target, select_held};
+use pstore_query::{
+    Aggregate, AggregateSpec, Aggregator, OrderBy, Selector, Target, Total, aggregate, select_held,
+};
 use std::collections::HashSet;
 
 #[tokio::test]
@@ -58,5 +60,48 @@ async fn the_shadow_hides_rows_only_in_a_shadowed_target() {
             &["d0", "d1", "d2", "d3"]
         };
         assert_eq!(ids, want, "shadowed: {shadowed}");
+    }
+}
+
+/// The aggregation's late visit holds the same contract (CI's mutation review of #58: its
+/// `t.shadowed && !shadow.is_empty()` as `||` missed too). A count of a string attribute has no
+/// statistics, so every block is visited.
+#[tokio::test]
+async fn an_aggregation_hides_shadowed_rows_only_in_a_shadowed_target() {
+    let store = MemoryStore::new();
+    let key = Key::new("0000/seg/shadow-agg");
+    let mut w = SegmentWriter::new(8);
+    for i in 0..4 {
+        let mut d = Document::new(format!("d{i}"), vec![1.0]);
+        d.attrs.insert("s".to_owned(), Value::Str(format!("v{i}")));
+        w.push(d);
+    }
+    store.put(&key, w.finish()).await.unwrap();
+    let shadow: HashSet<String> = HashSet::from(["d1".to_owned()]);
+    for shadowed in [false, true] {
+        let target = Target {
+            segment_len: None,
+            centroids: None,
+            deleted: None,
+            sparse_dict: false,
+            text_dict: false,
+            fde_clusters: false,
+            shadowed,
+            segment: key.clone(),
+        };
+        let mut a = Aggregator::new(AggregateSpec {
+            labels: vec![("n".to_owned(), Aggregate::Count(Some("s".to_owned())))],
+            group_by: vec![],
+            top_k: 10,
+        });
+        aggregate(&store, &[target], None, &shadow, &mut a)
+            .await
+            .unwrap();
+        let want = if shadowed { 3 } else { 4 };
+        assert_eq!(
+            a.finish()[0].1,
+            vec![Total::Int(want)],
+            "shadowed: {shadowed}"
+        );
     }
 }
