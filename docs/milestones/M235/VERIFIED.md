@@ -64,4 +64,4 @@ setting: it is a request and costs nothing when not asked. `cargo deny`: licence
 pass with `parquet` (a dev-dependency only); advisories fail on three quinn advisories that
 fail identically on the parent branch.
 
-Gates, in a cloud container: GATES-PENDING
+Gates, in a cloud container: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast` (the two IPv6 peer tests this container cannot run skipped; nothing else failed), `scripts/clients.sh` (both generated clients, every fixture step), `scripts/depth.sh`, `check-links.sh`, `check-verified.py`, `gen-clients.py --check`, `check-slos.py`, `build-index.py --check` and `check-poison.sh` passed. The coverage floor is CI's full run.
