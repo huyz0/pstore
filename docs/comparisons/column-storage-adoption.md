@@ -159,6 +159,15 @@ query, **L** is a new format version with a compatibility story.
 | 5 | **Predicate-mask cache.** Segments are immutable, so `(segment key, predicate digest)` to `Mask` can never be stale. Cache the masks of recent filters in the existing node cache | ClickHouse query condition cache | **S to M** | A repeated filter (dashboards, paginated queries) skips zone checks and block decodes | Bounded bytes, charged to the memory reservations; nothing durable; correctness never depends on it |
 | 6 | **Parquet export** of an index's rows and attributes, for analytics engines | OpenSearch `parquet-data-format` writer settings; D-6's promised export path | **M** | Interoperability with DuckDB, Spark and DataFusion without a pstore client | Writes customer-owned objects; uses `arrow` and `parquet` crates, which `cargo deny` must accept |
 
+> ⚠️ **Corrected by M230** (item 1, measured). Item 1(a) is **unsound** and was not built: the
+> trigram sketch hashes only `Str` rows, but a string literal also equals a datetime or uuid
+> row by its spelling (M9h.3, M171), so a block whose match is such a row would be dropped.
+> Item 1(b) shipped as Bloom filters only, no `set(N)`: at the widths the spare budget allows
+> (256 to 512 bits) a filter answers the same blocks for fewer bytes. Measured at 20,000 rows
+> ([M230 VERIFIED](../milestones/M230/VERIFIED.md)): a clustered string equality reads 2 of 40
+> blocks (234 KB against 4.58 MB, mask 4.8 to 0.24 ms); uniform and random-rare values gain
+> nothing; a scattered `In` can cost more GETs (1 to 2) for far fewer bytes.
+
 ### Not recommended
 
 | Idea | Why not |

@@ -40,7 +40,10 @@ fn a_segment_without_floats_keeps_its_bytes() {
 }
 
 fn typed_segment() -> bytes::Bytes {
-    let mut w = SegmentWriter::new(2);
+    typed_segment_with(SegmentWriter::new(2))
+}
+
+fn typed_segment_with(mut w: SegmentWriter) -> bytes::Bytes {
     for (i, v) in [
         Value::Float(1.5),
         Value::Bool(true),
@@ -291,16 +294,18 @@ fn a_nested_array_does_not_decode() {
 #[test]
 fn a_typed_segment_without_datetimes_keeps_its_bytes() {
     // Recorded on 25e43b5, the commit before M9h.3: flag 1 and M9h.1's float tables, byte for
-    // byte, so a datetime table is never written for a segment that holds no datetime.
-    let b = typed_segment();
+    // byte, so a datetime table is never written for a segment that holds no datetime. Written
+    // without M230's equality section, which these bools would otherwise earn.
+    let b = typed_segment_with(SegmentWriter::new(2).without_equality_section_for_test());
     assert_eq!(fnv(&b), 3_636_883_691_723_148_763, "len {}", b.len());
 }
 
 #[test]
 fn a_dated_segment_without_uint64s_keeps_its_bytes() {
     // Recorded on 95b292f, the commit before M172: flag 2 and its float and datetime tables,
-    // byte for byte, so a uint64 table is never written for a segment that holds none.
-    let mut w = SegmentWriter::new(2);
+    // byte for byte, so a uint64 table is never written for a segment that holds none. Written
+    // without M230's equality section, which the string row would otherwise earn.
+    let mut w = SegmentWriter::new(2).without_equality_section_for_test();
     for (i, v) in [
         Value::DateTime(-5),
         Value::Float(2.5),

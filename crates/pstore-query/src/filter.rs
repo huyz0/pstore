@@ -706,8 +706,13 @@ impl Predicate {
                         Op::Gte => hi.is_some_and(Ordering::is_ge),
                     }
                 }),
+                // M230: an equality of a string or a bool, through the equality section.
                 None => match want {
-                    Value::Str(s) => could_hold_string(zones, name, *op, s),
+                    Value::Str(s) => {
+                        could_hold_string(zones, name, *op, s)
+                            && (*op != Op::Eq || may_equal(zones, name, want))
+                    }
+                    Value::Bool(_) if *op == Op::Eq => may_equal(zones, name, want),
                     _ => true,
                 },
             },
@@ -786,6 +791,15 @@ fn tokens_match(op: TokenOp, b: &Bound, elems: &[&str]) -> bool {
         TokenOp::AllPrefix => query.iter().all(has) && (b.prefix.is_none() || prefixed()),
         TokenOp::AnyPrefix => query.iter().any(has) || prefixed(),
     }
+}
+
+/// Whether the block's equality section (M230) leaves room for a row of `name` equal to
+/// `want`: `true` without one.
+fn may_equal(zones: &Zones, name: &str, want: &Value) -> bool {
+    zones
+        .equality
+        .as_ref()
+        .is_none_or(|(e, b)| e.may_equal(name, *b, want))
 }
 
 /// Whether a row holding `name` could satisfy `name op s` for a string literal (M9h.3).

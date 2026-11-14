@@ -18,6 +18,7 @@
 mod codec;
 pub mod datetime;
 mod docs;
+pub mod equality;
 pub mod external;
 pub mod fde;
 pub mod geo;
@@ -132,6 +133,13 @@ pub enum Section {
     /// ⚠️ **Absent means the segment predates it** when the segment has a sparse field: a
     /// projection of that field over such a segment is refused, never answered as empty.
     SparseRows = 17,
+    /// The equality section (M230): per block, a Bloom filter per string attribute and two
+    /// bits per bool attribute, in the meta region so the open round reads it. See
+    /// [`equality::Equality`].
+    ///
+    /// ⚠️ **Absent means nothing is filtered**: every segment before M230, and every one whose
+    /// block index and trigram sketch left no room. It prunes nothing.
+    Equality = 18,
 }
 
 /// Where the third and later dense fields' vector sections are numbered from (M61): field `k`
@@ -1022,6 +1030,8 @@ pub struct Zones {
     pub complete: bool,
     /// The segment's trigram sketch and this block's place in it (M15.2), when it has one.
     pub sketch: Option<(std::sync::Arc<trigram::Sketch>, usize)>,
+    /// The segment's equality section and this block's place in it (M230), when it has one.
+    pub equality: Option<(std::sync::Arc<equality::Equality>, usize)>,
 }
 
 impl Zones {

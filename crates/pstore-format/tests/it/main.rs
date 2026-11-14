@@ -8,6 +8,7 @@
 
 mod analyzer;
 mod corrupt;
+mod equality;
 mod external;
 mod fde;
 mod fields;

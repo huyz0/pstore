@@ -27,6 +27,8 @@ pub struct SegmentWriter {
     write_text_fields: bool,
     text_fields: Vec<String>,
     trigram_attrs: Vec<String>,
+    /// Whether the equality section (M230) is written; cleared only by a test.
+    write_equality: bool,
     rows_per_block: usize,
     /// Whether sealed blocks carry zone maps. Cleared only by [`Self::seal_segment`]'s
     /// fallback, for a segment whose integer attribute names cannot fit the index.
@@ -66,6 +68,7 @@ impl SegmentWriter {
             write_fields: true,
             write_text_fields: true,
             trigram_attrs: Vec::new(),
+            write_equality: true,
             text_fields: Vec::new(),
             rows_per_block: rows_per_block.max(1),
             zone_maps: true,
@@ -151,6 +154,14 @@ impl SegmentWriter {
         names.sort();
         names.dedup();
         self.trigram_attrs = names;
+        self
+    }
+
+    /// Emits a segment with **no** `Equality` section, as one written before M230.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_equality_section_for_test(mut self) -> Self {
+        self.write_equality = false;
         self
     }
 
@@ -702,6 +713,29 @@ impl SegmentWriter {
                 Vec::new()
             }
         };
+        // M230: the equality section takes what the index and the sketch left, less its own
+        // directory entry, so it never coarsens a block nor narrows the sketch.
+        let equality = if self.write_equality {
+            let used = idx.len()
+                + if sketch.is_empty() {
+                    0
+                } else {
+                    ENTRY + sketch.len()
+                };
+            let spare = target.saturating_sub(used).saturating_sub(ENTRY);
+            let chunks: Vec<&[Document]> = docs.chunks(self.rows_per_block).collect();
+            crate::equality::Equality::build(self.blocks.len(), spare, |b| {
+                chunks
+                    .get(b)
+                    .into_iter()
+                    .flat_map(|rows| rows.iter())
+                    .flat_map(|d| d.attrs.iter().map(|(k, v)| (k.as_str(), v)))
+            })
+            .map(|e| e.encode())
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut out = self.body;
         for (id, body) in &bodies {
             dir.push((*id, out.len() as u64, body.len() as u64));
@@ -744,6 +778,9 @@ impl SegmentWriter {
         }
         if !sketch.is_empty() {
             inline.push((Section::TrigramSketch, &sketch));
+        }
+        if !equality.is_empty() {
+            inline.push((Section::Equality, &equality));
         }
         inline.push((Section::Blocks, &idx.0));
         for (section, bytes) in &inline {
@@ -793,6 +830,11 @@ impl SegmentWriter {
                     0
                 } else {
                     ENTRY + sketch.len()
+                }
+                + if equality.is_empty() {
+                    0
+                } else {
+                    ENTRY + equality.len()
                 },
             "the overhead above is wrong"
         );
