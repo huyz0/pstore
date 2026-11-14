@@ -66,4 +66,4 @@ stats_alloc   = "0.1.10"
 # M15: the regex oracle a pattern filter is checked against.
 regex         = { version = "1", default-features = false, features = ["std", "unicode"] }
 # M235: the reference reader an exported page must open.
-parquet       = { version = "60.1.0", default-features = false }
+parquet       = { version = "60.1.0", default-features = false, features = ["json"] }

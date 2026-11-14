@@ -4553,9 +4553,10 @@ async fn export_parquet<S: BlobStore + 'static>(
     };
     let engine = api.engine(tenant).await;
     let epoch = match params.get("as_of") {
-        Some(v) => pstore_types::Epoch(v.parse::<u64>().map_err(|_| {
-            ApiError::bad_request(format!("as_of is an epoch, not {v:?}"))
-        })?),
+        Some(v) => pstore_types::Epoch(
+            v.parse::<u64>()
+                .map_err(|_| ApiError::bad_request(format!("as_of is an epoch, not {v:?}")))?,
+        ),
         None => engine.index_stats_at(&index).await?.0,
     };
     let after = params.get("after").map(|a| {
@@ -4608,9 +4609,8 @@ async fn export_parquet<S: BlobStore + 'static>(
     if let Some(n) = &next {
         meta.push(("pstore.next_after".to_owned(), n.clone()));
     }
-    let (file, _) = pstore_format::parquet::write::write(&rows, &fields, &meta, &|v| {
-        to_json(v).to_string()
-    });
+    let (file, _) =
+        pstore_format::parquet::write::write(&rows, &fields, &meta, &|v| to_json(v).to_string());
     let mut res = axum::response::Response::new(axum::body::Body::from(file));
     let h = res.headers_mut();
     h.insert(

@@ -54,7 +54,7 @@ async fn ok(api: &A, method: &str, uri: &str, body: &Value) -> Value {
 fn attrs(i: usize) -> Map<String, Value> {
     let mut a = Map::new();
     a.insert("n".into(), json!(i * 3));
-    if i % 4 != 0 {
+    if !i.is_multiple_of(4) {
         a.insert("s".into(), json!(format!("s{}", i % 7)));
     }
     a
@@ -64,7 +64,7 @@ async fn put(api: &A, ids: impl Iterator<Item = usize>, deletes: &[&str]) -> u64
     let documents: Vec<Value> = ids
         .map(|i| json!({"id": format!("d{i:05}"), "vector": [i as f32, 1.0], "attributes": attrs(i)}))
         .collect();
-    let mut body = json!({"durability": "durable", "documents": documents});
+    let mut body = json!({"durability": "durable", "distance_metric": "euclidean_squared", "documents": documents});
     if !deletes.is_empty() {
         body["deletes"] = json!(deletes);
     }
@@ -84,8 +84,19 @@ struct Page {
 }
 
 async fn page(api: &A, query: &str) -> Page {
-    let (s, h, b) = send(api, "GET", &format!("/v1/indexes/x/export.parquet?{query}"), &Value::Null).await;
-    assert_eq!(s, StatusCode::OK, "{query}: {}", String::from_utf8_lossy(&b));
+    let (s, h, b) = send(
+        api,
+        "GET",
+        &format!("/v1/indexes/x/export.parquet?{query}"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "{query}: {}",
+        String::from_utf8_lossy(&b)
+    );
     assert_eq!(h["content-type"], "application/vnd.apache.parquet");
     let reader = SerializedFileReader::new(b).unwrap();
     let meta = reader
@@ -148,7 +159,7 @@ async fn the_parquet_export_pages_one_epoch() {
     assert_eq!(now.rows["d00101"]["vector"], json!([101.0, 1.0]));
 
     // Rows written and not yet folded are past any epoch an export reads.
-    let unfolded = json!({"durability": "batched", "documents": [
+    let unfolded = json!({"durability": "batched", "distance_metric": "euclidean_squared", "documents": [
         {"id": "d00005", "vector": [0.0, 0.0], "attributes": {"n": -1}},
         {"id": "d00200", "vector": [0.0, 0.0]},
     ]});
@@ -168,8 +179,10 @@ async fn the_parquet_export_pages_one_epoch() {
     for (i, id) in want.iter().enumerate() {
         assert_eq!(rows[id], attrs(i), "{id}");
     }
-    assert!(!rows["d00003"].contains_key("vector"), "no vectors unless asked");
-
+    assert!(
+        !rows["d00003"].contains_key("vector"),
+        "no vectors unless asked"
+    );
 
     // An exact last page says no next page.
     let exact = page(&api, &format!("limit=25&as_of={first}")).await;
@@ -183,7 +196,13 @@ async fn the_parquet_export_pages_one_epoch() {
         ("as_of=soon", StatusCode::BAD_REQUEST),
         ("as_of=1000000", StatusCode::BAD_REQUEST),
     ] {
-        let (s, _, b) = send(&api, "GET", &format!("/v1/indexes/x/export.parquet?{q}"), &Value::Null).await;
+        let (s, _, b) = send(
+            &api,
+            "GET",
+            &format!("/v1/indexes/x/export.parquet?{q}"),
+            &Value::Null,
+        )
+        .await;
         assert_eq!(s, want, "{q}: {}", String::from_utf8_lossy(&b));
     }
     let (s, _, _) = send(&api, "GET", "/v1/indexes/nope/export.parquet", &Value::Null).await;

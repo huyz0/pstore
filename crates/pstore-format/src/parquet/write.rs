@@ -173,26 +173,25 @@ impl Thrift {
     }
 }
 
+/// Writes a column's logical type into its schema element.
+type Logical = Box<dyn Fn(&mut Thrift)>;
+
 /// Levels as the RLE/bit-packing hybrid, runs only, behind their 4-byte length.
 fn levels(out: &mut Vec<u8>, values: &[u8], max: u8) {
     let width = 8 - max.leading_zeros() as usize;
     let mut body = Vec::new();
-    let mut i = 0;
-    while i < values.len() {
-        let v = values[i];
-        let run = values[i..].iter().take_while(|x| **x == v).count();
-        let mut header = (run as u64) << 1;
+    for run in values.chunk_by(|a, b| a == b) {
+        let Some(&v) = run.first() else { continue };
+        let mut header = (run.len() as u64) << 1;
         while header >= 0x80 {
             body.push((header as u8) | 0x80);
             header >>= 7;
         }
         body.push(header as u8);
-        body.extend(std::iter::repeat_n(0, width.div_ceil(8)));
+        // A level is at most 8 bits wide: its run's value is one byte, or none at width 0.
         if width > 0 {
-            let at = body.len() - width.div_ceil(8);
-            body[at] = v;
+            body.push(v);
         }
-        i += run;
     }
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
     out.extend_from_slice(&body);
@@ -330,7 +329,7 @@ pub fn write(
         count: rows.len(),
     });
 
-    for name in names {
+    for &name in &names {
         let kind = Kind::of(rows.iter().filter_map(|d| d.attrs.get(name)));
         let mut def = Vec::with_capacity(rows.len());
         let mut values = Vec::new();
@@ -376,12 +375,12 @@ pub fn write(
         if kind == Kind::Bool {
             values = vec![0u8; bools.len().div_ceil(8)];
             for (i, b) in bools.iter().enumerate() {
-                if *b {
-                    values[i / 8] |= 1 << (i % 8);
+                if let (true, Some(byte)) = (*b, values.get_mut(i / 8)) {
+                    *byte |= 1 << (i % 8);
                 }
             }
         }
-        let (physical, length, converted, logical): (i32, Option<i32>, Option<i32>, Box<dyn Fn(&mut Thrift)>) =
+        let (physical, length, converted, logical): (i32, Option<i32>, Option<i32>, Logical) =
             match kind {
                 Kind::Int => (INT64, None, None, Box::new(|_: &mut Thrift| {})),
                 Kind::Double => (DOUBLE, None, None, Box::new(|_: &mut Thrift| {})),

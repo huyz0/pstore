@@ -47,7 +47,7 @@ fn rows(n: usize, seed: u64) -> Vec<Document> {
             }
             if r.below(3) == 0 {
                 d.vectors.insert(
-                    "named".to_owned(),
+                    "named".to_owned().into(),
                     VectorField::Dense(vec![vec![i as f32 * 0.25; 4]]),
                 );
             }
@@ -64,8 +64,9 @@ fn rows(n: usize, seed: u64) -> Vec<Document> {
             );
             put(
                 "float",
-                Value::Float([-0.0, 0.1, f64::MAX, f64::MIN_POSITIVE, i as f64 / 3.0]
-                    [r.below(5) as usize]),
+                Value::Float(
+                    [-0.0, 0.1, f64::MAX, f64::MIN_POSITIVE, i as f64 / 3.0][r.below(5) as usize],
+                ),
                 &mut r,
             );
             put("bool", Value::Bool(r.below(2) == 0), &mut r);
@@ -169,7 +170,12 @@ fn a_page_reads_back_through_the_parquet_crate() {
         };
         let kinds: BTreeMap<&str, Kind> = names
             .iter()
-            .map(|&name| (name, Kind::of(docs.iter().filter_map(|d| d.attrs.get(name)))))
+            .map(|&name| {
+                (
+                    name,
+                    Kind::of(docs.iter().filter_map(|d| d.attrs.get(name))),
+                )
+            })
             .collect();
         if n >= 37 {
             assert_eq!(kinds["mixed"], Kind::Json);
@@ -195,7 +201,12 @@ fn a_page_reads_back_through_the_parquet_crate() {
                     }
                     continue;
                 }
-                assert_eq!(f, &want(kinds[name], d.attrs.get(name)), "{name} of {}", d.id);
+                assert_eq!(
+                    f,
+                    &want(kinds[name], d.attrs.get(name)),
+                    "{name} of {}",
+                    d.id
+                );
             }
             for field in &fields {
                 let f = got[field];
@@ -217,7 +228,7 @@ fn a_page_reads_back_through_the_parquet_crate() {
 fn a_field_of_several_vectors_a_row_is_left_out_by_name() {
     let mut docs = rows(5, 9);
     docs[2].vectors.insert(
-        "multi".to_owned(),
+        "multi".to_owned().into(),
         VectorField::Dense(vec![vec![1.0, 2.0], vec![3.0, 4.0]]),
     );
     let fields = vec![DEFAULT_FIELD.to_owned(), "multi".to_owned()];
@@ -246,7 +257,11 @@ fn a_field_named_as_an_attribute_is_left_out_by_name() {
         .iter()
         .map(|c| c.path().string())
         .collect();
-    assert_eq!(names.iter().filter(|n| *n == DEFAULT_FIELD).count(), 1, "{names:?}");
+    assert_eq!(
+        names.iter().filter(|n| *n == DEFAULT_FIELD).count(),
+        1,
+        "{names:?}"
+    );
 }
 
 #[test]
