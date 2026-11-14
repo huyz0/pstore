@@ -168,9 +168,15 @@ impl Equality {
                 .copied()
                 .filter(|(_, most)| most * 4 <= bits as usize)
                 .collect();
-            while !chosen.is_empty() && 16 + bools_len + string_len(bits, &chosen) > spare {
-                chosen.pop();
-            }
+            // The most of them that fit, fewest values first. A count, not a popping loop: a
+            // loop's condition inverted never ends, and a mutant that hangs is not measured.
+            let fit = (0..=chosen.len())
+                .rev()
+                .find(|&k| {
+                    16 + bools_len + string_len(bits, chosen.get(..k).unwrap_or_default()) <= spare
+                })
+                .unwrap_or(0);
+            chosen.truncate(fit);
             if !chosen.is_empty() {
                 let mut out = Self {
                     bits,

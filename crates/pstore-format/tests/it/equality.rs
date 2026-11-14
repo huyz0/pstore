@@ -254,3 +254,32 @@ fn a_section_round_trips_and_a_truncated_one_is_refused() {
     assert!(built.may_equal("other", 2, &s("x")));
     assert!(built.may_equal("s", 2, &Value::Int(1)));
 }
+
+#[test]
+fn a_section_that_fits_its_budget_exactly_is_kept() {
+    let blocks: Vec<Vec<(String, Value)>> = (0..6)
+        .map(|b| {
+            vec![
+                ("s".into(), Value::Str(format!("v{b}"))),
+                ("b".into(), Value::Bool(b % 2 == 0)),
+            ]
+        })
+        .collect();
+    let build = |spare: usize| {
+        Equality::build(blocks.len(), spare, |b| {
+            blocks[b].iter().map(|(k, v)| (k.as_str(), v))
+        })
+    };
+    let widest = build(usize::MAX).unwrap();
+    assert!(
+        !widest.may_equal("s", 0, &Value::Str("v1".into())),
+        "s is filtered"
+    );
+    let len = widest.encoded_len();
+    assert_eq!(
+        build(len),
+        Some(widest.clone()),
+        "a budget of exactly its length keeps it"
+    );
+    assert_ne!(build(len - 1), Some(widest), "one byte less cannot");
+}
