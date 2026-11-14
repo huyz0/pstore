@@ -65,3 +65,5 @@ pass with `parquet` (a dev-dependency only); advisories fail on three quinn advi
 fail identically on the parent branch.
 
 Gates, in a cloud container: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast` (the two IPv6 peer tests this container cannot run skipped; nothing else failed), `scripts/clients.sh` (both generated clients, every fixture step), `scripts/depth.sh`, `check-links.sh`, `check-verified.py`, `gen-clients.py --check`, `check-slos.py`, `build-index.py --check` and `check-poison.sh` passed. The coverage floor is CI's full run.
+
+A local `cargo mutants` over the M235 diff tested 94 mutants of `parquet/write.rs` against `pstore-format`'s tests: 92 caught and 2 unviable. It also tested `export_parquet`'s 7 mutants against the server's parquet test: 6 caught and 1 missed. The missed one was `rows.len() > limit` mutated to `>=`. The "exact last page" check used the default limit, which is far above 25 rows, so the last page was never exact. That check now uses `limit=25`; under the mutant it is red, with a next cursor of `d00024`, and without the mutant it is green.

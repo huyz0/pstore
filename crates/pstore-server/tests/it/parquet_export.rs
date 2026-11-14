@@ -184,8 +184,10 @@ async fn the_parquet_export_pages_one_epoch() {
         "no vectors unless asked"
     );
 
-    // An exact last page says no next page.
-    let exact = page(&api, &format!("as_of={first}")).await;
+    // An exact last page says no next page: as many rows as the limit and none after
+    // (mutation review: the default limit is far past 25, so this asked nothing, and
+    // `rows.len() > limit` as `>=` survived).
+    let exact = page(&api, &format!("limit=25&as_of={first}")).await;
     assert_eq!((exact.rows.len(), exact.next), (25, None));
     assert!(!exact.meta.contains_key("pstore.next_after"));
 
