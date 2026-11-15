@@ -5713,10 +5713,12 @@ fn created_schema(
         if name == pstore_format::DEFAULT_FIELD {
             continue;
         }
-        if let Some(t) = ty
-            .as_str()
-            .filter(|t| t.starts_with('[') && t.contains(']'))
-        {
+        // `[N]kind`, a width and not `[]string`'s empty brackets.
+        if let Some(t) = ty.as_str().filter(|t| {
+            t.strip_prefix('[')
+                .and_then(|r| r.split_once(']'))
+                .is_some_and(|(n, _)| n.parse::<u32>().is_ok())
+        }) {
             return Err(bad(format!(
                 "{name:?} is declared {t}; a named vector field is declared by the write that \
                  first carries it"

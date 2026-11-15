@@ -44,3 +44,13 @@ mutation reverted. No `cargo mutants` run is claimed for them. All were killed.
   records any analyzer, declaration or further text field now fails it.
 - `cargo test -p pstore-server --test it -- create:: tokenizers:: group_expanded::
   analyzer::`: 38 passed, 0 failed, after the fixes.
+
+## After CI's mutation shard (PR #63)
+
+- Three mutants in `created_schema` were MISSED: `&&` to `||` in the named-vector check, the
+  `"f32"` arm deleted, and the no-dims guard made `false`. The named-vector check now reads
+  a width between the brackets (`[2]f16`, not `[]string`, which the write's parser refuses
+  with its own message). `created_schema_refusals_match_writes` adds a `[2]f32` create
+  accepted with no `vector_types`, a `"[]string"` string refused by the write's parser, and
+  a no-dims refusal. Red against d718c28 (the `[]string` case); each of the three mutants,
+  and the new check made always true, applied by a script: killed.
