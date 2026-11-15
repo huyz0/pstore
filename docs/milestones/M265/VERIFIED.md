@@ -59,3 +59,6 @@ claimed. All seven were killed.
   bounded read caches a HEAD, a compaction and GC reap its segments, and the next read
   succeeds with one fresh HEAD read. An unknown text field on a fresh HEAD fails after one read,
   with no retry. Each mutant, applied by hand, turns it red.
+- Shard 9: `patterns > MAX_PATTERNS` in `computed_expression` replaced by `==` and by `>=` were
+  missed. `computed_attributes_refusals` now asks for an `Or` of 16 globs, which is answered,
+  and of 17, which is refused naming "16 patterns". Each mutant, applied by hand, turns it red.

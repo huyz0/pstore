@@ -388,6 +388,19 @@ async fn computed_attributes_refusals() {
         256,
         "{b}"
     );
+    // M265 (CI's mutation shard): an expression's filters hold at most 16 patterns, as a
+    // scoring rank_by's do -- 16 answered, 17 refused.
+    let globs = |n: usize| {
+        let any: Vec<Value> = (0..n)
+            .map(|i| json!(["kind", "Glob", format!("{i}*")]))
+            .collect();
+        json!({"vector": v, "top_k": 1, "compute_attributes": {"g": ["Or", any]}})
+    };
+    let (s, b) = send(&api, "POST", "/v1/indexes/docs/query", &globs(16)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = send(&api, "POST", "/v1/indexes/docs/query", &globs(17)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("16 patterns"), "{b}");
     // A BM25 clause over a field that is not full-text: refused by the engine, from HEAD.
     let (s, b) = send(
         &api,
