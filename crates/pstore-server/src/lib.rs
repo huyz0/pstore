@@ -3055,8 +3055,8 @@ async fn query_index<S: BlobStore + 'static>(
                 }
                 Some((freq, _)) => {
                     // ⚠️ Together, never one after the other: depth is the deeper of the two
-                    // (M65). M131: and from one snapshot, unless the query reads a past epoch;
-                    // planned inside, so a pinned retry can run both again.
+                    // (M65). M131: and from one snapshot, a past epoch's too (M236); planned
+                    // inside, so a pinned retry can run both again.
                     let (req, freq, token, peers, engine, index) =
                         (&req, &freq, &token, peers.as_ref(), &engine, index.as_str());
                     let both = move || async move {
@@ -3064,10 +3064,8 @@ async fn query_index<S: BlobStore + 'static>(
                         let beside = run(engine, index, freq, crate::plan(freq)?, token, None);
                         futures_util::future::try_join(ranked, beside).await
                     };
-                    let both = match pinnable(std::slice::from_ref(req), token)? {
-                        Some(level) => engine.pinned(index, level, both).await,
-                        None => both().await,
-                    };
+                    let level = pinnable(std::slice::from_ref(req), token)?;
+                    let both = engine.pinned(index, level, both).await;
                     let (got, faceted) = api.requesting(tenant, both).await?;
                     (got, Some(faceted))
                 }
@@ -3115,13 +3113,13 @@ async fn query_index<S: BlobStore + 'static>(
     // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
     let peers: Vec<Option<peers::QueryPeers>> =
         reqs.iter().map(|r| api.query_peers(tenant, r)).collect();
-    // M131: every leg from one snapshot when they share a level and none reads a past epoch.
+    // M131, M236: every leg from one snapshot, at the strongest live leg's level; a query's
+    // facets with it.
     let whole = pinnable(&reqs, &token)?;
     // Planned again inside, so a pinned retry (M131) can run every leg once more.
     let all = {
         let (reqs, facet_reqs, peers, engine, index, token) =
             (&reqs, &facet_reqs, &peers, &engine, &index, &token);
-        let pinned_whole = whole.is_some();
         move || {
             futures_util::future::try_join_all(reqs.iter().zip(facet_reqs).zip(peers).map(
                 move |((req, facet), p)| async move {
@@ -3138,24 +3136,12 @@ async fn query_index<S: BlobStore + 'static>(
                             }
                         }
                     };
-                    // M164: a request not pinned as a whole still pins each query to its
-                    // facets, as `query_index` pins a faceted query alone.
-                    let own = match facet {
-                        Some(_) if !pinned_whole => pinnable(std::slice::from_ref(req), token)?,
-                        _ => None,
-                    };
-                    match own {
-                        Some(level) => engine.pinned(index, level, pair).await,
-                        None => pair().await,
-                    }
+                    pair().await
                 },
             ))
         }
     };
-    let got = match whole {
-        Some(level) => engine.pinned(&index, level, all).await,
-        None => all().await,
-    };
+    let got = engine.pinned(&index, whole, all).await;
     let got = api.requesting(tenant, got).await?;
     // From the sub-queries' own tokens, never the request's: each already carries it, less
     // the entries its HEAD covers, and merging the request's back would restore them.
@@ -4018,25 +4004,34 @@ fn engine_level(level: Level, token: &session::Token) -> pstore_engine::Consiste
     }
 }
 
-/// The level a request's legs share, when they can run from one snapshot (M131): every leg
-/// at one engine level -- `session` mapped, a `bounded` tolerance part of it -- and none
-/// `as_of` an epoch. `None` runs each leg on its own, as before.
+/// The level a request's legs run pinned at (M131, M236): the strongest of its live legs'
+/// engine levels -- `session` mapped, a smaller `bounded` tolerance the stronger -- which
+/// keeps every live leg's promise. A leg `as_of` an epoch reads the snapshot's history and
+/// adds no level; a request of only such legs pins at `eventual`, a fresh HEAD.
 fn pinnable(
     reqs: &[QueryRequest],
     token: &session::Token,
-) -> Result<Option<pstore_engine::Consistency>, ApiError> {
+) -> Result<pstore_engine::Consistency, ApiError> {
     let mut shared = None;
     for req in reqs {
-        if req.as_of.is_some() {
-            return Ok(None);
-        }
         let level = engine_level(level(req)?, token);
-        if shared.is_some_and(|s| s != level) {
-            return Ok(None);
+        if req.as_of.is_none() {
+            shared = Some(strongest(shared, level));
         }
-        shared = Some(level);
     }
-    Ok(shared)
+    Ok(shared.unwrap_or(pstore_engine::Consistency::Eventual))
+}
+
+/// The stronger of `held` and `level` (M236), [`pstore_engine::Consistency::covers`] being a
+/// total order.
+fn strongest(
+    held: Option<pstore_engine::Consistency>,
+    level: pstore_engine::Consistency,
+) -> pstore_engine::Consistency {
+    match held {
+        Some(held) if held.covers(level) => held,
+        _ => level,
+    }
 }
 
 /// Checks a served answer against the session token and returns the token to send back

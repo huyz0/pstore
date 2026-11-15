@@ -616,6 +616,21 @@ pub enum Consistency {
     Bounded(std::time::Duration),
 }
 
+impl Consistency {
+    /// Whether a snapshot taken at `self` keeps the promise of a read at `leg` (M236): `strong`
+    /// keeps every level's, a fresh `eventual` HEAD keeps any `bounded` one's, and a `bounded`
+    /// HEAD keeps a looser tolerance's. A total order, so a request's strongest level keeps
+    /// every leg's.
+    #[must_use]
+    pub fn covers(self, leg: Self) -> bool {
+        match (self, leg) {
+            (Self::Strong, _) | (Self::Eventual, Self::Eventual | Self::Bounded(_)) => true,
+            (Self::Bounded(held), Self::Bounded(asked)) => held <= asked,
+            _ => false,
+        }
+    }
+}
+
 /// What a process has flushed and not yet seen folded (M9i.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unfolded {
@@ -2354,6 +2369,11 @@ struct Pin {
     index: String,
     consistency: Consistency,
     fetched: Fetched,
+    /// Whether `fetched` read HEAD for this request, not from the `bounded` cache: only then
+    /// is its history what an `as_of` read now would find (M236).
+    history: bool,
+    /// The strong legs' one verdict on the lanes, taken by the first to ask (M236).
+    settle: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 /// A query's HEAD and the unfolded rows consistent with it.
@@ -7152,8 +7172,11 @@ impl<S: BlobStore> Engine<S> {
 
     /// Runs `f` with every live read of `index` at `consistency` inside it served from one
     /// snapshot (M131): one HEAD -- with the lane registry for `strong`, or the cached one
-    /// for `bounded` -- and one view of the unfolded rows, taken before `f` runs. A read at
-    /// another consistency, of another index, or `as_of` an epoch is not served from it.
+    /// for `bounded` -- and one view of the unfolded rows, taken before `f` runs. M236: a read
+    /// at any level `consistency` [covers](Consistency::covers) is served from it, its strong
+    /// reads share one probe of the lanes, and an `as_of` read takes its history from the
+    /// snapshot's HEAD unless that came from the `bounded` cache. A read of another index, or
+    /// at a stronger level, is not served from it.
     ///
     /// ⚠️ **The one retry is here** (M131 spec review): a read under the pin never retries on
     /// its own, or a leg retried fresh would answer from another epoch than its siblings. A
@@ -7188,6 +7211,8 @@ impl<S: BlobStore> Engine<S> {
                 index: index.to_owned(),
                 consistency,
                 fetched,
+                history: !hit,
+                settle: Arc::default(),
             };
             match PINNED.scope(pin, f()).await {
                 Err(_) if hit => allow_hit = false,
@@ -8397,8 +8422,10 @@ impl<S: BlobStore> Engine<S> {
         // M131: under a pin of this engine, index and level, its snapshot, and no hit: a leg
         // never retries on its own.
         let engine = std::ptr::from_ref(self) as usize;
+        // M236: a stronger snapshot serves a weaker leg whole. A weaker leg under a strong pin
+        // asks the strong legs' one verdict on the lanes, which costs it nothing.
         if let Ok(Some(pinned)) = PINNED.try_with(|p| {
-            (p.engine == engine && p.index == index && p.consistency == consistency)
+            (p.engine == engine && p.index == index && p.consistency.covers(consistency))
                 .then(|| p.fetched.clone())
         }) {
             return Ok(pinned);
@@ -8498,6 +8525,48 @@ impl<S: BlobStore> Engine<S> {
         let Some(lanes) = lanes else {
             return Ok(true);
         };
+        // M236: under a pin of this engine, of the HEAD it holds, every leg shares one verdict.
+        match self.pinned_settle(head) {
+            Some(cell) => cell
+                .get_or_try_init(|| self.probe_lanes(head, lanes))
+                .await
+                .copied(),
+            None => self.probe_lanes(head, lanes).await,
+        }
+    }
+
+    /// The pin's shared verdict, when this engine runs under a pin holding `head`.
+    fn pinned_settle(&self, head: &Head) -> Option<Arc<tokio::sync::OnceCell<bool>>> {
+        let engine = std::ptr::from_ref(self) as usize;
+        PINNED
+            .try_with(|p| {
+                let held = &p.fetched.at.head;
+                (p.engine == engine && held.epoch == head.epoch && held.nonce == head.nonce)
+                    .then(|| Arc::clone(&p.settle))
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// The HEAD an `as_of` read of `index` takes its history from (M236): the pin's, when it
+    /// read HEAD for this request, else one read now.
+    async fn history_head(&self, index: &str) -> Result<Arc<head::HeadAt>, EngineError> {
+        let engine = std::ptr::from_ref(self) as usize;
+        let pinned = PINNED
+            .try_with(|p| {
+                (p.engine == engine && p.index == index && p.history)
+                    .then(|| Arc::clone(&p.fetched.at))
+            })
+            .ok()
+            .flatten();
+        match pinned {
+            Some(at) => Ok(at),
+            None => Ok(Arc::new(head::read(&*self.store, self.tenant).await?)),
+        }
+    }
+
+    /// [`Self::settled`]'s probes: one `head` request per lane, all at once.
+    async fn probe_lanes(&self, head: &Head, lanes: &[LaneId]) -> Result<bool, EngineError> {
         // An unfolded deferred operation of this process's is not reflected in its memtable
         // (M13): its lane is then probed at the watermark, like any other process's.
         let deferred = self.holds_deferred();
@@ -8634,7 +8703,7 @@ impl<S: BlobStore> Engine<S> {
         fusion: pstore_query::Fusion,
         top_k: usize,
     ) -> Result<Answer, EngineError> {
-        let at = head::read(&*self.store, self.tenant).await?;
+        let at = self.history_head(index).await?;
         self.remember_schemas(&at.head);
         if at.head.replications.contains_key(index) {
             return Err(EngineError::Replica(replica::ReplicaRefusal::NoHistory(
@@ -9302,7 +9371,7 @@ impl<S: BlobStore> Engine<S> {
         let (head, epoch, settle, staleness, unfolded, shadow, shadowed, (fts, texts)) = match as_of
         {
             Some(epoch) => {
-                let at = head::read(&*self.store, self.tenant).await?;
+                let at = self.history_head(index).await?;
                 self.remember_schemas(&at.head);
                 if at.head.replications.contains_key(index) {
                     return Err(EngineError::Replica(replica::ReplicaRefusal::NoHistory(
