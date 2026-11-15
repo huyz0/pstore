@@ -852,6 +852,11 @@ impl<S: BlobStore + 'static> Api<S> {
                 Arc::clone(&self),
                 count_request::<S>,
             ))
+            // M238: outermost, so every refusal, authentication's included, is drained.
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&self.ingress),
+                ingress::drain::drain_refused,
+            ))
             .with_state(self)
     }
 

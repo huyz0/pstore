@@ -321,6 +321,20 @@ jobs:
       - run: npm install --global typescript@5.9.3
       - run: ./scripts/clients.sh
 
+  # M237: the documented public TLS proxy (deploy/nginx/pstore-tls.conf) in front of the real
+  # server, checked from a client's side. Its own job: it needs nginx and the server binary.
+  tls-smoke:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
+      - run: sudo apt-get update -q && sudo apt-get install -y -q nginx-light
+      - run: ./scripts/tls-smoke.sh
+
   # The whole local gate, on the three operating systems a contributor might run it on.
   # ⚠️ For seven milestones it ran on one: on Windows every Python gate failed (`python3` is
   # the Store stub there) and rustc refused the repo's own `split-debuginfo`, and nothing said
