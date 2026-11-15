@@ -13,7 +13,9 @@ M131's one snapshot now covers every multi-query and every faceted query:
   HEAD, unless that HEAD came from the `bounded` cache, when it reads its own as before.
 - The strong legs of a request probe each lane once between them, not once each.
 
-Every answer is what it was; the request reads HEAD once, and probes L lanes instead of L
+Every answer keeps its level's promise; a `bounded` leg beside a fresher one is now answered
+from the fresher HEAD, so its answer and `staleness_ms` can be newer than before. The request
+reads HEAD once, and probes L lanes instead of L
 per strong leg. Evidence is in the [M236 verification](milestones/M236/VERIFIED.md).
 
 ## M213: buffered rows are charged the memory they hold

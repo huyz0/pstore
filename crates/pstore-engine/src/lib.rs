@@ -8526,7 +8526,7 @@ impl<S: BlobStore> Engine<S> {
             return Ok(true);
         };
         // M236: under a pin of this engine, of the HEAD it holds, every leg shares one verdict.
-        match self.pinned_settle(head) {
+        match self.pinned_settle(head, lanes) {
             Some(cell) => cell
                 .get_or_try_init(|| self.probe_lanes(head, lanes))
                 .await
@@ -8535,14 +8535,23 @@ impl<S: BlobStore> Engine<S> {
         }
     }
 
-    /// The pin's shared verdict, when this engine runs under a pin holding `head`.
-    fn pinned_settle(&self, head: &Head) -> Option<Arc<tokio::sync::OnceCell<bool>>> {
+    /// The pin's shared verdict, when this engine runs under a pin holding `head` and `lanes`
+    /// (code review: a read of another index under the pin reads its own registry, which may
+    /// name a lane the pin's does not).
+    fn pinned_settle(
+        &self,
+        head: &Head,
+        lanes: &[LaneId],
+    ) -> Option<Arc<tokio::sync::OnceCell<bool>>> {
         let engine = std::ptr::from_ref(self) as usize;
         PINNED
             .try_with(|p| {
                 let held = &p.fetched.at.head;
-                (p.engine == engine && held.epoch == head.epoch && held.nonce == head.nonce)
-                    .then(|| Arc::clone(&p.settle))
+                (p.engine == engine
+                    && held.epoch == head.epoch
+                    && held.nonce == head.nonce
+                    && p.fetched.lanes.as_deref() == Some(lanes))
+                .then(|| Arc::clone(&p.settle))
             })
             .ok()
             .flatten()

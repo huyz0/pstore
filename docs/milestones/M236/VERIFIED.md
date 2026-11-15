@@ -54,3 +54,12 @@ the request refuses as a whole anyway, so the clearing was dead and was removed.
 6. `a_cached_pin_does_not_serve_history`: green, a guard (see Red runs): with a cached HEAD at
    epoch 1 and the rival folded to 2, a `bounded` leg and an `as_of` 2 leg answer `[1, 2]` from
    one HEAD read; its mutation answers `[2, 2]`.
+
+Code review, one round (a reviewer given the diff and the spec, not this ledger): no blocking or
+major findings. Two minors fixed: the shared probe verdict is keyed on the pin's lanes as well
+as its HEAD, so a strong read of another index with its own registry never borrows it; the
+migration note says a `bounded` leg beside a fresher one now answers fresher. Minors left: a
+nested `pinned` would inherit the outer pin's cleared `hit` (the server no longer nests pins);
+a failing `as_of` leg under a `bounded` cache hit reruns every leg once from a fresh HEAD;
+the M131 and M164 test names say "unpinned" (kept, as their assertions are); a request of only
+past-epoch legs builds the unfolded view it does not read (CPU, no request).
