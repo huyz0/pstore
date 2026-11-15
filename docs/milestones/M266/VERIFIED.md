@@ -35,4 +35,13 @@ tests and reverted it. No `cargo mutants` run is claimed. All five were killed.
 4. `computed_highlight_refusals`: green for twelve refusals, none reading a blob, and two
    from the snapshot: a `BM25` over a non-text field and a `pre_tokenized_array` field.
    Killed: the missing-`BM25`-over-`attr` refusal dropped (H4).
-5. Gates: WORKSPACE_LINE
+5. Gates: `cargo fmt --check` and `cargo clippy --workspace --all-targets --all-features --
+   -D warnings` pass. The workspace suite, `cargo test --workspace --no-fail-fast -j 3`,
+   over this milestone merged with main's M236: 2,907 passed, 1 failed, 15 ignored. The
+   failure was `openapi::the_contract_uses_only_keywords_the_validator_checks`: the widened
+   `$computed` used `anyOf`, which the contract's validator does not check. It now uses
+   `oneOf` (a number or `null`, or an array, which no value is both), and
+   `cargo test -p pstore-server --test it -- openapi:: computed::` passes, 15 tests.
+   `scripts/gen-clients.py --check` passes after regenerating the clients, and
+   `scripts/clients.sh` passes. The two IPv6 tests were NOT-RUN, as in M265. `cargo deny
+   check`, coverage and the mutation sweep were NOT-RUN here; CI runs them on the PR.

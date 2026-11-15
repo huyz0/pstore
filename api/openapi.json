@@ -2796,7 +2796,7 @@
             "type": "object",
             "description": "The query's compute_attributes by name (M265): a number, a Highlight's fragments as $highlights gives them (M266), or null where the row has no value.",
             "additionalProperties": {
-              "anyOf": [
+              "oneOf": [
                 {
                   "type": [
                     "number",
