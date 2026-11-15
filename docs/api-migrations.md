@@ -1,5 +1,15 @@
 # Native API migration notes
 
+## M268: a turbopuffer compatibility facade, part 1
+
+New routes on the vendor's paths: `GET /v1/namespaces`, `POST` and `DELETE
+/v2/namespaces/{ns}`, `POST /v2/namespaces/{ns}/query`, `GET /v2/namespaces/{ns}/metadata`
+and `GET /v1/namespaces/{ns}/schema`. The turbopuffer SDK reaches them with its base URL set
+to a pstore server and its API key set to a pstore credential, or, on an unsecured server, to
+the tenant number. `X-Pstore-Tenant` is refused on these routes. Every native route, the
+OpenAPI contract and the generated clients are unchanged.
+[M268 verification](milestones/M268/VERIFIED.md).
+
 ## M267: the generated clients retry, page and encode vectors
 
 Both generated clients now send a call again when pstore refuses it `retryable` (every 5xx

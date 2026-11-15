@@ -37,6 +37,7 @@ mod durable;
 mod errors;
 mod explain;
 mod external;
+mod facade;
 mod facets;
 mod filters;
 mod geo;
