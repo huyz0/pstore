@@ -116,7 +116,8 @@ test("Retry-After is read with or without an envelope, and query values are writ
       asked = url;
       return new Response(body, { status: 503, headers: { "retry-after": "7" } });
     };
-    const client = new Client({ baseUrl: "http://unused/", fetch });
+    // M267: the single-attempt mode this test pinned before retries existed.
+    const client = new Client({ baseUrl: "http://unused/", fetch, maxRetries: 0 });
     await assert.rejects(client.getIndex("i", { progress: true }), (e) =>
       e instanceof PstoreError && e.code === code && e.retryAfter === 7 && e.retryable === true);
     assert.equal(asked, "http://unused/v1/indexes/i?progress=true");

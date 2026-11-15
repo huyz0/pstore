@@ -136,14 +136,20 @@ def python(spec: dict, digest: str) -> str:
         "Parquet export), with its status in `Client.last_status`, and raises `PstoreError` for a status of 400 or more.\n"
         '"""\n\n',
         "from __future__ import annotations\n\n",
+        "import asyncio\n",
+        "import base64\n",
         "import json\n",
+        "import random\n",
+        "import struct\n",
+        "import time\n",
         "import urllib.error\n",
         "import urllib.parse\n",
         "import urllib.request\n",
-        "from typing import Any, Dict, List, Optional, TypedDict, Union\n\n",
+        "from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, TypedDict, Union\n\n",
         f'CONTRACT_VERSION = "{version}"\n',
         f'CONTRACT_SHA256 = "{digest}"\n\n',
-        "__all__ = [\"Client\", \"PstoreError\", \"CONTRACT_VERSION\", \"CONTRACT_SHA256\"]\n\n",
+        "__all__ = [\"Client\", \"AsyncClient\", \"PstoreError\", \"encode_vector\", \"decode_vector\",\n"
+        "           \"CONTRACT_VERSION\", \"CONTRACT_SHA256\"]\n\n",
     ]
     for name, s in spec["components"]["schemas"].items():
         props = s.get("properties")
@@ -156,7 +162,9 @@ def python(spec: dict, digest: str) -> str:
             out.append(f"# {name}: {s['description']}\n")
         out.append("\n")
     out.append(PY_RUNTIME)
-    for op in operations(spec):
+    signatures = {}
+    for order, op in enumerate(operations(spec)):
+        op.order = order
         args = ["self"] + [f"{p}: str" for p in op.path_params]
         if op.body is not None:
             t = py_type(op.body)
@@ -174,6 +182,8 @@ def python(spec: dict, digest: str) -> str:
             if len({json.dumps(r) for r in op.responses.values()}) > 1
             else py_type(next(iter(op.responses.values()), None))
         )
+        signatures[op] = (args, ret)
+        op.positional = [p for p in op.path_params] + (["body"] if op.body is not None else [])
         out.append(f"    def {op.id}({', '.join(args)}) -> {ret}:\n")
         doc = f"{op.method} {op.path} (scope `{op.scope}`): {op.summary}"
         out.append(py_doc(doc, "        "))
@@ -201,6 +211,13 @@ def python(spec: dict, digest: str) -> str:
         + "".join(f'        "{op.id}",\n' for op in operations(spec))
         + "    )\n"
     )
+    out.append(PY_ASYNC)
+    for op, (args, ret) in sorted(signatures.items(), key=lambda kv: kv[0].order):
+        names = [a.split(":")[0] for a in args[1:] if a != "*"]
+        passed = [n for n in names if n in op.positional] + [f"{n}={n}" for n in names if n not in op.positional]
+        out.append(f"    async def {op.id}({', '.join(args)}) -> {ret}:\n")
+        out.append(f'        """`Client.{op.id}`, on a worker thread."""\n')
+        out.append(f"        return await asyncio.to_thread(self.sync.{op.id}{''.join(', ' + p for p in passed)})\n\n")
     return "".join(out)
 
 
@@ -232,6 +249,31 @@ def _qv(v: Any) -> str:
     return str(v)
 
 
+def encode_vector(floats: Sequence[float]) -> str:
+    """`floats` as the wire's base64 vector (D-36): padded base64 of little-endian f32."""
+    return base64.b64encode(struct.pack(f"<{len(floats)}f", *floats)).decode()
+
+
+def decode_vector(text: str) -> List[float]:
+    """A base64 vector (D-36) as its floats."""
+    raw = base64.b64decode(text, validate=True)
+    if len(raw) % 4:
+        raise ValueError(f"a base64 vector holds whole f32s, and this holds {len(raw)} bytes")
+    return list(struct.unpack(f"<{len(raw) // 4}f", raw))
+
+
+#: Longest a `Retry-After` is waited, in seconds (M267).
+MAX_RETRY_AFTER = 60.0
+
+
+def backoff(attempt: int, retry_after: Optional[int]) -> float:
+    """Seconds to wait before retry `attempt` (0 first) (M267): the answer's `Retry-After`,
+    at most `MAX_RETRY_AFTER`, else `min(8, 0.5 * 2**attempt)` scaled into [0.75, 1]."""
+    if retry_after is not None:
+        return min(float(retry_after), MAX_RETRY_AFTER)
+    return min(8.0, 0.5 * 2 ** attempt) * random.uniform(0.75, 1.0)
+
+
 class Client:
     """A client for one pstore server.
 
@@ -240,18 +282,52 @@ class Client:
     returned, to pass as `session=` for a read that must see that write (M11.1). `last_status`
     holds the latest success's status, which some operations answer with meaning: `copy_index`
     is 202 when this request started the copy and 200 when an earlier one had.
+
+    M267: a call refused `retryable` (every 5xx and 429), or that never reached the server, is
+    sent again up to `max_retries` more times, waiting `backoff` between; `max_retries=0`
+    sends each once. `sleep` is how it waits.
     """
 
     def __init__(self, base_url: str, *, token: Optional[str] = None,
-                 tenant: Optional[str] = None, timeout: float = 30.0) -> None:
+                 tenant: Optional[str] = None, timeout: float = 30.0,
+                 max_retries: int = 2, sleep: Optional[Callable[[float], None]] = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.tenant = tenant
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.sleep = sleep or time.sleep
         self.last_session: Optional[str] = None
         self.last_status: Optional[int] = None
 
-    def _call(self, method: str, path: str, operation: str, *, query: Any = (),
+    def _call(self, method: str, path: str, operation: str, **call: Any) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return self._once(method, path, **call)
+            except PstoreError as e:
+                if not e.retryable or attempt >= self.max_retries:
+                    raise
+                wait = backoff(attempt, e.retry_after)
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                if attempt >= self.max_retries:
+                    raise
+                wait = backoff(attempt, None)
+            self.sleep(wait)
+            attempt += 1
+
+    def iter_indexes(self, *, prefix: Optional[str] = None,
+                     page_size: Optional[int] = None) -> Iterator[str]:
+        """Every index name, a page of `list_indexes` at a time, following `next_cursor` (M267)."""
+        cursor: Optional[str] = None
+        while True:
+            page = self.list_indexes(prefix=prefix, cursor=cursor, page_size=page_size)
+            yield from page.get("indexes", [])
+            cursor = page.get("next_cursor")
+            if cursor is None:
+                return
+
+    def _once(self, method: str, path: str, *, query: Any = (),
               body: Any = None, session: Optional[str] = None, text: bool = False,
               binary: bool = False) -> Any:
         url = self.base_url + path
@@ -288,6 +364,33 @@ class Client:
                                   e.code >= 500 or e.code == 429, retry_after, raw) from None
             raise PstoreError(e.code, err.get("code", ""), err.get("message", ""),
                               bool(err.get("retryable")), retry_after, parsed) from None
+
+'''
+
+PY_ASYNC = '''
+
+class AsyncClient:
+    """`Client`'s operations as coroutines (M267), each run on a worker thread by
+    `asyncio.to_thread`: standard library only. `sync` is the `Client` they share, holding
+    `last_session` and `last_status`."""
+
+    def __init__(self, base_url: str, *, token: Optional[str] = None,
+                 tenant: Optional[str] = None, timeout: float = 30.0,
+                 max_retries: int = 2, sleep: Optional[Callable[[float], None]] = None) -> None:
+        self.sync = Client(base_url, token=token, tenant=tenant, timeout=timeout,
+                           max_retries=max_retries, sleep=sleep)
+
+    async def iter_indexes(self, *, prefix: Optional[str] = None,
+                           page_size: Optional[int] = None) -> AsyncIterator[str]:
+        """`Client.iter_indexes`, a page on a worker thread at a time."""
+        cursor: Optional[str] = None
+        while True:
+            page = await self.list_indexes(prefix=prefix, cursor=cursor, page_size=page_size)
+            for name in page.get("indexes", []):
+                yield name
+            cursor = page.get("next_cursor")
+            if cursor is None:
+                return
 
 '''
 
@@ -442,6 +545,45 @@ export interface ClientOptions {
   tenant?: string;
   /** The `fetch` to call; the global one when absent. */
   fetch?: typeof fetch;
+  /**
+   * M267: how many more times a call refused `retryable` (every 5xx and 429), or that never
+   * reached the server, is sent; 2 when absent, 0 to send each once.
+   */
+  maxRetries?: number;
+  /** How the client waits between attempts; a timer when absent. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Longest a `Retry-After` is waited, in seconds (M267). */
+export const MAX_RETRY_AFTER = 60;
+
+/**
+ * Milliseconds to wait before retry `attempt` (0 first) (M267): the answer's `Retry-After`, at
+ * most `MAX_RETRY_AFTER`, else `min(8, 0.5 * 2 ** attempt)` seconds scaled into [0.75, 1].
+ */
+export function backoff(attempt: number, retryAfter: number | undefined): number {
+  if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_AFTER) * 1000;
+  return Math.min(8, 0.5 * 2 ** attempt) * (0.75 + 0.25 * Math.random()) * 1000;
+}
+
+/** `floats` as the wire's base64 vector (D-36): padded base64 of little-endian f32. */
+export function encodeVector(floats: ArrayLike<number>): string {
+  const view = new DataView(new ArrayBuffer(floats.length * 4));
+  for (let i = 0; i < floats.length; i++) view.setFloat32(i * 4, floats[i] as number, true);
+  let bin = "";
+  for (const b of new Uint8Array(view.buffer)) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+/** A base64 vector (D-36) as its floats. */
+export function decodeVector(text: string): Float32Array {
+  const bin = atob(text);
+  if (bin.length % 4) throw new Error(`a base64 vector holds whole f32s, and this holds ${bin.length} bytes`);
+  const view = new DataView(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) view.setUint8(i, bin.charCodeAt(i));
+  const out = new Float32Array(bin.length / 4);
+  for (let i = 0; i < out.length; i++) out[i] = view.getFloat32(i * 4, true);
+  return out;
 }
 
 interface Call {
@@ -472,16 +614,46 @@ export class Client {
   readonly tenant: string | undefined;
   lastSession: string | undefined;
   lastStatus: number | undefined;
+  readonly maxRetries: number;
   private readonly fetcher: typeof fetch;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(options: ClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\\/+$/, "");
     this.token = options.token;
     this.tenant = options.tenant;
     this.fetcher = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.maxRetries = options.maxRetries ?? 2;
+    this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
+  }
+
+  /** Every index name, a page of `listIndexes` at a time, following `next_cursor` (M267). */
+  async *listIndexesAll(options: { prefix?: string; page_size?: number } = {}): AsyncGenerator<string> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.listIndexes({ ...options, cursor });
+      yield* page.indexes ?? [];
+      if (page.next_cursor === undefined || page.next_cursor === null) return;
+      cursor = page.next_cursor;
+    }
   }
 
   private async call(method: string, path: string, c: Call): Promise<unknown> {
+    for (let attempt = 0; ; attempt++) {
+      let wait: number;
+      try {
+        return await this.once(method, path, c);
+      } catch (e) {
+        // `fetch` rejects with a TypeError when the request never got an answer.
+        const retry = e instanceof PstoreError ? e.retryable : e instanceof TypeError;
+        if (!retry || attempt >= this.maxRetries) throw e;
+        wait = backoff(attempt, e instanceof PstoreError ? e.retryAfter : undefined);
+      }
+      await this.sleep(wait);
+    }
+  }
+
+  private async once(method: string, path: string, c: Call): Promise<unknown> {
     const pairs = (c.query ?? []).filter(([, v]) => v !== undefined && v !== null)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(qv(v))}`);
     const url = this.baseUrl + path + (pairs.length ? `?${pairs.join("&")}` : "");

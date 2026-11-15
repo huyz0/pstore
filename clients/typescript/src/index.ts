@@ -672,6 +672,45 @@ export interface ClientOptions {
   tenant?: string;
   /** The `fetch` to call; the global one when absent. */
   fetch?: typeof fetch;
+  /**
+   * M267: how many more times a call refused `retryable` (every 5xx and 429), or that never
+   * reached the server, is sent; 2 when absent, 0 to send each once.
+   */
+  maxRetries?: number;
+  /** How the client waits between attempts; a timer when absent. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Longest a `Retry-After` is waited, in seconds (M267). */
+export const MAX_RETRY_AFTER = 60;
+
+/**
+ * Milliseconds to wait before retry `attempt` (0 first) (M267): the answer's `Retry-After`, at
+ * most `MAX_RETRY_AFTER`, else `min(8, 0.5 * 2 ** attempt)` seconds scaled into [0.75, 1].
+ */
+export function backoff(attempt: number, retryAfter: number | undefined): number {
+  if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_AFTER) * 1000;
+  return Math.min(8, 0.5 * 2 ** attempt) * (0.75 + 0.25 * Math.random()) * 1000;
+}
+
+/** `floats` as the wire's base64 vector (D-36): padded base64 of little-endian f32. */
+export function encodeVector(floats: ArrayLike<number>): string {
+  const view = new DataView(new ArrayBuffer(floats.length * 4));
+  for (let i = 0; i < floats.length; i++) view.setFloat32(i * 4, floats[i] as number, true);
+  let bin = "";
+  for (const b of new Uint8Array(view.buffer)) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+/** A base64 vector (D-36) as its floats. */
+export function decodeVector(text: string): Float32Array {
+  const bin = atob(text);
+  if (bin.length % 4) throw new Error(`a base64 vector holds whole f32s, and this holds ${bin.length} bytes`);
+  const view = new DataView(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) view.setUint8(i, bin.charCodeAt(i));
+  const out = new Float32Array(bin.length / 4);
+  for (let i = 0; i < out.length; i++) out[i] = view.getFloat32(i * 4, true);
+  return out;
 }
 
 interface Call {
@@ -702,16 +741,46 @@ export class Client {
   readonly tenant: string | undefined;
   lastSession: string | undefined;
   lastStatus: number | undefined;
+  readonly maxRetries: number;
   private readonly fetcher: typeof fetch;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(options: ClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.token = options.token;
     this.tenant = options.tenant;
     this.fetcher = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.maxRetries = options.maxRetries ?? 2;
+    this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
+  }
+
+  /** Every index name, a page of `listIndexes` at a time, following `next_cursor` (M267). */
+  async *listIndexesAll(options: { prefix?: string; page_size?: number } = {}): AsyncGenerator<string> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.listIndexes({ ...options, cursor });
+      yield* page.indexes ?? [];
+      if (page.next_cursor === undefined || page.next_cursor === null) return;
+      cursor = page.next_cursor;
+    }
   }
 
   private async call(method: string, path: string, c: Call): Promise<unknown> {
+    for (let attempt = 0; ; attempt++) {
+      let wait: number;
+      try {
+        return await this.once(method, path, c);
+      } catch (e) {
+        // `fetch` rejects with a TypeError when the request never got an answer.
+        const retry = e instanceof PstoreError ? e.retryable : e instanceof TypeError;
+        if (!retry || attempt >= this.maxRetries) throw e;
+        wait = backoff(attempt, e instanceof PstoreError ? e.retryAfter : undefined);
+      }
+      await this.sleep(wait);
+    }
+  }
+
+  private async once(method: string, path: string, c: Call): Promise<unknown> {
     const pairs = (c.query ?? []).filter(([, v]) => v !== undefined && v !== null)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(qv(v))}`);
     const url = this.baseUrl + path + (pairs.length ? `?${pairs.join("&")}` : "");
