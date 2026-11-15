@@ -19,7 +19,8 @@ No `cargo mutants` run is claimed.
 2. `a_body_declared_too_large_is_never_read`: green, the spy never polled at 1,025 > 1,024.
    `a_body_behind_expect_continue_is_never_read` (added in code review): green, 0 bytes read;
    red with the `Expect` check removed.
-3. `draining_stops_at_its_bound`: green, 4,000 bytes offered, 1,000 to 1,100 read.
+3. `draining_stops_at_its_bound`: green, 4,096 bytes offered in 128-byte chunks, exactly 1,024
+   read: the bound reached exactly, not one chunk past it.
 4. `a_stalled_refused_body_is_abandoned_at_the_deadline`: green, the 401 sent at exactly the
    500 ms deadline (paused clock).
 5. `drain_refused_bodies_is_read_from_the_config`: green; the M128 suite green, off.
@@ -45,5 +46,9 @@ fixed, with a test. `nginx-light` might not exist on Ubuntu 24.04: it does (inst
 1.24.0-2ubuntu7.19), kept. Minors fixed: the smoke script's address probe on a host with no
 route; the docs say a drain is bounded per request and not in number, and that a `413` from
 collection drains up to `body_bytes` more. Minors left: `free_port` can race another process
-for a port (nginx then fails to start, loudly); `n <= max` for `n < max` reads the same
-1,100 bytes in criterion 3, an equivalent mutant at that chunking.
+for a port (nginx then fails to start, loudly).
+
+CI's mutation shard found `n <= max` for `n < max` in `discard` missed: at 100-byte chunks both
+read 1,100 bytes, and review had left it as equivalent. It is not: a body that reaches the bound
+exactly is read one chunk further. Criterion 3's test now offers 128-byte chunks and asserts
+exactly 1,024 bytes read (it was a range); the mutant applied by hand fails it.

@@ -738,19 +738,20 @@ async fn a_body_behind_expect_continue_is_never_read() {
     );
 }
 
-/// M238 criterion 3: a body of no declared length is read at most `body_bytes` and one chunk.
+/// M238 criterion 3: a body of no declared length is read at most `body_bytes` and one chunk;
+/// a body that reaches the bound exactly is read no further.
 #[tokio::test]
 async fn draining_stops_at_its_bound() {
     let (api, _store) = serve(bearer(), draining());
     let read = Arc::new(AtomicUsize::new(0));
     let got = call(
         api.clone().router(),
-        put(None, None).body(counted(40, 100, &read)).unwrap(),
+        put(None, None).body(counted(32, 128, &read)).unwrap(),
     )
     .await;
     refused(&got, StatusCode::UNAUTHORIZED, "unauthenticated");
-    let n = read.load(Ordering::SeqCst);
-    assert!((1000..=1100).contains(&n), "read {n} of 4000");
+    // Chunks of 128 bytes reach the 1,024-byte bound exactly: not one chunk past it is read.
+    assert_eq!(read.load(Ordering::SeqCst), 1024, "of 4096");
 }
 
 /// M238 criterion 4: a refused body that stops arriving is abandoned at the read deadline.
