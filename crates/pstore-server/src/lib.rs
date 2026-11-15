@@ -3372,13 +3372,40 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
                 "aggregate {label} must be [\"Count\"] or [kind, attribute]"
             ))
         };
-        let (kind, attr) = match v.as_array().map(Vec::as_slice) {
+        let (kind, attr, non_numeric) = match v.as_array().map(Vec::as_slice) {
             // M210: unary Count, the rows admitted, as `["Count", "id"]` counts them.
-            Some([kind]) if kind.as_str() == Some("Count") => ("Count", pstore_query::ID_ATTRIBUTE),
+            Some([kind]) if kind.as_str() == Some("Count") => {
+                ("Count", pstore_query::ID_ATTRIBUTE, false)
+            }
             Some([kind, attr]) => (
                 kind.as_str().ok_or_else(malformed)?,
                 attr.as_str().ok_or_else(malformed)?,
+                false,
             ),
+            // M263: `["Min", attribute, {"non_numeric": true}]`, and `Max` alike.
+            Some([kind, attr, opts]) => {
+                let kind = kind.as_str().ok_or_else(malformed)?;
+                let attr = attr.as_str().ok_or_else(malformed)?;
+                if !matches!(kind, "Min" | "Max") {
+                    return Err(ApiError::bad_request(format!(
+                        "aggregate {label}: only Min and Max take options"
+                    )));
+                }
+                let non_numeric = match opts.as_object().map(|o| {
+                    (
+                        o.len(),
+                        o.get("non_numeric").map(serde_json::Value::as_bool),
+                    )
+                }) {
+                    Some((1, Some(Some(b)))) => b,
+                    _ => {
+                        return Err(ApiError::bad_request(format!(
+                            "aggregate {label}: {kind}'s options are {{\"non_numeric\": bool}}"
+                        )));
+                    }
+                };
+                (kind, attr, non_numeric)
+            }
             _ => return Err(malformed()),
         };
         let agg = match (kind, attr) {
@@ -3391,6 +3418,8 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
             }
             ("Sum", a) => Aggregate::Sum(a.to_owned()),
             // M211.
+            ("Min", a) if non_numeric => Aggregate::MinAny(a.to_owned()),
+            ("Max", a) if non_numeric => Aggregate::MaxAny(a.to_owned()),
             ("Min", a) => Aggregate::Min(a.to_owned()),
             ("Max", a) => Aggregate::Max(a.to_owned()),
             ("Avg", a) => Aggregate::Avg(a.to_owned()),
@@ -3546,6 +3575,8 @@ fn total_json(t: pstore_query::Total) -> serde_json::Value {
         pstore_query::Total::Uint(n) => serde_json::Value::from(n),
         pstore_query::Total::Float(f) => serde_json::Value::from(f),
         pstore_query::Total::Null => serde_json::Value::Null,
+        // M263: as an attribute of that value is reported.
+        pstore_query::Total::Value(v) => to_json(&v),
     }
 }
 

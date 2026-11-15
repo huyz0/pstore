@@ -1,5 +1,15 @@
 # Native API migration notes
 
+## M263: `Min` and `Max` over strings, bools, datetimes and uuids
+
+`aggregate_by` takes `["Min", attribute, {"non_numeric": true}]`, and `Max` alike: when the
+attribute's admitted values include no number, the answer is the smallest or largest string,
+bool, datetime or uuid, as a group key orders them, reported as the value is. A number, when
+there is one, wins, as plain `Min` answers. Without the option nothing changes: an attribute
+holding no number still answers `null`. Options on another aggregate, or any options object
+but `{"non_numeric": bool}`, are refused `400`. Evidence is in
+[M263 verification](milestones/M263/VERIFIED.md).
+
 ## M262: an empty index created with a declared schema
 
 `PUT /v1/indexes/{index}` also takes `schema`, the map a write declares: the primary and

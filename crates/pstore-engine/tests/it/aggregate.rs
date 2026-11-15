@@ -31,7 +31,7 @@ async fn n(e: &Engine<MemoryStore>, as_of: Option<Epoch>) -> Total {
         .aggregate_as("idx", count(), None, as_of, Consistency::Eventual)
         .await
         .unwrap();
-    got.groups[0].1[0]
+    got.groups[0].1[0].clone()
 }
 
 async fn four_segments(e: &Engine<MemoryStore>) -> Epoch {

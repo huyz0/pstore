@@ -172,7 +172,7 @@ async fn legs<S: BlobStore>(e: &Engine<S>, level: Consistency) -> Result<Legs, E
         epochs: [a.epoch, o.epoch, g.epoch],
         ranked: a.ids.into_iter().flatten().collect(),
         ordered: o.rows.into_iter().map(|d| d.id).collect(),
-        counted: g.groups[0].1[0],
+        counted: g.groups[0].1[0].clone(),
     })
 }
 
