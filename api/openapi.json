@@ -2164,18 +2164,18 @@
           "dims": {
             "type": "integer",
             "minimum": 0,
-            "description": "The vector width; 0 for a text-only index (M170)."
+            "description": "The vector width; 0 or absent for a text-only index, which needs a schema (M170, M262)."
           },
           "distance_metric": {
             "$ref": "#/components/schemas/DistanceMetric",
             "description": "dot_product when absent."
+          },
+          "schema": {
+            "description": "What a write's schema declares, recorded at create (M262)."
           }
         },
-        "required": [
-          "dims"
-        ],
         "additionalProperties": false,
-        "description": "Create an empty index (M147)."
+        "description": "Create an empty index (M147), with a declared schema (M262)."
       },
       "PatchIndexRequest": {
         "type": "object",

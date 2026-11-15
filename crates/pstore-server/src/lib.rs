@@ -5154,15 +5154,24 @@ async fn create_index<S: BlobStore + 'static>(
     let req: CreateRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("malformed create request: {e}")))?;
     let most = api.ingress.limits().array_elements();
+    // M262: a schema may create a text-only index, of width 0; without one, M147's rule.
+    let least = u64::from(req.schema.is_none());
     let dims = u32::try_from(req.dims)
         .ok()
-        .filter(|d| *d >= 1 && (*d as usize) <= most)
+        .filter(|d| u64::from(*d) >= least && (*d as usize) <= most)
         .ok_or_else(|| {
             ApiError::bad_request(format!(
-                "dims must be from 1 to {most}, the longest array this server admits, not {}",
+                "dims must be from {least} to {most}, the longest array this server admits, \
+                 not {}",
                 req.dims
             ))
         })?;
+    if dims == 0 && req.distance_metric.is_some() {
+        return Err(ApiError::bad_request(
+            "distance_metric names how vectors compare, and a text-only index (no dims) has none",
+        ));
+    }
+    let declared = created_schema(req.schema.as_ref(), dims)?;
     let metric = match req.distance_metric.as_deref() {
         None => pstore_engine::Metric::DotProduct,
         Some(name) => pstore_engine::Metric::parse(name).ok_or_else(|| {
@@ -5174,7 +5183,9 @@ async fn create_index<S: BlobStore + 'static>(
     };
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
-    let epoch = engine.create_index(&index, dims, metric).await?;
+    let epoch = engine
+        .create_index_declared(&index, dims, metric, &declared)
+        .await?;
     Ok(axum::Json(FoldResponse {
         epoch: epoch.0,
         cost: api.spend(tenant).since(before),
@@ -5389,12 +5400,84 @@ struct PatchIndexRequest {
     storage: Option<StoragePatch>,
 }
 
+/// A create's `schema` (M262), read by a write's own parsers: what a write declaring the same
+/// map would record at its first fold. A vector type is `vector`'s alone, of the create's
+/// width; a named vector field is declared by the write that first carries it.
+fn created_schema(
+    schema: Option<&serde_json::Value>,
+    dims: u32,
+) -> Result<pstore_engine::Declared, ApiError> {
+    let Some(schema) = schema else {
+        return Ok(pstore_engine::Declared::default());
+    };
+    let bad = |why: String| ApiError::bad_request(format!("schema: {why}"));
+    let mut map = schema
+        .as_object()
+        .cloned()
+        .ok_or_else(|| bad("an object of attribute names to declarations".to_owned()))?;
+    let mut types = typed::Declarations::new();
+    for (name, ty) in &map {
+        let Some(t) = ty
+            .as_str()
+            .filter(|t| t.starts_with('[') && t.contains(']'))
+        else {
+            continue;
+        };
+        if name != pstore_format::DEFAULT_FIELD {
+            return Err(bad(format!(
+                "{name:?} is declared {t}; a named vector field is declared by the write that \
+                 first carries it"
+            )));
+        }
+        let kind = match t.strip_prefix(&format!("[{dims}]")) {
+            Some("f32") => None,
+            Some("f16") => Some(pstore_format::typed::Kind::F16),
+            Some("i8") => Some(pstore_format::typed::Kind::I8),
+            _ => {
+                return Err(bad(format!(
+                    "{name:?} is declared {t}; this index's vectors are [{dims}]f32, [{dims}]f16 \
+                     or [{dims}]i8"
+                )));
+            }
+        };
+        if dims == 0 {
+            return Err(bad(format!(
+                "{name:?} is declared {t} and the index has no dims"
+            )));
+        }
+        if let Some(kind) = kind {
+            types.insert(pstore_format::typed::vector_key(name), kind);
+        }
+    }
+    map.remove(pstore_format::DEFAULT_FIELD);
+    let req: WriteRequest = serde_json::from_value(serde_json::json!({
+        "schema": serde_json::Value::Object(map),
+    }))
+    .map_err(|e| bad(e.to_string()))?;
+    let req = WriteRequest {
+        creating: true,
+        ..req
+    };
+    types.extend(declared_types(&req)?);
+    Ok(pstore_engine::Declared {
+        fts: declared_fts(&req)?,
+        trigram: declared_trigram(&req)?,
+        types,
+        texts: declared_further(&req)?,
+    })
+}
+
 /// What `PUT /v1/indexes/{index}` carries (M147). Anything else is refused.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRequest {
+    /// M262: absent or 0 is a text-only index.
+    #[serde(default)]
     dims: u64,
     distance_metric: Option<String>,
+    /// M262: what a write's `schema` declares, recorded now.
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
 }
 
 /// A write body, with the durability level refused by name rather than by serde's message.
@@ -6047,10 +6130,11 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         if name == pstore_format::text::DEFAULT_TEXT_FIELD {
             return Err(bad(format!("{name:?} is the text field, always a string")));
         }
-        if !req
-            .documents
-            .iter()
-            .any(|d| d.attributes.contains_key(name))
+        if !req.creating
+            && !req
+                .documents
+                .iter()
+                .any(|d| d.attributes.contains_key(name))
         {
             return Err(bad(format!(
                 "{name:?} is declared and no document carries it"
@@ -6201,7 +6285,7 @@ fn declared_texts(
                 "{name:?}: a pre_tokenized_array field's type is []string"
             )));
         }
-        if req.documents.is_empty() {
+        if req.documents.is_empty() && !req.creating {
             return Err(bad(
                 "full_text_search is declared and the write has no documents".to_owned(),
             ));
@@ -6521,7 +6605,7 @@ fn declared_trigram(req: &WriteRequest) -> Result<Option<Vec<String>>, ApiError>
     if names.is_empty() {
         return Ok(None);
     }
-    if req.documents.is_empty() {
+    if req.documents.is_empty() && !req.creating {
         return Err(bad(
             "regex is declared and the write has no documents".to_owned()
         ));
