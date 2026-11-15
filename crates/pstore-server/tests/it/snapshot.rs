@@ -38,6 +38,8 @@ struct Inner {
     folding: AtomicBool,
     head_reads: AtomicU64,
     lane_reads: AtomicU64,
+    /// `head` requests for a lane's bundle: the strong probes (M236).
+    probes: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -49,6 +51,10 @@ impl Interfering {
             self.0.head_reads.load(Ordering::SeqCst),
             self.0.lane_reads.load(Ordering::SeqCst),
         )
+    }
+
+    fn probes(&self) -> u64 {
+        self.0.probes.load(Ordering::SeqCst)
     }
 }
 
@@ -91,6 +97,9 @@ impl BlobStore for Interfering {
         self.0.store.get_tag(key).await
     }
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+        if key.as_str().ends_with(".bundle") {
+            self.0.probes.fetch_add(1, Ordering::SeqCst);
+        }
         self.0.store.head(key).await
     }
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
@@ -146,6 +155,7 @@ async fn world() -> (Interfering, Arc<Api<Interfering>>) {
         folding: AtomicBool::new(false),
         head_reads: AtomicU64::new(0),
         lane_reads: AtomicU64::new(0),
+        probes: AtomicU64::new(0),
     }));
     let api = Api::unsecured(Accounted::new(store.clone()), LaneId(2)).unwrap();
     (store, api)
@@ -223,7 +233,8 @@ async fn a_pinned_request_reads_head_once() {
     }
 }
 
-/// Criterion 4: legs at two levels run as before, each at its own.
+/// Criterion 4: legs at two levels, one strong, with another engine's write unfolded, are refused.
+/// (M131 ran them apart; M236 pins them at `strong`, and the refusal stands.)
 #[tokio::test]
 async fn mixed_levels_are_unpinned() {
     let (_store, api) = world().await;
@@ -279,4 +290,147 @@ async fn an_unpinned_multi_query_pins_each_faceted_pair() {
     // Whichever leg takes the armed read, the pair is one epoch's: 1 with 2 rows, 2 with 3.
     let n = b["facets"][0]["n"].as_u64().unwrap();
     assert_eq!(b["meta"]["epochs"][0].as_u64().unwrap() + 1, n, "{b}");
+}
+
+/// The lanes the registry names, so a test can say how many probes one strong check costs.
+async fn registered(store: &Interfering) -> u64 {
+    let lanes = pstore_engine::lanes::live(&*store.0.store, T)
+        .await
+        .unwrap();
+    u64::try_from(lanes.len()).unwrap()
+}
+
+/// M236 criterion 1: three strong legs probe each registered lane once between them, not once
+/// each.
+#[tokio::test]
+async fn strong_legs_probe_each_lane_once() {
+    let (store, api) = world().await;
+    store.0.rival.fold().await.unwrap();
+    let lanes = registered(&store).await;
+    assert!(lanes >= 2, "the writer's and the rival's lanes: {lanes}");
+    let (heads, registry) = store.reads();
+    let probes = store.probes();
+    let (s, b) = query(&api, &three("strong")).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["meta"]["epochs"], json!([2, 2, 2]), "{b}");
+    assert_eq!(store.probes() - probes, lanes, "{b}");
+    assert_eq!(store.reads(), (heads + 1, registry + 1), "{b}");
+}
+
+/// M236 criterion 2: legs at three levels answer from one snapshot, the strongest's.
+#[tokio::test]
+async fn mixed_levels_share_one_snapshot() {
+    let q = json!({"queries": [
+        {"vector": [1.0, 0.5], "top_k": 10, "consistency": "eventual"},
+        {"vector": [1.0, 0.5], "top_k": 10, "consistency": "bounded", "max_staleness_ms": 60000},
+        {"rank_by": ["id", "asc"], "top_k": 10, "consistency": "strong"},
+    ]});
+    // Settled: one HEAD and one registry read, every leg at the HEAD's epoch, and only the
+    // strong leg probing.
+    let (store, api) = world().await;
+    store.0.rival.fold().await.unwrap();
+    let lanes = registered(&store).await;
+    let (heads, registry) = store.reads();
+    let probes = store.probes();
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["meta"]["epochs"], json!([2, 2, 2]), "{b}");
+    assert_eq!(b["results"][2].as_array().unwrap().len(), 3, "{b}");
+    assert_eq!(store.reads(), (heads + 1, registry + 1), "{b}");
+    assert_eq!(store.probes() - probes, lanes, "{b}");
+    // Weaker legs only, the rival folding after the snapshot: one epoch, the row in no leg.
+    let (store, api) = world().await;
+    store.0.armed.store(true, Ordering::SeqCst);
+    let weaker = json!({"queries": [q["queries"][0], q["queries"][1]]});
+    let (s, b) = query(&api, &weaker).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["meta"]["epochs"], json!([1, 1]), "{b}");
+    assert!(!b["results"].to_string().contains("\"c\""), "{b}");
+    // The rival's write durable and unfolded: the strong leg refuses the request, as before.
+    let (_store, api) = world().await;
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+    assert_eq!(b["error"]["code"], "not_folded", "{b}");
+}
+
+/// M236 criterion 3: legs `as_of` a past epoch read the history of the request's one HEAD,
+/// and answer what each answers alone.
+#[tokio::test]
+async fn as_of_legs_read_the_pinned_head() {
+    let (store, api) = world().await;
+    store.0.rival.fold().await.unwrap();
+    let live = json!({"vector": [1.0, 0.5], "top_k": 10});
+    let past = json!({"vector": [1.0, 0.5], "top_k": 10, "as_of": 1});
+    let order = json!({"rank_by": ["id", "asc"], "top_k": 10, "as_of": 1});
+    let q = json!({"queries": [live, past, order]});
+    let (heads, _) = store.reads();
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(store.reads().0 - heads, 1, "{b}");
+    assert_eq!(b["meta"]["epochs"], json!([2, 1, 1]), "{b}");
+    for (i, alone) in [live, past, order].iter().enumerate() {
+        let (s, one) = query(&api, alone).await;
+        assert_eq!(s, StatusCode::OK, "{one}");
+        assert_eq!(
+            b["results"][i], one["results"],
+            "leg {i}: {b} against {one}"
+        );
+    }
+    assert_eq!(b["results"][2].as_array().unwrap().len(), 2, "{b}");
+}
+
+/// M236 criterion 4: a past epoch's hits and facets, from one HEAD read.
+#[tokio::test]
+async fn a_past_faceted_query_reads_head_once() {
+    let (store, api) = world().await;
+    store.0.rival.fold().await.unwrap();
+    let q = json!({"vector": [1.0, 0.5], "top_k": 10, "as_of": 1,
+                   "facets": {"aggregate_by": {"n": ["Count", "id"]}}});
+    let (heads, _) = store.reads();
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(store.reads().0 - heads, 1, "{b}");
+    assert_eq!(b["meta"]["epoch"], 1, "{b}");
+    assert_eq!(b["meta"]["facets_epoch"], 1, "{b}");
+    assert_eq!(b["facets"]["n"], 2, "{b}");
+}
+
+/// M236 criterion 6: a `bounded` snapshot from the cache is not read for history: an `as_of`
+/// leg past the cached epoch reads its own HEAD, and the bounded leg keeps its cached epoch.
+#[tokio::test]
+async fn a_cached_pin_does_not_serve_history() {
+    let (store, api) = world().await;
+    let bounded = json!({"vector": [1.0, 0.5], "top_k": 10, "consistency": "bounded",
+                         "max_staleness_ms": 600000});
+    let (s, b) = query(&api, &bounded).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["meta"]["epoch"], 1, "{b}");
+    store.0.rival.fold().await.unwrap();
+    let q = json!({"queries": [bounded, {"vector": [1.0, 0.5], "top_k": 10, "as_of": 2}]});
+    let (heads, _) = store.reads();
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["meta"]["epochs"], json!([1, 2]), "{b}");
+    assert_eq!(store.reads().0 - heads, 1, "{b}");
+}
+
+/// M236 criterion 2: two `bounded` legs pin at the tighter tolerance, so a cached HEAD older
+/// than it is not served to the tighter leg.
+#[tokio::test]
+async fn the_tightest_tolerance_pins() {
+    let (store, api) = world().await;
+    let loose = json!({"vector": [1.0, 0.5], "top_k": 10, "consistency": "bounded",
+                       "max_staleness_ms": 600000});
+    let (s, b) = query(&api, &loose).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    store.0.rival.fold().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let tight = json!({"vector": [1.0, 0.5], "top_k": 10, "consistency": "bounded",
+                       "max_staleness_ms": 100});
+    let q = json!({"queries": [loose, tight]});
+    let (heads, _) = store.reads();
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["meta"]["epochs"], json!([2, 2]), "{b}");
+    assert_eq!(store.reads().0 - heads, 1, "{b}");
 }
