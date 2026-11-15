@@ -699,7 +699,19 @@ commits there again or you call `POST /v1/admin/gc` for it.
 
 ### `tls` — public ingress and peer identities
 
-Terminate public HTTP TLS in a trusted reverse proxy. The separate peer listeners
+Terminate public HTTP TLS in a trusted reverse proxy:
+[`deploy/nginx/pstore-tls.conf`](../deploy/nginx/pstore-tls.conf) is one, which
+`scripts/tls-smoke.sh` runs as written in CI (M237). Whatever proxy you use, keep its three
+body settings: **buffer the whole body** before forwarding, **bound it at pstore's
+`body_bytes`** (2 MiB by default), and answer a larger one with pstore's typed `413`.
+⚠️ pstore refuses some requests before it reads their body (a bad credential, admission, an
+oversized `Content-Length`) and closes the connection; a proxy still sending that body gets a
+reset and answers `502` instead of the refusal. Behind a proxy, **set `drain_refused_bodies`**
+in `PSTORE_REQUEST_LIMITS_CONFIG` (M238): pstore then reads and discards what a refusal left of
+its body, up to `body_bytes` and within the body-read deadline, and the proxy relays the
+refusal. Measured in M238, 20 unauthenticated writes each: buffered, 7 of 20 2 MiB ones came
+back `502` with it off and none with it on; streamed, 17 of 20 at 1 MiB off, none on. Bind
+pstore itself to loopback or a private address. The separate peer listeners
 use native mutual TLS with a dedicated deployment peer CA and server SAN
 verification. Peer certificates grant internal authority across tenants. Keep
 their issuance separate from public client credentials.
@@ -721,6 +733,7 @@ Fleet quotas remain incomplete: `pstore-meter` exists and is not wired.
 | `PSTORE_LANE` | — | **Required.** See above. |
 | `PSTORE_BIND` | `127.0.0.1:8080` | ⚠️ The image sets `0.0.0.0:8080`; the library default is loopback, which inside a container is reachable by nothing. |
 | `PSTORE_AUTH_CONFIG` | — | Required signed-credential configuration unless explicit private mode is selected. See the authentication contract above. |
+| `PSTORE_REQUEST_LIMITS_CONFIG` | version 1's defaults | JSON, `{"version": 1, ...}`: the public ingress limits (M128, M141, M143, M212), each only lowerable, and `drain_refused_bodies` (M238, default `false`; set `true` behind a reverse proxy, see `tls` above). |
 | `PSTORE_ALLOW_UNAUTHENTICATED` | `0` | Exactly `1` selects private/test mode; incompatible with key configuration. |
 | `PSTORE_BACKEND` | `memory` | `memory`, `s3` or `azure`. `memory` is durable for exactly as long as the process. |
 | `PSTORE_PROFILE` | `unprobed` | `unprobed` refuses to serve. |

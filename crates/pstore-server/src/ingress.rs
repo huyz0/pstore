@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use crate::ApiError;
 
+pub(crate) mod drain;
 pub(crate) mod shape;
 
 /// The one configuration version this release reads.
@@ -46,6 +47,8 @@ pub struct RequestLimits {
     query_rows: u64,
     tenant_query_rows: u64,
     shape: shape::Shape,
+    /// M238: read and discard what a refusal left of its body, so a proxy relays the refusal.
+    drain_refused_bodies: bool,
 }
 
 impl Default for RequestLimits {
@@ -72,6 +75,7 @@ impl Default for RequestLimits {
                 members: 1024,
                 string_bytes: 256 << 10,
             },
+            drain_refused_bodies: false,
         }
     }
 }
@@ -198,6 +202,15 @@ impl RequestLimitsBuilder {
         self
     }
 
+    /// Whether a refused request's unread body is read and discarded, up to `body_bytes` and
+    /// within the body-read deadline, before the refusal is sent (M238). Off by default: off,
+    /// a refused body is never polled (M128).
+    #[must_use]
+    pub fn drain_refused_bodies(mut self, on: bool) -> Self {
+        self.0.drain_refused_bodies = on;
+        self
+    }
+
     /// The limits, or why they are unsafe.
     ///
     /// # Errors
@@ -292,6 +305,7 @@ struct Config {
     array_elements: Option<u64>,
     object_members: Option<u64>,
     string_bytes: Option<u64>,
+    drain_refused_bodies: Option<bool>,
 }
 
 impl RequestLimits {
@@ -348,6 +362,7 @@ impl RequestLimits {
             .array_elements(size("array_elements", c.array_elements, d.shape.elements)?)
             .object_members(size("object_members", c.object_members, d.shape.members)?)
             .string_bytes(size("string_bytes", c.string_bytes, d.shape.string_bytes)?)
+            .drain_refused_bodies(c.drain_refused_bodies.unwrap_or(d.drain_refused_bodies))
             .build()
     }
 
@@ -373,6 +388,12 @@ impl RequestLimits {
     #[must_use]
     pub fn string_bytes(&self) -> usize {
         self.shape.string_bytes
+    }
+
+    /// Whether a refused request's unread body is read and discarded (M238).
+    #[must_use]
+    pub fn drain_refused_bodies(&self) -> bool {
+        self.drain_refused_bodies
     }
 
     /// The largest encoded body admitted, in bytes.
