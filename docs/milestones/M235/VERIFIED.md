@@ -31,7 +31,11 @@ byte; with the long-runs test those 6 mutants are caught. The handler's 7 mutant
    `a_field_named_as_an_attribute_is_left_out_by_name`, `an_empty_page_is_a_file_of_no_rows`,
    `long_runs_of_one_level_read_back`, and the Thrift unit tests
    `integers_are_zigzag_varints`, `a_field_header_is_its_delta_and_type_or_its_id_in_full`,
-   `a_list_header_is_short_below_fifteen_items`: green.
+   `a_list_header_is_short_below_fifteen_items`, `a_run_of_sixty_four_levels_takes_a_two_byte_header`:
+   green. CI's mutation shard 0 lost its runner to `>=` → `<` in `Thrift::varint`'s `while`,
+   which pushed bytes forever; that varint and the level-run header are now loops bounded at
+   ten bytes (a `u64`'s most), as M231's `put_var` is, and the export test's page loop at ten
+   pages. The run-of-64 test kills the bounded header's `<` → `<=` (seen red with it).
 2. `the_parquet_export_pages_one_epoch`: green. 25 rows folded at `E`, paged 10 at a time by
    `after` while a delete, three new rows and two unfolded writes (one replacing a row of `E`)
    land: the pages hold the 25 rows of `E` once each, in id order, with their attributes and no

@@ -167,13 +167,16 @@ async fn the_parquet_export_pages_one_epoch() {
     let mut seen = one.order.clone();
     let mut rows = one.rows;
     let mut next = one.next;
-    while let Some(after) = next {
+    // Bounded: 25 rows are three pages of 10, so a cursor that never ends fails, not hangs.
+    for _ in 0..10 {
+        let Some(after) = next else { break };
         let p = page(&api, &format!("limit=10&as_of={first}&after={after}")).await;
         assert_eq!(p.epoch, first);
         seen.extend(p.order);
         rows.extend(p.rows);
         next = p.next;
     }
+    assert_eq!(next, None, "the loop ends");
     let want: Vec<String> = (0..25).map(|i| format!("d{i:05}")).collect();
     assert_eq!(seen, want, "every row of the epoch once, in id order");
     for (i, id) in want.iter().enumerate() {

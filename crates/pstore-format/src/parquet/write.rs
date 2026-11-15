@@ -98,12 +98,16 @@ const T_LIST: u8 = 9;
 const T_STRUCT: u8 = 12;
 
 impl Thrift {
+    /// Bounded at ten bytes, a `u64`'s most, so a mutant of the test cannot push forever.
     fn varint(&mut self, mut v: u64) {
-        while v >= 0x80 {
+        for _ in 0..10 {
+            if v < 0x80 {
+                self.out.push(v as u8);
+                return;
+            }
             self.out.push((v as u8) | 0x80);
             v >>= 7;
         }
-        self.out.push(v as u8);
     }
 
     fn zigzag(&mut self, v: i64) {
@@ -183,11 +187,15 @@ fn levels(out: &mut Vec<u8>, values: &[u8]) {
     for run in values.chunk_by(|a, b| a == b) {
         let Some(&v) = run.first() else { continue };
         let mut header = (run.len() as u64) << 1;
-        while header >= 0x80 {
+        // Bounded at ten bytes, a `u64`'s most, as `Thrift::varint` is.
+        for _ in 0..10 {
+            if header < 0x80 {
+                body.push(header as u8);
+                break;
+            }
             body.push((header as u8) | 0x80);
             header >>= 7;
         }
-        body.push(header as u8);
         body.push(v);
     }
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -604,7 +612,7 @@ fn schema_tops(schema: &[Vec<u8>], fields: &[String], skipped: &[String]) -> usi
 
 #[cfg(test)]
 mod tests {
-    use super::{T_I32, T_LIST, T_STRUCT, Thrift};
+    use super::{T_I32, T_LIST, T_STRUCT, Thrift, levels};
 
     fn bytes(f: impl FnOnce(&mut Thrift)) -> Vec<u8> {
         let mut t = Thrift::default();
@@ -646,5 +654,14 @@ mod tests {
             [0x10 + T_LIST, 0xfc, 15]
         );
         assert_eq!(bytes(|t| t.list(1, T_I32, 0)), [0x10 + T_LIST, 0x05]);
+    }
+
+    #[test]
+    fn a_run_of_sixty_four_levels_takes_a_two_byte_header() {
+        let mut values = vec![1; 63];
+        values.extend([0; 64]);
+        let mut out = Vec::new();
+        levels(&mut out, &values);
+        assert_eq!(out, [5, 0, 0, 0, 126, 1, 0x80, 1, 0]);
     }
 }
