@@ -29,6 +29,7 @@ fn title_ft() -> FullText {
         },
         k1: 2.0,
         b: 0.3,
+        k3: None,
     }
 }
 
@@ -40,6 +41,7 @@ fn tags_ft() -> FullText {
         },
         k1: 0.8,
         b: 1.0,
+        k3: None,
     }
 }
 

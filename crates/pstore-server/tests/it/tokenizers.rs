@@ -200,3 +200,63 @@ async fn tokenizers_over_http() {
         assert_eq!(s, StatusCode::OK, "{t}: {b}");
     }
 }
+
+/// M261: a `whitespace` field keeps punctuation in its tokens.
+#[tokio::test]
+async fn whitespace_tokenizer_over_http() {
+    let a = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    for (index, fts) in [
+        (
+            "ws",
+            json!({"tokenizer": "whitespace", "language": "french"}),
+        ),
+        ("v1", json!({"tokenizer": "word_v1"})),
+    ] {
+        let body = json!({
+            "durability": "durable",
+            "schema": {"text": {"type": "string", "full_text_search": fts}},
+            "documents": [
+                {"id": "dot", "vector": [1.0, 0.0], "attributes": {"text": "Please stop. Now"}},
+                {"id": "plain", "vector": [1.0, 1.0], "attributes": {"text": "a bus stop"}},
+            ],
+        });
+        let (s, b) = send(&a, "PUT", &format!("/v1/indexes/{index}/documents"), &body).await;
+        assert_eq!(s, StatusCode::OK, "{index}: {b}");
+    }
+    for folded in [false, true] {
+        if folded {
+            let (s, b) = send(&a, "POST", "/v1/admin/fold", &json!({})).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        }
+        assert_eq!(ids(&a, "ws", "stop.").await, ["dot"], "folded {folded}");
+        assert_eq!(ids(&a, "ws", "STOP").await, ["plain"], "folded {folded}");
+        let mut v1 = ids(&a, "v1", "stop.").await;
+        v1.sort();
+        assert_eq!(v1, ["dot", "plain"], "folded {folded}");
+    }
+    let (s, b) = send(&a, "GET", "/v1/indexes/ws", &json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["schema"]["full_text_search"]["tokenizer"], "whitespace",
+        "{b}"
+    );
+    for (i, refused) in [
+        json!({"tokenizer": "whitespace", "stemming": true}),
+        json!({"tokenizer": "whitespace", "remove_stopwords": true}),
+        // Named by the tokenizer even where the language has no stopword list (M204's
+        // refusal would otherwise speak first).
+        json!({"tokenizer": "whitespace", "remove_stopwords": true, "language": "arabic"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = json!({
+            "durability": "durable",
+            "schema": {"text": {"type": "string", "full_text_search": refused}},
+            "documents": [{"id": "x", "vector": [1.0, 0.0], "attributes": {"text": "x"}}],
+        });
+        let (s, b) = send(&a, "PUT", &format!("/v1/indexes/bad{i}/documents"), &body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{refused}: {b}");
+        assert!(b.to_string().contains("whitespace takes no"), "{b}");
+    }
+}

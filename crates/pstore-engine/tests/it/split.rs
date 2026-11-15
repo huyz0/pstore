@@ -1447,6 +1447,7 @@ async fn further(store: &Arc<MemoryStore>) -> Engine<MemoryStore> {
         },
         k1: 2.0,
         b: 0.3,
+        k3: None,
     };
     let declared = pstore_engine::Declared {
         texts: Some(std::collections::BTreeMap::from([(
@@ -1900,6 +1901,7 @@ async fn several(store: &Arc<MemoryStore>) -> Engine<MemoryStore> {
         },
         k1: 2.0,
         b: 0.3,
+        k3: None,
     };
     let declared = pstore_engine::Declared {
         texts: Some(std::collections::BTreeMap::from([

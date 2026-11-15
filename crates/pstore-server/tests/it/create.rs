@@ -387,3 +387,274 @@ async fn create_costs_one_read_and_one_cas() {
     assert_eq!(b["cost"]["blob_reads"], 1, "{b}");
     assert_eq!(b["cost"]["blob_writes"], 1, "{b}");
 }
+
+/// M262: a create's `schema`, the map a write declares.
+fn declared() -> Value {
+    json!({
+        "text": {"type": "string", "full_text_search": {"k1": 2.0, "stemming": true}},
+        "title": {"type": "string", "full_text_search": {"language": "french"}},
+        "sku": {"type": "string", "regex": true},
+        "n": "uint64",
+        "id": "uuid",
+    })
+}
+
+const UUID: &str = "0b6fa4a6-6a0b-4c8b-9f43-6c3b8d2f7a11";
+
+fn summary_schema(b: &Value) -> &Value {
+    &b["schema"]
+}
+
+#[tokio::test]
+async fn created_schema_is_recorded() {
+    let store = Accounted::new(MemoryStore::new());
+    let a = cached(&store, 1);
+    let (s, b) = create(&a, "docs", &json!({"dims": 2, "schema": declared()})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    for api in [&a, &cached(&store, 2)] {
+        let (s, b) = send(api, "GET", "/v1/indexes/docs", &Value::Null).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let sc = summary_schema(&b);
+        assert_eq!(sc["full_text_search"]["k1"], 2.0, "{b}");
+        assert_eq!(sc["full_text_search"]["stemming"], true, "{b}");
+        assert_eq!(sc["text_fields"]["title"]["language"], "french", "{b}");
+        assert_eq!(sc["regex"], json!(["sku"]), "{b}");
+        assert_eq!(sc["attributes"]["n"], "uint64", "{b}");
+        assert_eq!(sc["id"], "uuid", "{b}");
+    }
+    // A write that declares nothing is folded under the declared analyzer.
+    let (s, b) = write(
+        &a,
+        "docs",
+        &json!({"durability": "durable", "documents": [
+            {"id": UUID, "vector": [1.0, 0.0], "text": "he runs daily", "attributes": {"n": 7}},
+        ]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    fold(&a).await;
+    let (_, sum) = send(&a, "GET", "/v1/indexes/docs", &Value::Null).await;
+    let (s, b) = query(&a, "docs", &json!({"text": "running", "top_k": 5})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["results"][0]["id"], UUID, "stemmed: {b} {sum}");
+}
+
+#[tokio::test]
+async fn created_schema_refuses_other_declarations() {
+    let store = Accounted::new(MemoryStore::new());
+    let a = cached(&store, 1);
+    let (s, b) = create(&a, "docs", &json!({"dims": 2, "schema": declared()})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let doc = json!({"id": UUID, "vector": [1.0, 0.0], "text": "x",
+                     "attributes": {"n": 1, "sku": "a-1", "title": "le chat"}});
+    let typed = json!({"id": UUID, "vector": [1.0, 0.0], "attributes": {"n": UUID}});
+    for (what, schema, d) in [
+        (
+            "k1",
+            json!({"text": {"type": "string", "full_text_search": {"k1": 1.0, "stemming": true}}}),
+            doc.clone(),
+        ),
+        ("type", json!({"n": "uuid"}), typed),
+        (
+            "regex",
+            json!({"code": {"type": "string", "regex": true}}),
+            json!({"id": UUID, "vector": [1.0, 0.0], "attributes": {"code": "z"}}),
+        ),
+    ] {
+        let (s, b) = write(
+            &a,
+            "docs",
+            &json!({"durability": "durable", "documents": [d], "schema": schema}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {b}");
+        assert_eq!(b["error"]["code"], "schema_conflict", "{what}: {b}");
+    }
+    // The same map again is no conflict.
+    let mut same = declared();
+    same.as_object_mut().unwrap().remove("id");
+    let (s, b) = write(
+        &a,
+        "docs",
+        &json!({"durability": "durable", "documents": [doc], "schema": same}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+}
+
+#[tokio::test]
+async fn created_text_only_index() {
+    let store = Accounted::new(MemoryStore::new());
+    let a = cached(&store, 1);
+    let schema = json!({"text": {"type": "string", "full_text_search": true}});
+    let (s, b) = create(&a, "notes", &json!({"schema": schema})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = send(&a, "GET", "/v1/indexes/notes", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["schema"]["dims"], 0, "{b}");
+    let (s, b) = query(&a, "notes", &json!({"text": "hello", "top_k": 5})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["results"], json!([]), "{b}");
+    let (s, b) = query(&a, "notes", &json!({"vector": [1.0, 0.0], "top_k": 5})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "vector query: {b}");
+    let (s, b) = write(
+        &a,
+        "notes",
+        &json!({"durability": "durable", "documents": [{"id": "v", "vector": [1.0], "text": "x"}]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "vector write: {b}");
+    let (s, b) = write(
+        &a,
+        "notes",
+        &json!({"durability": "durable", "documents": [{"id": "t", "text": "hello world"}]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "text write: {b}");
+    fold(&a).await;
+    let (s, b) = query(&a, "notes", &json!({"text": "hello", "top_k": 5})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["results"][0]["id"], "t", "{b}");
+    // A metric with no width is refused; so is no width without a schema (M147).
+    let (s, b) = create(
+        &a,
+        "m",
+        &json!({"dims": 0, "distance_metric": "cosine_distance", "schema": schema}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    let (s, b) = create(&a, "m", &json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+}
+
+#[tokio::test]
+async fn create_without_schema_is_m147s() {
+    let with_none = Accounted::new(MemoryStore::new());
+    let with_empty = Accounted::new(MemoryStore::new());
+    let (a, b) = (cached(&with_none, 1), cached(&with_empty, 1));
+    let (s, r) = create(
+        &a,
+        "docs",
+        &json!({"dims": 3, "distance_metric": "cosine_distance"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let (s, r) = create(
+        &b,
+        "docs",
+        &json!({"dims": 3, "distance_metric": "cosine_distance", "schema": {}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let (_, x) = send(&a, "GET", "/v1/indexes/docs", &Value::Null).await;
+    let (_, y) = send(&b, "GET", "/v1/indexes/docs", &Value::Null).await;
+    assert_eq!(x["schema"], y["schema"], "{x} vs {y}");
+    assert_eq!(x["schema"]["regex"], json!([]), "{x}");
+    assert_eq!(x["schema"]["attributes"], json!({}), "{x}");
+    assert_eq!(x["schema"]["id"], "string", "{x}");
+    // The whole schema, pinned: what M147's create recorded before M262. A schema-less
+    // create recording any declaration, analyzer or further text field differs here.
+    let golden = json!({"attributes": {}, "dims": 3, "distance_metric": "cosine_distance",
+        "full_text_search": {"ascii_folding": false, "b": 0.75, "case_sensitive": false,
+            "k1": 1.200_000_047_683_715_8, "language": "english", "remove_stopwords": false,
+            "stemming": false, "tokenizer": "word_v1"},
+        "id": "string", "regex": [], "text_field": ""});
+    assert_eq!(x["schema"], golden, "{x}");
+}
+
+#[tokio::test]
+async fn created_schema_refusals_match_writes() {
+    let store = Accounted::new(MemoryStore::new());
+    let a = cached(&store, 1);
+    for (what, schema, says) in [
+        (
+            "unknown key",
+            json!({"t": {"type": "string", "nope": 1}}),
+            "a write declares",
+        ),
+        (
+            "regex on id",
+            json!({"id": {"type": "string", "regex": true}}),
+            "cannot be declared regex",
+        ),
+        (
+            "fts on uint64",
+            json!({"n": {"type": "uint64", "full_text_search": true}}),
+            "type is string or []string",
+        ),
+        (
+            "stemming pre-tokenized",
+            json!({"t": {"type": "[]string",
+                         "full_text_search": {"tokenizer": "pre_tokenized_array", "stemming": true}}}),
+            "pre_tokenized_array",
+        ),
+        (
+            "named vector",
+            json!({"emb": "[2]f16"}),
+            "named vector field",
+        ),
+        ("vector width", json!({"vector": "[3]f32"}), "[2]f32"),
+        // Anything but `[N]kind` on `vector` is refused, as a write refuses it.
+        (
+            "vector object",
+            json!({"vector": {"type": "[2]f16"}}),
+            "[2]f32",
+        ),
+        ("vector scalar", json!({"vector": "uint64"}), "[2]f32"),
+        ("vector kind alone", json!({"vector": "f16"}), "[2]f32"),
+        ("vector kind unknown", json!({"vector": "[2]f64"}), "[2]f32"),
+    ] {
+        let before = puts(&store);
+        let (s, b) = create(&a, "docs", &json!({"dims": 2, "schema": schema})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {b}");
+        assert!(b.to_string().contains(says), "{what}: {b}");
+        assert_eq!(puts(&store), before, "{what} committed");
+    }
+    // A vector type of the create's width is recorded.
+    let (s, b) = create(
+        &a,
+        "docs",
+        &json!({"dims": 2, "schema": {"vector": "[2]f16"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (_, b) = send(&a, "GET", "/v1/indexes/docs", &Value::Null).await;
+    assert_eq!(b["schema"]["vector_types"]["vector"], "[2]f16", "{b}");
+    // `[N]f32` is the default kind: accepted, and nothing further recorded.
+    let (s, b) = create(
+        &a,
+        "plain",
+        &json!({"dims": 2, "schema": {"vector": "[2]f32"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (_, b) = send(&a, "GET", "/v1/indexes/plain", &Value::Null).await;
+    assert!(b["schema"].get("vector_types").is_none(), "{b}");
+    // An array type spelled as a string is not a named vector: the write's parser refuses it.
+    let (s, b) = create(
+        &a,
+        "tags",
+        &json!({"dims": 2, "schema": {"tags": "[]string"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("a write declares"), "{b}");
+    // A vector type on an index with no width says so.
+    let (s, b) = create(
+        &a,
+        "nodims",
+        &json!({"dims": 0, "schema": {"vector": "[2]f16",
+            "text": {"type": "string", "full_text_search": true}}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("has no dims"), "{b}");
+    // The width spelled as a write may spell it.
+    let (s, b) = create(
+        &a,
+        "padded",
+        &json!({"dims": 2, "schema": {"vector": "[02]i8"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+}

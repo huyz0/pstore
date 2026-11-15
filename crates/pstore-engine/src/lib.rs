@@ -1895,9 +1895,11 @@ fn describe(f: &FullText) -> String {
         .max_token_length
         .map(|m| format!(", max_token_length {m}"))
         .unwrap_or_default();
+    // M260: named only when set, so a conflict on `k3` alone reads as one.
+    let k3 = f.k3.map(|k| format!(", k3 {k}")).unwrap_or_default();
     format!(
         "tokenizer {}, language {}, stemming {}, remove_stopwords {}, case_sensitive {}, \
-         ascii_folding {}{max}, k1 {}, b {}",
+         ascii_folding {}{max}, k1 {}, b {}{k3}",
         a.tokenizer.name(),
         a.language.name(),
         a.stemming,
@@ -5773,6 +5775,39 @@ impl<S: BlobStore> Engine<S> {
             index,
             dims,
             metric,
+            &Declared::default(),
+            false,
+            None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+        )
+        .await
+    }
+
+    /// [`Self::create_index`], its schema holding `declared` (M262): the analyzers, further
+    /// text fields, regex set and types a write declaring the same map records at its first
+    /// fold. `dims` of 0 is a text-only index (M170), whatever `metric`.
+    ///
+    /// # Errors
+    /// As [`Self::create_index`]; and `Refused` for further text fields a write would refuse.
+    pub async fn create_index_declared(
+        &self,
+        index: &str,
+        dims: u32,
+        metric: Metric,
+        declared: &Declared,
+    ) -> Result<Epoch, EngineError> {
+        if let Some(why) = declared
+            .texts
+            .as_ref()
+            .and_then(|t| texts_refusal(t, &self.text_field))
+        {
+            return Err(EngineError::Refused(why));
+        }
+        self.create_index_inner(
+            index,
+            dims,
+            metric,
+            declared,
+            true,
             None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
         )
         .await
@@ -5788,8 +5823,15 @@ impl<S: BlobStore> Engine<S> {
         metric: Metric,
         interfere: impl Future<Output = ()> + Send,
     ) -> Result<Epoch, EngineError> {
-        self.create_index_inner(index, dims, metric, Some(interfere))
-            .await
+        self.create_index_inner(
+            index,
+            dims,
+            metric,
+            &Declared::default(),
+            false,
+            Some(interfere),
+        )
+        .await
     }
 
     async fn create_index_inner(
@@ -5797,6 +5839,8 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         dims: u32,
         metric: Metric,
+        declared: &Declared,
+        allow_text_only: bool,
         interfere: Option<impl Future<Output = ()> + Send>,
     ) -> Result<Epoch, EngineError> {
         require_fencing(&*self.store)?;
@@ -5805,9 +5849,12 @@ impl<S: BlobStore> Engine<S> {
                 "an index name {index:?} must match [A-Za-z0-9_.-]{{1,128}} and not be . or .."
             )));
         }
+        // M262: a width of 0 is a text-only index, as M170's folds record one: no transform.
+        let text_only = allow_text_only && dims == 0;
         let Some(stored) = (dims > 0)
             .then(|| dims.checked_add(metric.extra() as u32))
             .flatten()
+            .or(text_only.then_some(0))
         else {
             return Err(EngineError::Refused(format!(
                 "an index's dims must be from 1 to {}, not {dims}",
@@ -5818,11 +5865,11 @@ impl<S: BlobStore> Engine<S> {
             dims: stored,
             text_field: String::new(),
             metric,
-            fts: FullText::default(),
-            trigram: Vec::new(),
+            fts: declared.fts.unwrap_or_default(),
+            trigram: declared.trigram.clone().unwrap_or_default(),
             fields: BTreeMap::new(),
-            types: BTreeMap::new(),
-            texts: BTreeMap::new(),
+            types: declared.types.clone(),
+            texts: declared.texts.clone().unwrap_or_default(),
         };
         let mut interfere = interfere;
         for attempt in 0..MAX_COMMIT_ATTEMPTS {

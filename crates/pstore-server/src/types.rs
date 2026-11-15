@@ -227,6 +227,10 @@ pub struct WriteRequest {
     /// applies. Issued by `POST /v1/indexes/{index}/idempotency-keys`.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Set by `PUT /v1/indexes/{index}` (M262), never by a body: the `schema` declares an
+    /// empty index's, so a declaration needs no document to carry it.
+    #[serde(skip)]
+    pub creating: bool,
 }
 
 /// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.

@@ -1,5 +1,39 @@
 # Native API migration notes
 
+## M263: `Min` and `Max` over strings, bools, datetimes and uuids
+
+`aggregate_by` takes `["Min", attribute, {"non_numeric": true}]`, and `Max` alike: when the
+attribute's admitted values include no number, the answer is the smallest or largest string,
+bool, datetime or uuid, as a group key orders them, reported as the value is. A number, when
+there is one, wins, as plain `Min` answers. Without the option nothing changes: an attribute
+holding no number still answers `null`. Options on another aggregate, or any options object
+but `{"non_numeric": bool}`, are refused `400`. Evidence is in
+[M263 verification](milestones/M263/VERIFIED.md).
+
+## M262: an empty index created with a declared schema
+
+`PUT /v1/indexes/{index}` also takes `schema`, the map a write declares: the primary and
+further text fields' `full_text_search`, `regex` attributes, attribute types, `"id"`'s kind,
+and `"vector": "[N]f32|f16|i8"` of the create's width. It is recorded by the create's one
+commit, and a later write is checked against it as against any recorded schema. A named
+vector field is still declared by the write that first carries it. With a `schema`, `dims`
+may be absent or 0: a text-only index (M170), and `distance_metric` is then refused. A body
+without `schema` creates what it did. Evidence is in [M262 verification](milestones/M262/VERIFIED.md).
+
+## M261: the `whitespace` tokenizer
+
+`full_text_search.tokenizer` takes `"whitespace"`: tokens are the runs between Unicode
+whitespace, punctuation kept, then case, folding and `max_token_length` as usual.
+`stemming` and `remove_stopwords` are refused with it. Nothing else changes. Evidence is in
+[M261 verification](milestones/M261/VERIFIED.md).
+
+## M260: BM25 `k3`
+
+`full_text_search.k3`, a number in `(0, 1000]`, weighs a term the query repeats by
+`((k3 + 1) · qtf) / (k3 + qtf)`. Unset, scoring is what it was: each distinct term once. A
+schema with `k3` is refused by an older build. Evidence is in
+[M260 verification](milestones/M260/VERIFIED.md).
+
 ## M238: refused bodies can be drained
 
 `PSTORE_REQUEST_LIMITS_CONFIG` accepts `"drain_refused_bodies": true` (default `false`). With

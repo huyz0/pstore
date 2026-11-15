@@ -88,11 +88,33 @@ fn term_score(idf: f32, tf: f32, len: f32, avgdl: f32, k1: f32, b: f32) -> f32 {
     idf * (tf * (k1 + 1.0)) / (tf + norm)
 }
 
+/// BM25's query-term weight (M260): `((k3 + 1) · qtf) / (k3 + qtf)` for a term the query
+/// holds `qtf` times, or 1 with no `k3`. A term held once weighs exactly 1 (`x / x`).
+#[must_use]
+pub fn query_weight(k3: Option<f32>, qtf: usize) -> f32 {
+    let Some(k3) = k3 else { return 1.0 };
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a query's term count is far below f32's exact range"
+    )]
+    let qtf = qtf as f32;
+    ((k3 + 1.0) * qtf) / (k3 + qtf)
+}
+
+/// How many times `terms` holds `term` (M260).
+fn qtf(terms: &[String], term: &str) -> usize {
+    terms.iter().filter(|t| t.as_str() == term).count()
+}
+
 /// One row's score under [`TextIndex::search_prefixed`] (M182), from the row's own terms
 /// (`row`, as [`pstore_format::text::value_terms`] makes them) rather than from postings:
 /// the same arithmetic in the same order -- each query term once, in byte order, then the
 /// prefixes' 1.0 -- so the two agree to the bit.
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the terms, the row, and BM25's parameters"
+)]
 pub fn row_score(
     terms: &[String],
     prefixes: &[String],
@@ -100,7 +122,9 @@ pub fn row_score(
     stats: &Stats,
     k1: f32,
     b: f32,
+    k3: Option<f32>,
 ) -> f32 {
+    let all = terms;
     let mut terms: Vec<&String> = terms.iter().collect();
     terms.sort_unstable();
     terms.dedup();
@@ -122,7 +146,7 @@ pub fn row_score(
             reason = "BM25 is arithmetic on counts; all of them are far below f32's exact range"
         )]
         let (df, tf) = (*df as f32, tf as f32);
-        score += term_score(idf(n, df), tf, len, avgdl, k1, b);
+        score += term_score(idf(n, df), tf, len, avgdl, k1, b) * query_weight(k3, qtf(all, term));
     }
     if row
         .iter()
@@ -340,7 +364,8 @@ impl TextIndex {
         stats: &Stats,
         k: usize,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
-        self.search_with(store, key, terms, stats, k, K1, B).await
+        self.search_with(store, key, terms, stats, k, K1, B, None)
+            .await
     }
 
     /// [`Self::search`], scored with an index's own `k1` and `b` (M14).
@@ -360,8 +385,9 @@ impl TextIndex {
         k: usize,
         k1: f32,
         b: f32,
+        k3: Option<f32>,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
-        self.search_prefixed(store, key, terms, &[], stats, k, k1, b)
+        self.search_prefixed(store, key, terms, &[], stats, k, k1, b, k3)
             .await
     }
 
@@ -383,6 +409,7 @@ impl TextIndex {
         k: usize,
         k1: f32,
         b: f32,
+        k3: Option<f32>,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
         let entries = self.entries(terms);
         let runs: Vec<&[TermEntry]> = prefixes
@@ -450,10 +477,12 @@ impl TextIndex {
                 // number then.
                 let df = *stats.df.get(term).unwrap_or(&e.df) as f32;
                 let idf = idf(n, df);
+                // M260: 1 with no `k3`, and for a term the query holds once.
+                let w = query_weight(k3, qtf(terms, term));
                 for (row, tf) in self.dict.decode_list(e, buf) {
                     let len =
                         pstore_format::text::norm_at(&norms, row as usize).unwrap_or(0) as f32;
-                    scores.add(row, term_score(idf, tf as f32, len, avgdl, k1, b));
+                    scores.add(row, term_score(idf, tf as f32, len, avgdl, k1, b) * w);
                 }
             }
             // M180: 1.0 a row the prefixes match, once however many terms or forms match it.

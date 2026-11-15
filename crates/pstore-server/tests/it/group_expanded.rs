@@ -400,3 +400,188 @@ async fn what_expanded_grouping_cannot_mean_is_refused_before_any_blob_request()
         }
     }
 }
+
+// M263: `Min` and `Max` over strings, bools, datetimes and uuids, opted into per aggregate.
+
+const UUIDS: [&str; 3] = [
+    "7d0c3f6e-0000-4000-8000-000000000003",
+    "00000000-0000-4000-8000-0000000000ff",
+    "f0000000-0000-4000-8000-000000000001",
+];
+
+/// Row `i` of the M263 corpus: one attribute of each kind, and a group key.
+fn kinds(i: usize) -> Value {
+    let s = ["pear", "apple", "fig"][i % 3];
+    let t = [
+        "2024-03-01T00:00:00Z",
+        "2023-12-31T23:59:59Z",
+        "2024-01-15T12:00:00Z",
+    ][i % 3];
+    let u = UUIDS[i % 3];
+    let mixed = if i.is_multiple_of(2) {
+        json!(i)
+    } else {
+        json!(s)
+    };
+    let g = ["even", "odd"][i % 2];
+    json!({"id": format!("k{i:02}"), "vector": [1.0, 0.5], "attributes": {
+        "s": s, "b": i.is_multiple_of(3), "t": t, "u": u, "mixed": mixed, "g": g,
+        "blob": "AAE=", "arr": [s, "zzz"],
+    }})
+}
+
+async fn write_kinds(api: &A, range: std::ops::Range<usize>) {
+    let documents: Vec<Value> = range.map(kinds).collect();
+    let body = json!({"durability": "durable", "documents": documents,
+                      "schema": {"t": "datetime", "u": "uuid", "blob": "bytes"}});
+    let (s, b) = send(api, "PUT", "/v1/indexes/docs/documents", &body).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+}
+
+fn any(kind: &str, attr: &str) -> Value {
+    json!([kind, attr, {"non_numeric": true}])
+}
+
+fn extremes_of_each_kind() -> Value {
+    let mut m = Map::new();
+    for a in ["s", "b", "t", "u"] {
+        m.insert(format!("{a}_lo"), any("Min", a));
+        m.insert(format!("{a}_hi"), any("Max", a));
+        m.insert(format!("{a}_plain"), json!(["Min", a]));
+    }
+    Value::Object(m)
+}
+
+fn assert_kinds(got: &Value, what: &str) {
+    let a = &got["aggregations"];
+    let want = json!({
+        "s_lo": "apple", "s_hi": "pear",
+        "b_lo": false, "b_hi": true,
+        "t_lo": "2023-12-31T23:59:59Z", "t_hi": "2024-03-01T00:00:00Z",
+        "u_lo": UUIDS[1], "u_hi": UUIDS[2],
+        "s_plain": null, "b_plain": null, "t_plain": null, "u_plain": null,
+    });
+    for (k, w) in want.as_object().unwrap() {
+        assert_eq!(&a[k], w, "{what} {k}: {got}");
+    }
+}
+
+#[tokio::test]
+async fn min_max_over_each_scalar_kind() {
+    let store = Accounted::new(DepthCounting::new(MemoryStore::new()));
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    let q = json!({"aggregate_by": extremes_of_each_kind()});
+    // Row 0 alone, unfolded then folded: its values are both extremes.
+    write_kinds(&api, 0..1).await;
+    for what in ["unfolded", "one segment"] {
+        let got = query(&api, &q).await;
+        assert_eq!(got["aggregations"]["s_lo"], "pear", "{what}: {got}");
+        assert_eq!(got["aggregations"]["s_hi"], "pear", "{what}: {got}");
+        assert_eq!(got["aggregations"]["u_lo"], UUIDS[0], "{what}: {got}");
+        if what == "unfolded" {
+            fold(&api).await;
+        }
+    }
+    // Rows 1 and 2 hold the other extremes: unfolded beside the segment, then a second
+    // segment, so the answer merges partials holding different extremes.
+    write_kinds(&api, 1..3).await;
+    assert_kinds(&query(&api, &q).await, "a segment and unfolded rows");
+    fold(&api).await;
+    assert_kinds(&query(&api, &q).await, "two segments");
+}
+
+#[tokio::test]
+async fn min_max_numbers_win_over_other_kinds() {
+    let store = Accounted::new(DepthCounting::new(MemoryStore::new()));
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    write_kinds(&api, 0..3).await;
+    fold(&api).await;
+    write_kinds(&api, 3..6).await;
+    // `mixed` holds 0, 2, 4 and "apple", "pear", "fig": the numbers answer, as plain `Min`.
+    let q = json!({"aggregate_by": {
+        "lo": any("Min", "mixed"), "hi": any("Max", "mixed"),
+        "plain_lo": ["Min", "mixed"], "plain_hi": ["Max", "mixed"]}});
+    let got = query(&api, &q).await;
+    let a = &got["aggregations"];
+    assert_eq!(a["lo"], 0, "{got}");
+    assert_eq!(a["hi"], 4, "{got}");
+    assert_eq!(a["lo"], a["plain_lo"], "{got}");
+    assert_eq!(a["hi"], a["plain_hi"], "{got}");
+}
+
+#[tokio::test]
+async fn min_max_of_strings_per_group() {
+    let store = Accounted::new(DepthCounting::new(MemoryStore::new()));
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    // Rows 0..4: even rows pear, fig; odd rows apple, pear.
+    write_kinds(&api, 0..2).await;
+    fold(&api).await;
+    write_kinds(&api, 2..4).await;
+    let q = json!({"aggregate_by": {"lo": any("Min", "s"), "hi": any("Max", "s")},
+                   "group_by": ["g"]});
+    let got = query(&api, &q).await;
+    let groups = got["aggregation_groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{got}");
+    assert_eq!(groups[0]["g"], "even", "{got}");
+    assert_eq!(
+        (&groups[0]["lo"], &groups[0]["hi"]),
+        (&json!("fig"), &json!("pear")),
+        "{got}"
+    );
+    assert_eq!(groups[1]["g"], "odd", "{got}");
+    assert_eq!(
+        (&groups[1]["lo"], &groups[1]["hi"]),
+        (&json!("apple"), &json!("pear")),
+        "{got}"
+    );
+}
+
+#[tokio::test]
+async fn min_max_ignore_bytes_and_arrays() {
+    let store = Accounted::new(DepthCounting::new(MemoryStore::new()));
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    write_kinds(&api, 0..3).await;
+    let q = json!({"aggregate_by": {
+        "blob_lo": any("Min", "blob"), "blob_hi": any("Max", "blob"),
+        "arr_lo": any("Min", "arr"), "arr_hi": any("Max", "arr"), "avg": ["Avg", "s"]}});
+    let got = query(&api, &q).await;
+    for k in ["blob_lo", "blob_hi", "arr_lo", "arr_hi", "avg"] {
+        assert_eq!(got["aggregations"][k], Value::Null, "{k}: {got}");
+    }
+}
+
+#[tokio::test]
+async fn min_max_options_are_refused_when_malformed() {
+    let store = Accounted::new(DepthCounting::new(MemoryStore::new()));
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    write_kinds(&api, 0..3).await;
+    let spent =
+        || [OpClass::Read, OpClass::Write, OpClass::List].map(|c| store.count(TenantId(TENANT), c));
+    let before = spent();
+    for (agg, says) in [
+        (
+            json!(["Sum", "s", {"non_numeric": true}]),
+            "only Min and Max take options",
+        ),
+        (json!(["Min", "s", {"non_numeric": 1}]), "options are"),
+        (json!(["Min", "s", {}]), "options are"),
+        (
+            json!(["Max", "s", {"non_numeric": true, "x": 1}]),
+            "options are",
+        ),
+        (json!(["Max", "s", true]), "options are"),
+        (
+            json!(["Min", "id", {"non_numeric": true}]),
+            "the id is not an attribute",
+        ),
+    ] {
+        let q = json!({"aggregate_by": {"a": agg}});
+        let (s, b) = send(&api, "POST", "/v1/indexes/docs/query", &q).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{agg} -> {b}");
+        assert!(b.to_string().contains(says), "{agg} -> {b}");
+    }
+    assert_eq!(spent(), before, "a refusal reads nothing");
+    // `false` is plain `Min`.
+    let q = json!({"aggregate_by": {"a": ["Min", "s", {"non_numeric": false}]}});
+    assert_eq!(query(&api, &q).await["aggregations"]["a"], Value::Null);
+}

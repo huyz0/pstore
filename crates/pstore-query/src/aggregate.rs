@@ -27,6 +27,11 @@ pub enum Aggregate {
     Max(String),
     /// The numbers' sum over their count, a float (M211); `null` for none.
     Avg(String),
+    /// `Min`, and when the attribute holds no number, the smallest string, bool, datetime or
+    /// uuid, as a group key orders them (M263, opted into per aggregate).
+    MinAny(String),
+    /// `Max`, and when the attribute holds no number, the largest of the others (M263).
+    MaxAny(String),
 }
 
 /// What to compute: labelled aggregates, the attributes to group by, and how many groups.
@@ -180,7 +185,9 @@ impl Spec {
                 | Aggregate::Sum(a)
                 | Aggregate::Min(a)
                 | Aggregate::Max(a)
-                | Aggregate::Avg(a) => Some(a.as_str()),
+                | Aggregate::Avg(a)
+                | Aggregate::MinAny(a)
+                | Aggregate::MaxAny(a) => Some(a.as_str()),
             })
             .chain(self.group_by.iter().map(|g| g.attribute.as_str()))
             .collect();
@@ -325,7 +332,7 @@ impl PartialEq for Key {
 impl Eq for Key {}
 
 /// One aggregate's running state.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Acc {
     count: u64,
     ints: i128,
@@ -339,6 +346,11 @@ struct Acc {
     min: Option<Number>,
     /// The largest number seen (M211).
     max: Option<Number>,
+    /// The smallest string, bool, datetime or uuid seen (M263): `Min`'s answer when no
+    /// number was.
+    lo: Option<Key>,
+    /// The largest of them (M263).
+    hi: Option<Key>,
 }
 
 impl Acc {
@@ -373,9 +385,32 @@ impl Acc {
         }
     }
 
+    /// One string, bool, datetime or uuid for `Min` and `Max` (M263), as a key orders it.
+    ///
+    /// By `Ord::min` and `Ord::max`, not a hand-written `<`: on a tie the two keys are equal,
+    /// so which one is kept cannot be observed, and a strict or non-strict comparison would
+    /// be a mutant no test can kill.
+    fn other(&mut self, lo: Option<&Key>, hi: Option<&Key>) {
+        if let Some(k) = lo {
+            self.lo = Some(
+                self.lo
+                    .take()
+                    .map_or_else(|| k.clone(), |m| m.min(k.clone())),
+            );
+        }
+        if let Some(k) = hi {
+            self.hi = Some(
+                self.hi
+                    .take()
+                    .map_or_else(|| k.clone(), |m| m.max(k.clone())),
+            );
+        }
+    }
+
     fn add(&mut self, other: &Self) {
         self.nums += other.nums;
         self.extremes(other.min, other.max);
+        self.other(other.lo.as_ref(), other.hi.as_ref());
         self.count += other.count;
         self.ints += other.ints;
         self.floats += other.floats;
@@ -385,7 +420,7 @@ impl Acc {
 }
 
 /// An aggregate's result.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Total {
     /// A count, or a sum of integers only within `i64`.
     Int(i64),
@@ -395,6 +430,9 @@ pub enum Total {
     Float(f64),
     /// A float sum that overflowed: JSON cannot carry ±∞.
     Null,
+    /// `Min` or `Max` of an attribute holding no number (M263): a string, bool, datetime or
+    /// uuid.
+    Value(Value),
 }
 
 /// A block's smallest and largest value of `attr`, from the zone of its statistics' kind.
@@ -433,9 +471,22 @@ fn fold(labels: &[(String, Aggregate)], accs: &mut [Acc], doc: &Document) {
                 }
                 _ => {}
             },
-            Aggregate::Min(a) | Aggregate::Max(a) | Aggregate::Avg(a) => {
-                if let Some(n) = doc.attrs.get(a).and_then(Number::of) {
+            Aggregate::Min(a)
+            | Aggregate::Max(a)
+            | Aggregate::Avg(a)
+            | Aggregate::MinAny(a)
+            | Aggregate::MaxAny(a) => {
+                let v = doc.attrs.get(a);
+                if let Some(n) = v.and_then(Number::of) {
                     acc.number(n);
+                } else if matches!(agg, Aggregate::MinAny(_) | Aggregate::MaxAny(_))
+                    && let Some(
+                        v @ (Value::Str(_) | Value::Bool(_) | Value::DateTime(_) | Value::Uuid(_)),
+                    ) = v
+                {
+                    // M263: kept beside the numbers, answered only when there are none.
+                    let k = Key::of(Some(v));
+                    acc.other(Some(&k), Some(&k));
                 }
             }
         }
@@ -573,7 +624,11 @@ impl Aggregator {
             && self.spec.labels.iter().all(|(_, agg)| match agg {
                 Aggregate::Count(None) => true,
                 Aggregate::Count(Some(a)) | Aggregate::Sum(a) => stats.get(a, *b).is_some(),
-                Aggregate::Min(a) | Aggregate::Max(a) | Aggregate::Avg(a) => stats
+                Aggregate::Min(a)
+                | Aggregate::Max(a)
+                | Aggregate::Avg(a)
+                | Aggregate::MinAny(a)
+                | Aggregate::MaxAny(a) => stats
                     .get(a, *b)
                     .is_some_and(|s| s.count() == 0 || extremes_of(zones, a, s).is_some()),
             })
@@ -601,7 +656,9 @@ impl Aggregator {
                 | Aggregate::Sum(a)
                 | Aggregate::Min(a)
                 | Aggregate::Max(a)
-                | Aggregate::Avg(a) => a,
+                | Aggregate::Avg(a)
+                | Aggregate::MinAny(a)
+                | Aggregate::MaxAny(a) => a,
             };
             let Some(stat) = stats.get(attr, *b) else {
                 continue;
@@ -709,10 +766,22 @@ fn extreme(n: Number) -> Total {
     }
 }
 
+/// A string, bool, datetime or uuid extreme as a total (M263), or `null` for none.
+fn other_total(k: Option<&Key>) -> Total {
+    k.and_then(Key::value).map_or(Total::Null, Total::Value)
+}
+
 fn total(agg: &Aggregate, acc: Acc) -> Total {
     match agg {
         Aggregate::Min(_) => acc.min.map_or(Total::Null, extreme),
         Aggregate::Max(_) => acc.max.map_or(Total::Null, extreme),
+        // M263: a number when there was one, as `Min`; else the others' extreme.
+        Aggregate::MinAny(_) => acc
+            .min
+            .map_or_else(|| other_total(acc.lo.as_ref()), extreme),
+        Aggregate::MaxAny(_) => acc
+            .max
+            .map_or_else(|| other_total(acc.hi.as_ref()), extreme),
         Aggregate::Avg(_) => {
             if acc.nums == 0 {
                 return Total::Null;
@@ -1149,7 +1218,7 @@ mod tests {
         let got: Vec<_> = all
             .finish()
             .into_iter()
-            .map(|(k, t)| (k[0].value().unwrap(), t[0]))
+            .map(|(k, t)| (k[0].value().unwrap(), t[0].clone()))
             .collect();
         assert_eq!(
             got,
@@ -1277,7 +1346,7 @@ mod tests {
             for (i, v) in vals.iter().enumerate() {
                 a.offer(&doc(&i.to_string(), v.clone()));
             }
-            a.finish()[0].1[0]
+            a.finish()[0].1[0].clone()
         };
         assert_eq!(sum(&[]), Total::Int(0));
         assert_eq!(
@@ -1317,7 +1386,7 @@ mod tests {
             let mut g = Aggregator::new(spec(a));
             g.offer(&doc("x", Value::Int(1)));
             g.offer(&Document::new("y", vec![1.0]));
-            g.finish()[0].1[0]
+            g.finish()[0].1[0].clone()
         };
         assert_eq!(count(Aggregate::Count(None)), Total::Int(2));
         assert_eq!(count(Aggregate::Count(Some("k".into()))), Total::Int(1));

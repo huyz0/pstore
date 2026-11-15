@@ -3363,13 +3363,40 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
                 "aggregate {label} must be [\"Count\"] or [kind, attribute]"
             ))
         };
-        let (kind, attr) = match v.as_array().map(Vec::as_slice) {
+        let (kind, attr, non_numeric) = match v.as_array().map(Vec::as_slice) {
             // M210: unary Count, the rows admitted, as `["Count", "id"]` counts them.
-            Some([kind]) if kind.as_str() == Some("Count") => ("Count", pstore_query::ID_ATTRIBUTE),
+            Some([kind]) if kind.as_str() == Some("Count") => {
+                ("Count", pstore_query::ID_ATTRIBUTE, false)
+            }
             Some([kind, attr]) => (
                 kind.as_str().ok_or_else(malformed)?,
                 attr.as_str().ok_or_else(malformed)?,
+                false,
             ),
+            // M263: `["Min", attribute, {"non_numeric": true}]`, and `Max` alike.
+            Some([kind, attr, opts]) => {
+                let kind = kind.as_str().ok_or_else(malformed)?;
+                let attr = attr.as_str().ok_or_else(malformed)?;
+                if !matches!(kind, "Min" | "Max") {
+                    return Err(ApiError::bad_request(format!(
+                        "aggregate {label}: only Min and Max take options"
+                    )));
+                }
+                let non_numeric = match opts.as_object().map(|o| {
+                    (
+                        o.len(),
+                        o.get("non_numeric").map(serde_json::Value::as_bool),
+                    )
+                }) {
+                    Some((1, Some(Some(b)))) => b,
+                    _ => {
+                        return Err(ApiError::bad_request(format!(
+                            "aggregate {label}: {kind}'s options are {{\"non_numeric\": bool}}"
+                        )));
+                    }
+                };
+                (kind, attr, non_numeric)
+            }
             _ => return Err(malformed()),
         };
         let agg = match (kind, attr) {
@@ -3377,11 +3404,18 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
             ("Count", a) => Aggregate::Count(Some(a.to_owned())),
             (kind @ ("Sum" | "Min" | "Max" | "Avg"), pstore_query::ID_ATTRIBUTE) => {
                 return Err(ApiError::bad_request(format!(
-                    "aggregate {label}: {kind} of id is not a number"
+                    "aggregate {label}: {kind} of id {}",
+                    if non_numeric {
+                        "is refused: the id is not an attribute"
+                    } else {
+                        "is not a number"
+                    }
                 )));
             }
             ("Sum", a) => Aggregate::Sum(a.to_owned()),
             // M211.
+            ("Min", a) if non_numeric => Aggregate::MinAny(a.to_owned()),
+            ("Max", a) if non_numeric => Aggregate::MaxAny(a.to_owned()),
             ("Min", a) => Aggregate::Min(a.to_owned()),
             ("Max", a) => Aggregate::Max(a.to_owned()),
             ("Avg", a) => Aggregate::Avg(a.to_owned()),
@@ -3537,6 +3571,8 @@ fn total_json(t: pstore_query::Total) -> serde_json::Value {
         pstore_query::Total::Uint(n) => serde_json::Value::from(n),
         pstore_query::Total::Float(f) => serde_json::Value::from(f),
         pstore_query::Total::Null => serde_json::Value::Null,
+        // M263: as an attribute of that value is reported.
+        pstore_query::Total::Value(v) => to_json(&v),
     }
 }
 
@@ -5154,15 +5190,24 @@ async fn create_index<S: BlobStore + 'static>(
     let req: CreateRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("malformed create request: {e}")))?;
     let most = api.ingress.limits().array_elements();
+    // M262: a schema may create a text-only index, of width 0; without one, M147's rule.
+    let least = u64::from(req.schema.is_none());
     let dims = u32::try_from(req.dims)
         .ok()
-        .filter(|d| *d >= 1 && (*d as usize) <= most)
+        .filter(|d| u64::from(*d) >= least && (*d as usize) <= most)
         .ok_or_else(|| {
             ApiError::bad_request(format!(
-                "dims must be from 1 to {most}, the longest array this server admits, not {}",
+                "dims must be from {least} to {most}, the longest array this server admits, \
+                 not {}",
                 req.dims
             ))
         })?;
+    if dims == 0 && req.distance_metric.is_some() {
+        return Err(ApiError::bad_request(
+            "distance_metric names how vectors compare, and a text-only index (no dims) has none",
+        ));
+    }
+    let declared = created_schema(req.schema.as_ref(), dims)?;
     let metric = match req.distance_metric.as_deref() {
         None => pstore_engine::Metric::DotProduct,
         Some(name) => pstore_engine::Metric::parse(name).ok_or_else(|| {
@@ -5174,7 +5219,9 @@ async fn create_index<S: BlobStore + 'static>(
     };
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
-    let epoch = engine.create_index(&index, dims, metric).await?;
+    let epoch = engine
+        .create_index_declared(&index, dims, metric, &declared)
+        .await?;
     Ok(axum::Json(FoldResponse {
         epoch: epoch.0,
         cost: api.spend(tenant).since(before),
@@ -5389,12 +5436,100 @@ struct PatchIndexRequest {
     storage: Option<StoragePatch>,
 }
 
+/// A create's `schema` (M262), read by a write's own parsers: what a write declaring the same
+/// map would record at its first fold. A vector type is `vector`'s alone, of the create's
+/// width; a named vector field is declared by the write that first carries it.
+fn created_schema(
+    schema: Option<&serde_json::Value>,
+    dims: u32,
+) -> Result<pstore_engine::Declared, ApiError> {
+    let Some(schema) = schema else {
+        return Ok(pstore_engine::Declared::default());
+    };
+    let bad = |why: String| ApiError::bad_request(format!("schema: {why}"));
+    let mut map = schema
+        .as_object()
+        .cloned()
+        .ok_or_else(|| bad("an object of attribute names to declarations".to_owned()))?;
+    let mut types = typed::Declarations::new();
+    for (name, ty) in &map {
+        if name == pstore_format::DEFAULT_FIELD {
+            continue;
+        }
+        // `[N]kind`, a width and not `[]string`'s empty brackets.
+        if let Some(t) = ty.as_str().filter(|t| {
+            t.strip_prefix('[')
+                .and_then(|r| r.split_once(']'))
+                .is_some_and(|(n, _)| n.parse::<u32>().is_ok())
+        }) {
+            return Err(bad(format!(
+                "{name:?} is declared {t}; a named vector field is declared by the write that \
+                 first carries it"
+            )));
+        }
+    }
+    // `vector` is always a vector field, so anything but `[N]f32|f16|i8` of the create's
+    // width is refused, as a write refuses it (`vector_declaration`).
+    if let Some(ty) = map.get(pstore_format::DEFAULT_FIELD) {
+        let name = pstore_format::DEFAULT_FIELD;
+        let parsed = ty.as_str().and_then(|t| {
+            let (n, kind) = t.strip_prefix('[')?.split_once(']')?;
+            let n: u32 = n.parse().ok()?;
+            let kind = match kind {
+                "f32" => None,
+                "f16" => Some(pstore_format::typed::Kind::F16),
+                "i8" => Some(pstore_format::typed::Kind::I8),
+                _ => return None,
+            };
+            Some((n, kind))
+        });
+        let kind = match parsed {
+            Some((n, kind)) if n == dims && dims > 0 => kind,
+            Some(_) if dims == 0 => {
+                return Err(bad(format!(
+                    "{name:?} is declared {ty} and the index has no dims"
+                )));
+            }
+            _ => {
+                return Err(bad(format!(
+                    "{name:?} is a vector field and is declared {ty}; this index's vectors are \
+                     [{dims}]f32, [{dims}]f16 or [{dims}]i8"
+                )));
+            }
+        };
+        if let Some(kind) = kind {
+            types.insert(pstore_format::typed::vector_key(name), kind);
+        }
+    }
+    map.remove(pstore_format::DEFAULT_FIELD);
+    let req: WriteRequest = serde_json::from_value(serde_json::json!({
+        "schema": serde_json::Value::Object(map),
+    }))
+    .map_err(|e| bad(e.to_string()))?;
+    let req = WriteRequest {
+        creating: true,
+        ..req
+    };
+    types.extend(declared_types(&req)?);
+    Ok(pstore_engine::Declared {
+        fts: declared_fts(&req)?,
+        trigram: declared_trigram(&req)?,
+        types,
+        texts: declared_further(&req)?,
+    })
+}
+
 /// What `PUT /v1/indexes/{index}` carries (M147). Anything else is refused.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRequest {
+    /// M262: absent or 0 is a text-only index.
+    #[serde(default)]
     dims: u64,
     distance_metric: Option<String>,
+    /// M262: what a write's `schema` declares, recorded now.
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
 }
 
 /// A write body, with the durability level refused by name rather than by serde's message.
@@ -6047,10 +6182,11 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         if name == pstore_format::text::DEFAULT_TEXT_FIELD {
             return Err(bad(format!("{name:?} is the text field, always a string")));
         }
-        if !req
-            .documents
-            .iter()
-            .any(|d| d.attributes.contains_key(name))
+        if !req.creating
+            && !req
+                .documents
+                .iter()
+                .any(|d| d.attributes.contains_key(name))
         {
             return Err(bad(format!(
                 "{name:?} is declared and no document carries it"
@@ -6201,7 +6337,7 @@ fn declared_texts(
                 "{name:?}: a pre_tokenized_array field's type is []string"
             )));
         }
-        if req.documents.is_empty() {
+        if req.documents.is_empty() && !req.creating {
             return Err(bad(
                 "full_text_search is declared and the write has no documents".to_owned(),
             ));
@@ -6270,7 +6406,32 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                     "ascii_folding" => a.ascii_folding = flag(v, k)?,
                     "k1" => fts.k1 = param(v, k, 3.0)?,
                     "b" => fts.b = param(v, k, 1.0)?,
+                    // M260: above zero, so a repeated query term never weighs nothing.
+                    "k3" => {
+                        fts.k3 = Some(
+                            v.as_f64()
+                                .map(|x| x as f32)
+                                .filter(|x| FullText::k3_in_range(*x))
+                                .ok_or_else(|| {
+                                    "full_text_search: k3 must be a number in (0, 1000]".to_owned()
+                                })?,
+                        );
+                    }
                     _ => return Err(format!("full_text_search: unknown option {k:?}")),
+                }
+            }
+            // M261: whitespace tokens keep their punctuation, which no stemmer or stopword list
+            // was written for, as the vendor documents.
+            if fts.analyzer.tokenizer == Tokenizer::Whitespace {
+                let a = &fts.analyzer;
+                if let Some(what) = [
+                    ("stemming: true", a.stemming),
+                    ("remove_stopwords: true", a.remove_stopwords),
+                ]
+                .iter()
+                .find_map(|(what, set)| set.then_some(*what))
+                {
+                    return Err(format!("full_text_search: whitespace takes no {what}"));
                 }
             }
             // M204: every language with a stopword list.
@@ -6496,7 +6657,7 @@ fn declared_trigram(req: &WriteRequest) -> Result<Option<Vec<String>>, ApiError>
     if names.is_empty() {
         return Ok(None);
     }
-    if req.documents.is_empty() {
+    if req.documents.is_empty() && !req.creating {
         return Err(bad(
             "regex is declared and the write has no documents".to_owned()
         ));
@@ -6521,6 +6682,10 @@ fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
     // M181: reported only when set, as a field that never declared one is unchanged.
     if let (Some(max), Some(o)) = (a.max_token_length, out.as_object_mut()) {
         o.insert("max_token_length".to_owned(), max.into());
+    }
+    // M260: likewise.
+    if let (Some(k3), Some(o)) = (f.k3, out.as_object_mut()) {
+        o.insert("k3".to_owned(), k3.into());
     }
     out
 }
