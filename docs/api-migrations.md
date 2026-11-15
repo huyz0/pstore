@@ -1,5 +1,17 @@
 # Native API migration notes
 
+## M265: `compute_attributes`
+
+A relevance query (`vector`, `text`, or both) takes `compute_attributes`, an object of 1 to
+256 names. Each name maps to `[field, "VectorDist", vector]` or to any `rank_by` scoring
+expression, and a computed value may be signed. Each returned row then carries
+`$computed: {name: number | null}`: an expression's value is the score `rank_by` with it would
+give the row, and a `VectorDist` is the metric's distance, nearest of a multi-vector field.
+The ranking, the page and every other field are unchanged, and a `VectorDist` field's
+vectors are returned only where `include_vectors` asks. It is refused beside `rank_by`,
+`aggregate_by` or `as_of`. A query without it is answered as before. Evidence is in
+[M265 verification](milestones/M265/VERIFIED.md).
+
 ## M264: `meta.performance` on every query
 
 A query's and a multi-query's `meta` gain `performance`: `server_total_ms` and

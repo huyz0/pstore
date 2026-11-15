@@ -2664,6 +2664,11 @@
           "rank_by": {
             "description": "An order (an attribute and asc or desc) or a scoring expression (M182; numeric nodes M203)."
           },
+          "compute_attributes": {
+            "type": "object",
+            "description": "1 to 256 values computed on each returned row of a relevance query (M265), never changing the ranking: each name (non-empty, not starting with $) to [field, \"VectorDist\", vector] or a rank_by scoring expression. Refused with as_of, rank_by or aggregate_by.",
+            "additionalProperties": {}
+          },
           "aggregate_by": {
             "description": "Aggregations instead of rows (M140)."
           },
@@ -2786,6 +2791,16 @@
           "$dist": {
             "type": "number",
             "description": "The vector distance under the index's metric: lower is nearer. Absent on an order or a text-only query."
+          },
+          "$computed": {
+            "type": "object",
+            "description": "The query's compute_attributes by name (M265): a number, or null where the row has no value.",
+            "additionalProperties": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
           },
           "attributes": {
             "type": "object",

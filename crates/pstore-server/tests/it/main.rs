@@ -23,6 +23,7 @@ mod buffered;
 mod chaos;
 mod closed_requests;
 mod composition;
+mod computed;
 mod consistency;
 mod cost;
 mod create;

@@ -546,6 +546,11 @@ pub struct QueryRequest {
     /// be the last.
     #[serde(default)]
     pub rank_by: Option<serde_json::Value>,
+    /// `{name: expression}`: values computed on each returned row, never changing the
+    /// ranking (M265). An expression is `[field, "VectorDist", vector]` or a `rank_by`
+    /// scoring expression. Parsed by `lib.rs`'s `computed_attributes`.
+    #[serde(default)]
+    pub compute_attributes: Option<serde_json::Value>,
     /// `{label: ["Count" | "Sum", attr]}`: counts and sums instead of rows (M12). Parsed by
     /// `lib.rs`'s `aggregation`.
     #[serde(default)]
@@ -596,6 +601,10 @@ pub struct ResultRow {
     /// Without `exact` it is the ranking rung's estimate.
     #[serde(rename = "$dist", skip_serializing_if = "Option::is_none")]
     pub dist: Option<f32>,
+    /// The query's `compute_attributes`, by name (M265): a number, or `null` where the row
+    /// has no value. Absent when the query asks for none.
+    #[serde(rename = "$computed", skip_serializing_if = "Option::is_none")]
+    pub computed: Option<std::collections::BTreeMap<String, Option<f32>>>,
     /// Its attributes, **only when the query asked** — absent otherwise, so a query that
     /// did not ask gets exactly the response it always did.
     #[serde(skip_serializing_if = "Option::is_none")]

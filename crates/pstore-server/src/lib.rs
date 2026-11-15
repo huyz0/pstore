@@ -3828,6 +3828,192 @@ fn page_end(req: &QueryRequest) -> usize {
 }
 
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
+    let computing = computed_attributes(req)?;
+    let planned = plan_of(req)?;
+    // M265: values on a relevance ranking's returned rows, at the snapshot it ranked.
+    if computing.is_some() {
+        let refused = |why: &str| {
+            Err(ApiError::bad_request(format!(
+                "compute_attributes: computed on a relevance query's rows; {why}"
+            )))
+        };
+        if req.as_of.is_some() {
+            return refused("it cannot be combined with as_of");
+        }
+        if !matches!(planned, Plan::Ranked(..)) {
+            return refused("an order, a scoring rank_by or an aggregation has none");
+        }
+    }
+    Ok(planned)
+}
+
+/// The most names `compute_attributes` may hold (M265), the vendor's bound.
+const MAX_COMPUTED: usize = 256;
+
+/// One `compute_attributes` value (M265).
+#[derive(Debug, Clone)]
+enum Computing {
+    /// A `rank_by` scoring expression, valued as `rank_by` scores the row.
+    Expr(pstore_query::Expr),
+    /// `[field, "VectorDist", vector]`: the row's field vector's distance from `vector`.
+    VectorDist { field: String, vector: Vec<f32> },
+}
+
+/// A query's `compute_attributes`, in name order, or why it cannot be one (M265).
+fn computed_attributes(req: &QueryRequest) -> Result<Option<Vec<(String, Computing)>>, ApiError> {
+    let Some(v) = req.compute_attributes.as_ref().filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let bad = |why: String| ApiError::bad_request(format!("compute_attributes: {why}"));
+    let map = v
+        .as_object()
+        .ok_or_else(|| bad("an object of names to expressions".to_owned()))?;
+    if map.is_empty() || map.len() > MAX_COMPUTED {
+        return Err(bad(format!(
+            "1 to {MAX_COMPUTED} names, and this has {}",
+            map.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(map.len());
+    for (name, e) in map {
+        if name.is_empty() || name.starts_with('$') {
+            return Err(bad(format!(
+                "{name:?} is not a name: names are non-empty and do not start with $"
+            )));
+        }
+        let computing = match e.as_array().map(Vec::as_slice) {
+            Some([field, op, vector]) if op.as_str() == Some("VectorDist") => {
+                let field = field
+                    .as_str()
+                    .ok_or_else(|| bad(format!("{name}: VectorDist names a vector field")))?;
+                if field == SPARSE_FIELD {
+                    return Err(bad(format!(
+                        "{name}: VectorDist measures a dense field, and {field} is sparse"
+                    )));
+                }
+                let vector: Vec<f32> = vector
+                    .as_array()
+                    .filter(|a| !a.is_empty())
+                    .and_then(|a| {
+                        a.iter()
+                            .map(|x| x.as_f64().map(|x| x as f32).filter(|x| x.is_finite()))
+                            .collect()
+                    })
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "{name}: VectorDist's vector is a non-empty array of numbers"
+                        ))
+                    })?;
+                Computing::VectorDist {
+                    field: field.to_owned(),
+                    vector,
+                }
+            }
+            _ => Computing::Expr(
+                computed_expression(e).map_err(|why| bad(format!("{name}: {why}")))?,
+            ),
+        };
+        out.push((name.clone(), computing));
+    }
+    Ok(Some(out))
+}
+
+/// `v`'s distance from `q` under `metric`, as `$dist` reports one (M265), or `None` when
+/// the widths differ.
+fn vector_dist(metric: pstore_engine::Metric, q: &[f32], v: &[f32]) -> Option<f32> {
+    if q.len() != v.len() {
+        return None;
+    }
+    let (mut dot, mut qq, mut vv, mut l2) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    for (a, b) in q.iter().zip(v) {
+        let (a, b) = (f64::from(*a), f64::from(*b));
+        dot += a * b;
+        qq += a * a;
+        vv += b * b;
+        l2 += (a - b) * (a - b);
+    }
+    let d = match metric {
+        pstore_engine::Metric::DotProduct => -dot,
+        pstore_engine::Metric::CosineDistance => {
+            let norms = (qq * vv).sqrt();
+            if norms == 0.0 {
+                1.0
+            } else {
+                (1.0 - dot / norms).clamp(0.0, 2.0)
+            }
+        }
+        pstore_engine::Metric::EuclideanSquared => l2,
+    };
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a distance on the wire is f32"
+    )]
+    Some(d as f32)
+}
+
+/// Each page row's `compute_attributes` (M265): expressions valued by `evaluator`,
+/// `VectorDist` from the row's fetched vectors. A field of another width is refused.
+fn computed_rows(
+    computing: &[(String, Computing)],
+    evaluator: Option<&pstore_query::Computed>,
+    rows: &[(pstore_engine::Resolved, pstore_engine::Projected)],
+    metric: pstore_engine::Metric,
+) -> Result<Vec<std::collections::BTreeMap<String, Option<f32>>>, ApiError> {
+    let docs: Vec<pstore_format::Document> = rows
+        .iter()
+        .map(|((id, _, attrs, _), _)| pstore_format::Document {
+            id: id.clone(),
+            vectors: std::collections::BTreeMap::new(),
+            attrs: attrs.clone(),
+        })
+        .collect();
+    let mut values = evaluator
+        .map_or_else(Vec::new, |e| e.values(&docs))
+        .into_iter();
+    let mut out = Vec::with_capacity(rows.len());
+    for (_, p) in rows {
+        let mut exprs = values.next().unwrap_or_default().into_iter();
+        let mut row = std::collections::BTreeMap::new();
+        for (name, c) in computing {
+            let v = match c {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "a value on the wire is f32"
+                )]
+                Computing::Expr(_) => exprs.next().flatten().map(|x| x as f32),
+                Computing::VectorDist { field, vector } => {
+                    let held: Vec<&[f32]> = if field == pstore_format::DEFAULT_FIELD {
+                        p.vector.iter().map(Vec::as_slice).collect()
+                    } else {
+                        p.fields
+                            .get(field)
+                            .map(|vs| vs.iter().map(Vec::as_slice).collect())
+                            .unwrap_or_default()
+                    };
+                    let mut nearest: Option<f32> = None;
+                    for v in held {
+                        let d = vector_dist(metric, vector, v).ok_or_else(|| {
+                            ApiError::bad_request(format!(
+                                "compute_attributes: {name}: {field} holds [{}] vectors, and \
+                                 VectorDist's is [{}]",
+                                v.len(),
+                                vector.len()
+                            ))
+                        })?;
+                        nearest = Some(nearest.map_or(d, |n| n.min(d)));
+                    }
+                    nearest
+                }
+            };
+            row.insert(name.clone(), v);
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// [`plan`] without `compute_attributes`.
+fn plan_of(req: &QueryRequest) -> Result<Plan, ApiError> {
     level(req)?;
     vector_projection(req)?;
     // M63: checked first, before an aggregation or an order returns, so every refusal names it.
@@ -4312,6 +4498,7 @@ async fn run<E: BlobStore>(
                         id: d.id,
                         score: None,
                         dist: None,
+                        computed: None,
                         highlight: None,
                         highlights: None,
                     })
@@ -4365,6 +4552,7 @@ async fn run<E: BlobStore>(
                         // The wire's f32, narrowed from the f64 the rows were ordered by.
                         score: Some(pstore_query::wire_score(score)),
                         dist: None,
+                        computed: None,
                         highlight: None,
                         highlights: None,
                     })
@@ -4378,6 +4566,17 @@ async fn run<E: BlobStore>(
             (legs, filter, fusion, boost, highlight, diversify, limit_per)
         }
     };
+    // M265: `compute_attributes`, checked by `plan`, and its expressions' statistics.
+    let computing = computed_attributes(req)?;
+    let exprs: Vec<pstore_query::Expr> = computing
+        .iter()
+        .flatten()
+        .filter_map(|(_, c)| match c {
+            Computing::Expr(e) => Some(e.clone()),
+            Computing::VectorDist { .. } => None,
+        })
+        .collect();
+    let mut evaluator: Option<pstore_query::Computed> = None;
     // M62: the engine ranks the window, and the boost cuts it to `top_k`.
     let top_k = boost
         .as_ref()
@@ -4406,8 +4605,21 @@ async fn run<E: BlobStore>(
             let (vector, named, sparse) = projected.as_ref().map_or((false, &[][..], false), |p| {
                 (p.vector, p.named.as_slice(), p.sparse)
             });
-            engine
-                .query_split_projected(
+            // M265: a `VectorDist` field's vectors ride the same fetch, and are spelled only
+            // where the query projects them.
+            let mut named = named.to_vec();
+            let mut vector = vector || diversify.is_some();
+            for (_, c) in computing.iter().flatten() {
+                if let Computing::VectorDist { field, .. } = c {
+                    if field == pstore_format::DEFAULT_FIELD {
+                        vector = true;
+                    } else if !named.contains(field) {
+                        named.push(field.clone());
+                    }
+                }
+            }
+            let query = || {
+                engine.query_split_projected(
                     index,
                     &legs,
                     filter.as_ref(),
@@ -4415,11 +4627,33 @@ async fn run<E: BlobStore>(
                     top_k,
                     consistency,
                     peers.map(|p| p as &dyn pstore_engine::Peers),
-                    vector || diversify.is_some(),
-                    named,
+                    vector,
+                    &named,
                     sparse,
                 )
-                .await?
+            };
+            if exprs.is_empty() {
+                query().await?
+            } else {
+                // M265: the statistics beside the query, from its snapshot: depth unchanged.
+                let both = || async {
+                    futures_util::future::try_join(
+                        async { query().await.map_err(ApiError::from) },
+                        async {
+                            engine
+                                .computed(index, &exprs, consistency)
+                                .await
+                                .map_err(ApiError::from)
+                        },
+                    )
+                    .await
+                };
+                // Boxed: inline, the query and the statistics together grow every query's
+                // future past a test thread's stack (`peers::explain_counts_remote_segments`).
+                let (answer, gathered) = Box::pin(engine.pinned(index, consistency, both)).await?;
+                evaluator = Some(gathered);
+                answer
+            }
         }
     };
     let token = checked(answer.epoch.0, &answer.watermarks)?;
@@ -4512,10 +4746,18 @@ async fn run<E: BlobStore>(
             .collect();
         (h, terms)
     });
+    let computed = match &computing {
+        None => vec![None; rows.len()],
+        Some(computing) => computed_rows(computing, evaluator.as_ref(), &rows, answer.metric)?
+            .into_iter()
+            .map(Some)
+            .collect(),
+    };
     Ok(Answered {
         results: rows
             .into_iter()
-            .map(|((id, score, attrs, dist), p)| ResultRow {
+            .zip(computed)
+            .map(|(((id, score, attrs, dist), p), computed)| ResultRow {
                 vector: projected
                     .as_ref()
                     .and_then(|e| e.vector(p.vector.as_deref())),
@@ -4546,6 +4788,7 @@ async fn run<E: BlobStore>(
                 id,
                 score: Some(score),
                 dist,
+                computed,
             })
             .collect(),
         epoch: answer.epoch.0,
@@ -5659,6 +5902,21 @@ fn scoring_expression(v: &serde_json::Value) -> Result<pstore_query::Expr, ApiEr
             "rank_by: an expression's filters hold at most {MAX_PATTERNS} patterns, and these \
              hold {patterns}"
         )));
+    }
+    Ok(e)
+}
+
+/// A `compute_attributes` expression (M265): [`scoring_expression`]'s, its root free to be
+/// signed, since it ranks nothing.
+fn computed_expression(v: &serde_json::Value) -> Result<pstore_query::Expr, String> {
+    let e = expression(v)?;
+    e.check_limits()?;
+    let patterns = e.filters().iter().map(|p| p.patterns()).sum::<usize>();
+    if patterns > MAX_PATTERNS {
+        return Err(format!(
+            "an expression's filters hold at most {MAX_PATTERNS} patterns, and these hold \
+             {patterns}"
+        ));
     }
     Ok(e)
 }
