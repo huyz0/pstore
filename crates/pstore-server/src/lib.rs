@@ -3857,6 +3857,78 @@ enum Computing {
     Expr(pstore_query::Expr),
     /// `[field, "VectorDist", vector]`: the row's field vector's distance from `vector`.
     VectorDist { field: String, vector: Vec<f32> },
+    /// `["Highlight", attr, config?]` (M266): `attr`'s fragments, ranked by `rank`, an
+    /// expression whose statistics are read with the others.
+    Highlight {
+        highlight: highlight::Highlight,
+        rank: pstore_query::Expr,
+    },
+}
+
+/// The fragments a `compute_attributes` `Highlight` returns when its config names no
+/// `fragment_limit` (M266): the vendor's default.
+const HIGHLIGHT_FRAGMENTS: u64 = 3;
+
+/// `["Highlight", attr]` or `["Highlight", attr, config]` (M266), or why it is not one.
+fn computed_highlight(
+    req: &QueryRequest,
+    attr: &serde_json::Value,
+    config: Option<&serde_json::Value>,
+) -> Result<Computing, String> {
+    let attr = attr
+        .as_str()
+        .ok_or("Highlight is [\"Highlight\", attr] or [\"Highlight\", attr, config]")?;
+    let mut config = match config {
+        None => serde_json::Map::new(),
+        Some(c) => c
+            .as_object()
+            .cloned()
+            .ok_or("Highlight's config is an object")?,
+    };
+    if config.contains_key("attr") {
+        return Err("Highlight's attr is its second entry, not a config key".into());
+    }
+    let rank = config.remove("rank_fragments_by");
+    config.insert("attr".into(), attr.into());
+    config
+        .entry("fragment_limit")
+        .or_insert_with(|| HIGHLIGHT_FRAGMENTS.into());
+    let highlight = highlight::parse(&serde_json::Value::Object(config))
+        .map_err(|why| format!("Highlight: {why}"))?;
+    let rank = match rank {
+        Some(r) => computed_expression(&r).map_err(|why| format!("rank_fragments_by: {why}"))?,
+        // The query's own text, over `attr`.
+        None => {
+            let legs = req
+                .text
+                .as_ref()
+                .map(TextIn::legs)
+                .transpose()?
+                .unwrap_or_default();
+            let mut clauses: Vec<serde_json::Value> = legs
+                .into_iter()
+                .map(|(_, q, _)| serde_json::json!([attr, "BM25", q]))
+                .collect();
+            let e = match clauses.len() {
+                0 => {
+                    return Err(
+                        "Highlight ranks fragments by the query's text, and this query has none: \
+                         name rank_fragments_by"
+                            .into(),
+                    );
+                }
+                1 => clauses.remove(0),
+                _ => serde_json::json!(["Sum", clauses]),
+            };
+            computed_expression(&e)?
+        }
+    };
+    if !rank.fields().contains(&attr) {
+        return Err(format!(
+            "rank_fragments_by has no BM25 clause over {attr:?}, so it marks nothing there"
+        ));
+    }
+    Ok(Computing::Highlight { highlight, rank })
 }
 
 /// A query's `compute_attributes`, in name order, or why it cannot be one (M265).
@@ -3909,6 +3981,13 @@ fn computed_attributes(req: &QueryRequest) -> Result<Option<Vec<(String, Computi
                     vector,
                 }
             }
+            Some([op, attr]) if op.as_str() == Some("Highlight") => {
+                computed_highlight(req, attr, None).map_err(|why| bad(format!("{name}: {why}")))?
+            }
+            Some([op, attr, config]) if op.as_str() == Some("Highlight") => {
+                computed_highlight(req, attr, Some(config))
+                    .map_err(|why| bad(format!("{name}: {why}")))?
+            }
             _ => Computing::Expr(
                 computed_expression(e).map_err(|why| bad(format!("{name}: {why}")))?,
             ),
@@ -3958,7 +4037,7 @@ fn computed_rows(
     evaluator: Option<&pstore_query::Computed>,
     rows: &[(pstore_engine::Resolved, pstore_engine::Projected)],
     metric: pstore_engine::Metric,
-) -> Result<Vec<std::collections::BTreeMap<String, Option<f32>>>, ApiError> {
+) -> Result<Vec<std::collections::BTreeMap<String, Option<types::Computed>>>, ApiError> {
     let docs: Vec<pstore_format::Document> = rows
         .iter()
         .map(|((id, _, attrs, _), _)| pstore_format::Document {
@@ -3971,16 +4050,30 @@ fn computed_rows(
         .map_or_else(Vec::new, |e| e.values(&docs))
         .into_iter();
     let mut out = Vec::with_capacity(rows.len());
-    for (_, p) in rows {
+    for (doc, (_, p)) in docs.iter().zip(rows) {
         let mut exprs = values.next().unwrap_or_default().into_iter();
         let mut row = std::collections::BTreeMap::new();
+        // The evaluator's index of the next expression: a `Highlight`'s ranking is one.
+        let mut at = 0;
         for (name, c) in computing {
             let v = match c {
                 #[allow(
                     clippy::cast_possible_truncation,
                     reason = "a value on the wire is f32"
                 )]
-                Computing::Expr(_) => exprs.next().flatten().map(|x| x as f32),
+                Computing::Expr(_) => {
+                    at += 1;
+                    exprs
+                        .next()
+                        .flatten()
+                        .map(|x| types::Computed::Number(x as f32))
+                }
+                Computing::Highlight { highlight, .. } => {
+                    exprs.next();
+                    at += 1;
+                    computed_fragments(name, highlight, evaluator, at - 1, doc)?
+                        .map(types::Computed::Fragments)
+                }
                 Computing::VectorDist { field, vector } => {
                     let held: Vec<&[f32]> = if field == pstore_format::DEFAULT_FIELD {
                         p.vector.iter().map(Vec::as_slice).collect()
@@ -4002,7 +4095,7 @@ fn computed_rows(
                         })?;
                         nearest = Some(nearest.map_or(d, |n| n.min(d)));
                     }
-                    nearest
+                    nearest.map(types::Computed::Number)
                 }
             };
             row.insert(name.clone(), v);
@@ -4010,6 +4103,52 @@ fn computed_rows(
         out.push(row);
     }
     Ok(out)
+}
+
+/// A `Highlight`'s fragments of `doc`'s `attr` (M266), each candidate scored by expression
+/// `at` as a document holding only it; `None` where the row has no string there.
+fn computed_fragments(
+    name: &str,
+    highlight: &highlight::Highlight,
+    evaluator: Option<&pstore_query::Computed>,
+    at: usize,
+    doc: &pstore_format::Document,
+) -> Result<Option<Vec<types::HighlightMatch>>, ApiError> {
+    let Some(value) = doc.attrs.get(&highlight.attr) else {
+        return Ok(None);
+    };
+    let Some((analyzer, terms)) = evaluator.and_then(|e| e.marked(at, &highlight.attr)) else {
+        return Ok(None);
+    };
+    // M158: a pre-tokenized field's tokens are not words in a string.
+    if analyzer.tokenizer == pstore_format::text::Tokenizer::PreTokenizedArray {
+        return Err(ApiError::bad_request(format!(
+            "compute_attributes: {name}: {} is pre_tokenized_array, which has nothing to mark",
+            highlight.attr
+        )));
+    }
+    let terms: std::collections::HashSet<String> = terms.into_iter().collect();
+    let fragments = highlight.fragments_ranked(value, &analyzer, &terms, |plain, _| {
+        let docs: Vec<pstore_format::Document> = plain
+            .iter()
+            .map(|t| pstore_format::Document {
+                id: doc.id.clone(),
+                vectors: std::collections::BTreeMap::new(),
+                attrs: std::iter::once((
+                    highlight.attr.clone(),
+                    pstore_format::Value::Str((*t).to_owned()),
+                ))
+                .collect(),
+            })
+            .collect();
+        evaluator
+            .map(|e| e.values_of(at, &docs))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.unwrap_or(0.0))
+            .collect()
+    });
+    Ok(fragments.map(|f| f.into_iter().map(types::HighlightMatch::from).collect()))
 }
 
 /// [`plan`] without `compute_attributes`.
@@ -4572,7 +4711,7 @@ async fn run<E: BlobStore>(
         .iter()
         .flatten()
         .filter_map(|(_, c)| match c {
-            Computing::Expr(e) => Some(e.clone()),
+            Computing::Expr(e) | Computing::Highlight { rank: e, .. } => Some(e.clone()),
             Computing::VectorDist { .. } => None,
         })
         .collect();

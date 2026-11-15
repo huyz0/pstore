@@ -181,7 +181,8 @@ async fn computed_attributes_never_change_the_page() {
         let plain = query(&api, &q).await;
         let mut with = q.clone();
         with["compute_attributes"] = json!({"s": expression(),
-            "d": ["vector", "VectorDist", [1.0, 0.0, 0.0]]});
+            "d": ["vector", "VectorDist", [1.0, 0.0, 0.0]],
+            "h": ["Highlight", "text", {"rank_fragments_by": ["text", "BM25", "fox"]}]});
         let got = query(&api, &with).await;
         let strip = |b: &Value| {
             let mut rows = b["results"].clone();
@@ -300,7 +301,8 @@ async fn computed_attributes_add_no_round() {
         let plain = depth(q.clone()).await;
         let mut with = q.clone();
         with["compute_attributes"] = json!({"s": expression(),
-            "d": ["vector", "VectorDist", [1.0, 0.0, 0.0]]});
+            "d": ["vector", "VectorDist", [1.0, 0.0, 0.0]],
+            "h": ["Highlight", "text", {"rank_fragments_by": ["text", "BM25", "fox"]}]});
         let computed = depth(with).await;
         assert_eq!(computed, plain, "{q}");
         assert!(plain >= 2, "{q}: depth {plain}");
@@ -378,4 +380,222 @@ async fn computed_attributes_refusals() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+}
+
+// M266: `Highlight` within `compute_attributes`.
+
+/// The notes index: sentences for fragments, `common` in most rows and `rare` in one.
+async fn notes() -> (A, Store) {
+    let store = Accounted::new(DepthCounting::new(MemoryStore::new()));
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    let mut documents = vec![
+        json!({"id": "r00", "vector": [1.0, 0.0],
+            "text": "The common word sits here. A rare gem appears later. Nothing else to see.",
+            "attributes": {"n": 0, "toks": ["a", "b"]}}),
+        json!({"id": "r09", "vector": [0.9, 0.1],
+            "text": "alpha common. bravo common. delta common. gamma common.",
+            "attributes": {"n": 9}}),
+        json!({"id": "r10", "vector": [0.8, 0.2], "attributes": {"n": 10}}),
+        json!({"id": "r11", "vector": [0.7, 0.3], "text": "Plain words only here. And more.",
+            "attributes": {"n": 11}}),
+    ];
+    for i in 1..9 {
+        documents.push(json!({"id": format!("r{i:02}"), "vector": [0.5, 0.5],
+            "text": format!("common filler {i}. more common words."), "attributes": {"n": i}}));
+    }
+    let body = json!({"durability": "durable", "distance_metric": "cosine_distance",
+        "documents": documents,
+        "schema": {"text": {"type": "string", "full_text_search": true},
+            "toks": {"type": "[]string",
+                "full_text_search": {"tokenizer": "pre_tokenized_array"}}}});
+    let (s, b) = send(&api, "PUT", "/v1/indexes/notes/documents", &body).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    fold(&api).await;
+    (api, store)
+}
+
+async fn ask(api: &A, q: &Value) -> Value {
+    let (s, b) = send(api, "POST", "/v1/indexes/notes/query", q).await;
+    assert_eq!(s, StatusCode::OK, "{q} -> {b}");
+    b
+}
+
+fn row<'a>(b: &'a Value, id: &str) -> &'a Value {
+    b["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id)
+        .unwrap_or_else(|| panic!("{id} not in {b}"))
+}
+
+#[tokio::test]
+async fn computed_highlight_matches_m159() {
+    let (api, _) = notes().await;
+    for u in ["utf-8", "utf-16", "codepoints"] {
+        for n in [1, 2] {
+            let config = json!({"fragment_by": "sentence", "fragment_limit": n,
+                "include_offsets": u});
+            let mut highlight = config.clone();
+            highlight["attr"] = json!("text");
+            let b = ask(
+                &api,
+                &json!({"text": "gem plain", "top_k": 10, "highlight": highlight,
+                    "compute_attributes": {"h": ["Highlight", "text", config]}}),
+            )
+            .await;
+            let rows = b["results"].as_array().unwrap();
+            assert_eq!(rows.len(), 2, "{b}");
+            for r in rows {
+                assert!(r["$highlights"].is_array(), "{r}");
+                assert_eq!(r["$computed"]["h"], r["$highlights"], "{u} {n}: {r}");
+            }
+        }
+    }
+    // Nothing marked: both take the first fragment.
+    let config = json!({"fragment_by": "sentence", "fragment_limit": 2});
+    let b = ask(
+        &api,
+        &json!({"text": "gem plain", "top_k": 10,
+            "highlight": {"attr": "text", "fragment_by": "sentence", "fragment_limit": 2},
+            "compute_attributes": {"h": ["Highlight", "text",
+                {"fragment_by": "sentence", "fragment_limit": 2,
+                 "rank_fragments_by": ["text", "BM25", "zzz"]}],
+                "m": ["Highlight", "text", config]}}),
+    )
+    .await;
+    let r = row(&b, "r11");
+    assert_eq!(
+        r["$computed"]["h"],
+        json!([{"text": "Plain words only here."}]),
+        "{r}"
+    );
+    // No `fragment_limit`: three, as M159's `fragment_limit: 3`.
+    let b = ask(
+        &api,
+        &json!({"text": "common", "top_k": 20,
+            "highlight": {"attr": "text", "fragment_by": "sentence", "fragment_limit": 3},
+            "compute_attributes": {"h": ["Highlight", "text", {"fragment_by": "sentence"}]}}),
+    )
+    .await;
+    let r = row(&b, "r09");
+    assert_eq!(r["$computed"]["h"].as_array().unwrap().len(), 3, "{r}");
+    assert_eq!(r["$computed"]["h"], r["$highlights"], "{r}");
+    // A row without the attribute: null.
+    let b = ask(
+        &api,
+        &json!({"vector": [1.0, 0.0], "top_k": 20,
+            "compute_attributes": {"h": ["Highlight", "text",
+                {"rank_fragments_by": ["text", "BM25", "gem"]}]}}),
+    )
+    .await;
+    let r = row(&b, "r10");
+    assert!(r["$computed"]["h"].is_null(), "{r}");
+    assert!(r["$computed"].as_object().unwrap().contains_key("h"), "{r}");
+}
+
+#[tokio::test]
+async fn computed_highlight_ranks_fragments() {
+    let (api, _) = notes().await;
+    let first = |b: &Value| row(b, "r00")["$computed"]["h"][0]["text"].clone();
+    let by = |rank: Value| {
+        json!({"text": "rare", "top_k": 5, "compute_attributes": {"h": ["Highlight", "text",
+            {"fragment_by": "sentence", "fragment_limit": 1, "rank_fragments_by": rank}]}})
+    };
+    let b = ask(&api, &by(json!(["text", "BM25", "rare common"]))).await;
+    assert_eq!(first(&b), "A <em>rare</em> gem appears later.", "{b}");
+    let b = ask(&api, &by(json!(["text", "BM25", "common"]))).await;
+    assert_eq!(first(&b), "The <em>common</em> word sits here.", "{b}");
+    let b = ask(
+        &api,
+        &by(json!([
+            "Sum",
+            [
+                ["text", "BM25", "rare"],
+                ["Product", 1000.0, ["text", "BM25", "common"]]
+            ]
+        ])),
+    )
+    .await;
+    assert_eq!(first(&b), "The <em>common</em> word sits here.", "{b}");
+    // A vector query names its ranking, and its terms are marked.
+    let b = ask(
+        &api,
+        &json!({"vector": [1.0, 0.0], "top_k": 20, "compute_attributes": {"h": ["Highlight",
+            "text", {"fragment_by": "sentence", "fragment_limit": 1,
+                     "rank_fragments_by": ["text", "BM25", "gem"]}]}}),
+    )
+    .await;
+    assert_eq!(first(&b), "A rare <em>gem</em> appears later.", "{b}");
+}
+
+#[tokio::test]
+async fn computed_highlight_refusals() {
+    let (api, store) = notes().await;
+    let spent =
+        || [OpClass::Read, OpClass::Write, OpClass::List].map(|c| store.count(TenantId(TENANT), c));
+    let t = |h: Value| json!({"text": "rare", "compute_attributes": {"h": h}});
+    for (q, says) in [
+        (t(json!(["Highlight"])), "compute_attributes: h: "),
+        (
+            t(json!(["Highlight", "text", {}, 1])),
+            "compute_attributes: h: ",
+        ),
+        (t(json!(["Highlight", 3])), "Highlight is"),
+        (
+            t(json!(["Highlight", "id"])),
+            "a highlight reads an attribute",
+        ),
+        (
+            t(json!(["Highlight", "$x"])),
+            "a highlight reads an attribute",
+        ),
+        (t(json!(["Highlight", "text", 5])), "config is an object"),
+        (
+            t(json!(["Highlight", "text", {"attr": "x"}])),
+            "second entry",
+        ),
+        (
+            t(json!(["Highlight", "text", {"nope": 1}])),
+            "is not a highlight field",
+        ),
+        (
+            t(json!(["Highlight", "text", {"fragment_limit": 99}])),
+            "fragment_limit is",
+        ),
+        (
+            t(json!(["Highlight", "text", {"rank_fragments_by": ["Sum", []]}])),
+            "rank_fragments_by: ",
+        ),
+        (
+            t(json!(["Highlight", "text", {"rank_fragments_by": ["n", "Gte", 1]}])),
+            "no BM25 clause over",
+        ),
+        (
+            json!({"vector": [1.0, 0.0], "compute_attributes": {"h": ["Highlight", "text"]}}),
+            "name rank_fragments_by",
+        ),
+    ] {
+        let before = spent();
+        let (s, b) = send(&api, "POST", "/v1/indexes/notes/query", &q).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{q} -> {b}");
+        assert!(b.to_string().contains(says), "{q} -> {b}");
+        assert_eq!(spent(), before, "{q}: a refusal reads nothing");
+    }
+    // From the snapshot: not a text field, and a pre-tokenized one.
+    for (h, says) in [
+        (
+            json!(["Highlight", "n", {"rank_fragments_by": ["n", "BM25", "x"]}]),
+            "",
+        ),
+        (
+            json!(["Highlight", "toks", {"rank_fragments_by": ["toks", "BM25", "a"]}]),
+            "pre_tokenized_array",
+        ),
+    ] {
+        let q = json!({"vector": [1.0, 0.0], "top_k": 20, "compute_attributes": {"h": h}});
+        let (s, b) = send(&api, "POST", "/v1/indexes/notes/query", &q).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{q} -> {b}");
+        assert!(b.to_string().contains(says), "{q} -> {b}");
+    }
 }

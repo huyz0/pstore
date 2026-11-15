@@ -547,8 +547,9 @@ pub struct QueryRequest {
     #[serde(default)]
     pub rank_by: Option<serde_json::Value>,
     /// `{name: expression}`: values computed on each returned row, never changing the
-    /// ranking (M265). An expression is `[field, "VectorDist", vector]` or a `rank_by`
-    /// scoring expression. Parsed by `lib.rs`'s `computed_attributes`.
+    /// ranking (M265). An expression is `[field, "VectorDist", vector]`, a `rank_by`
+    /// scoring expression, or `["Highlight", attr, config?]` (M266). Parsed by `lib.rs`'s
+    /// `computed_attributes`.
     #[serde(default)]
     pub compute_attributes: Option<serde_json::Value>,
     /// `{label: ["Count" | "Sum", attr]}`: counts and sums instead of rows (M12). Parsed by
@@ -601,10 +602,10 @@ pub struct ResultRow {
     /// Without `exact` it is the ranking rung's estimate.
     #[serde(rename = "$dist", skip_serializing_if = "Option::is_none")]
     pub dist: Option<f32>,
-    /// The query's `compute_attributes`, by name (M265): a number, or `null` where the row
-    /// has no value. Absent when the query asks for none.
+    /// The query's `compute_attributes`, by name (M265): a number, a `Highlight`'s fragments
+    /// (M266), or `null` where the row has no value. Absent when the query asks for none.
     #[serde(rename = "$computed", skip_serializing_if = "Option::is_none")]
-    pub computed: Option<std::collections::BTreeMap<String, Option<f32>>>,
+    pub computed: Option<std::collections::BTreeMap<String, Option<Computed>>>,
     /// Its attributes, **only when the query asked** — absent otherwise, so a query that
     /// did not ask gets exactly the response it always did.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -639,6 +640,16 @@ pub enum VectorOut {
     Float(Vec<f32>),
     /// The standard-alphabet, padded base64 of its little-endian f32 bytes.
     Base64(String),
+}
+
+/// One `compute_attributes` value of a row (M265, M266).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Computed {
+    /// An expression's value or a `VectorDist`, as the wire's `f32`.
+    Number(f32),
+    /// A `Highlight`'s fragments (M266), as M159's `$highlights` gives them.
+    Fragments(Vec<HighlightMatch>),
 }
 
 /// One fragment of a structured highlight (M159). Ranges are `[start, end)` into the

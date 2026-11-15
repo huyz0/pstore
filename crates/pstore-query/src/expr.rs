@@ -516,6 +516,51 @@ impl Computed {
             })
             .collect()
     }
+
+    /// Expression `i`'s value on each of `rows` (M266), as [`Computed::values`] gives it:
+    /// `rows` need not be returned rows. A highlight's fragments are scored this way, each a
+    /// document holding only the fragment.
+    #[must_use]
+    pub fn values_of(&self, i: usize, rows: &[Document]) -> Vec<Option<f64>> {
+        let Some(e) = self.exprs.get(i) else {
+            return vec![None; rows.len()];
+        };
+        let node = Node::of(e, &self.fields);
+        rows.iter()
+            .map(|d| {
+                let mut terms = vec![None; self.fields.0.len()];
+                node.value(&self.fields, d, &mut terms)
+            })
+            .collect()
+    }
+
+    /// The terms expression `i`'s `BM25` clauses over `field` match, under `field`'s
+    /// analyzer, with that analyzer (M266): what a highlight ranked by it marks. `None` when
+    /// it has no such clause.
+    #[must_use]
+    pub fn marked(
+        &self,
+        i: usize,
+        field: &str,
+    ) -> Option<(pstore_format::text::Analyzer, Vec<String>)> {
+        let e = self.exprs.get(i)?;
+        let f = self.fields.0.iter().find(|f| f.name == field)?;
+        let mut terms = Vec::new();
+        let mut any = false;
+        e.walk(&mut |e| {
+            if let Expr::Bm25 {
+                field: of,
+                query,
+                last_as_prefix,
+            } = e
+                && of == field
+            {
+                any = true;
+                terms.extend(leg_terms(&f.text.analyzer, query, *last_as_prefix).0);
+            }
+        });
+        any.then_some((f.text.analyzer, terms))
+    }
 }
 
 impl Field {

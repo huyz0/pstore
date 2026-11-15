@@ -2666,7 +2666,7 @@
           },
           "compute_attributes": {
             "type": "object",
-            "description": "1 to 256 values computed on each returned row of a relevance query (M265), never changing the ranking: each name (non-empty, not starting with $) to [field, \"VectorDist\", vector] or a rank_by scoring expression. Refused with as_of, rank_by or aggregate_by.",
+            "description": "1 to 256 values computed on each returned row of a relevance query (M265), never changing the ranking: each name (non-empty, not starting with $) to [field, \"VectorDist\", vector], a rank_by scoring expression, or [\"Highlight\", attr] / [\"Highlight\", attr, config] (M266: config holds fragment_by, fragment_limit (default 3), include_offsets, pre, post, max_chars and rank_fragments_by). Refused with as_of, rank_by or aggregate_by.",
             "additionalProperties": {}
           },
           "aggregate_by": {
@@ -2794,11 +2794,21 @@
           },
           "$computed": {
             "type": "object",
-            "description": "The query's compute_attributes by name (M265): a number, or null where the row has no value.",
+            "description": "The query's compute_attributes by name (M265): a number, a Highlight's fragments as $highlights gives them (M266), or null where the row has no value.",
             "additionalProperties": {
-              "type": [
-                "number",
-                "null"
+              "anyOf": [
+                {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HighlightMatch"
+                  }
+                }
               ]
             }
           },

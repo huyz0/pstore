@@ -399,6 +399,26 @@ impl Highlight {
         analyzer: &Analyzer,
         terms: &HashSet<String>,
     ) -> Option<Vec<Fragment>> {
+        // M159: a fragment's score is its count of marks.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a count of marks, far below 2^52"
+        )]
+        self.fragments_ranked(value, analyzer, terms, |_, marks| {
+            marks.iter().map(|m| *m as f64).collect()
+        })
+    }
+
+    /// [`Highlight::fragments`], each candidate scored by `score` (M266), given every
+    /// candidate's unmarked text and count of marks, in the order found: taken highest first,
+    /// ties the earliest, overlaps skipped, and one scoring 0 only when none scores more.
+    pub(crate) fn fragments_ranked(
+        &self,
+        value: &pstore_format::Value,
+        analyzer: &Analyzer,
+        terms: &HashSet<String>,
+        score: impl FnOnce(&[&str], &[usize]) -> Vec<f64>,
+    ) -> Option<Vec<Fragment>> {
         use pstore_format::Value;
         let s = self.structure.as_ref()?;
         let texts: Vec<(Option<usize>, &str)> = match value {
@@ -422,10 +442,22 @@ impl Highlight {
         if all.is_empty() {
             return None;
         }
-        // Ranked by marks, then the earliest: a stable sort over the order they were found.
-        all.sort_by(|a, b| b.marks.len().cmp(&a.marks.len()));
+        let plain: Vec<&str> = all
+            .iter()
+            .map(|c| piece(texts.get(c.element).map_or("", |t| t.1), c.from, c.to))
+            .collect();
+        let marks: Vec<usize> = all.iter().map(|c| c.marks.len()).collect();
+        let scores = score(&plain, &marks);
+        let at = |i: usize| scores.get(i).copied().unwrap_or(0.0);
+        // Ranked by score, then the earliest: a stable sort over the order they were found.
+        let mut order: Vec<usize> = (0..all.len()).collect();
+        order.sort_by(|a, b| at(*b).total_cmp(&at(*a)));
         let mut taken: Vec<&Candidate> = Vec::new();
-        for c in all.iter().filter(|c| !c.marks.is_empty()) {
+        for c in order
+            .into_iter()
+            .filter(|i| at(*i) > 0.0)
+            .filter_map(|i| all.get(i))
+        {
             if taken.len() == s.limit {
                 break;
             }
@@ -437,7 +469,7 @@ impl Highlight {
             }
         }
         if taken.is_empty() && s.limit > 0 {
-            // Nothing marked: every candidate scores 0, so the first is the earliest.
+            // Nothing scores above 0, so the first is the earliest.
             taken.extend(all.first());
         }
         Some(

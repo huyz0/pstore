@@ -1,5 +1,16 @@
 # Native API migration notes
 
+## M266: `Highlight` in `compute_attributes`
+
+`compute_attributes` also takes `["Highlight", attr]` and `["Highlight", attr, config]`. The
+config holds `fragment_by`, `fragment_limit` (default **3** here, not `highlight`'s 1),
+`include_offsets`, `pre`, `post`, `max_chars` and `rank_fragments_by`, a `rank_by` scoring
+expression that orders `attr`'s candidate fragments, each scored as if it were the row's whole
+`attr`. It defaults to the query's text over `attr`; a vector query must name one, and it must
+hold a `BM25` clause over `attr`, whose terms are marked. The value is the list of fragments
+`$highlights` gives, or `null`, so `$computed`'s values are now a number, `null` or such a
+list. `highlight` is unchanged. [M266 verification](milestones/M266/VERIFIED.md).
+
 ## M265: `compute_attributes`
 
 A relevance query (`vector`, `text`, or both) takes `compute_attributes`, an object of 1 to
