@@ -1275,6 +1275,33 @@ pub struct Duties {
 mod tests {
     use super::*;
 
+    /// M264 (CI's mutation shard): both spans are in milliseconds, from seconds times 1000.
+    #[test]
+    fn performance_spans_are_milliseconds() {
+        let started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(50))
+            .unwrap_or_else(std::time::Instant::now);
+        let before = pstore_cache::Traffic::default();
+        let after = pstore_cache::Traffic {
+            hit_bytes: 3,
+            miss_bytes: 1,
+        };
+        let p = Performance::of(started, std::time::Duration::from_millis(20), after, before);
+        assert!(
+            (p.query_execution_ms - 20.0).abs() < 1e-9,
+            "{}",
+            p.query_execution_ms
+        );
+        // At least the 50 ms already spent, and nowhere near a second.
+        assert!(
+            (50.0..900.0).contains(&p.server_total_ms),
+            "{}",
+            p.server_total_ms
+        );
+        assert_eq!(p.cache_hit_ratio, Some(0.75));
+        assert_eq!((p.cache_hit_bytes, p.cache_miss_bytes), (3, 1));
+    }
+
     /// The derive `VectorIn` replaced (M119), verbatim, under its own name: the name is in
     /// its message.
     mod derived {

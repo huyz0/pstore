@@ -48,3 +48,11 @@ were killed.
    0 failed, 15 ignored. The two IPv6 tests were NOT-RUN, as in M263, because this container
    has no IPv6 loopback. `cargo deny check`, coverage and the mutation sweep were NOT-RUN
    here; CI runs them on the PR.
+
+## After CI's mutation shard (PR #65)
+Shard 11 found two mutants no test killed: `Performance::of`'s `* 1e3` replaced by `+` for
+`server_total_ms` and by `/` for `query_execution_ms`. The server tests only read the
+fields' presence and order. `performance_spans_are_milliseconds` in `types.rs` builds one
+from a start 50 ms back and a 20 ms execution: `query_execution_ms` is 20, `server_total_ms`
+lies in [50, 900), the ratio is 0.75 of 3 hit and 1 missed bytes. Both mutants, applied by
+hand, turn it red; restored, it passes.

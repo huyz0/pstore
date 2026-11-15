@@ -371,6 +371,23 @@ async fn computed_attributes_refusals() {
         assert!(b.to_string().contains(says), "{q} -> {b}");
         assert_eq!(spent(), before, "{q}: a refusal reads nothing");
     }
+    // M265 (CI's mutation shard): the bound itself is accepted, 256 names answered.
+    let most: serde_json::Map<String, Value> = (0..256)
+        .map(|i| (format!("a{i}"), json!(["n", "Gte", i])))
+        .collect();
+    let (s, b) = send(
+        &api,
+        "POST",
+        "/v1/indexes/docs/query",
+        &json!({"vector": v, "top_k": 1, "compute_attributes": Value::Object(most)}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["results"][0]["$computed"].as_object().unwrap().len(),
+        256,
+        "{b}"
+    );
     // A BM25 clause over a field that is not full-text: refused by the engine, from HEAD.
     let (s, b) = send(
         &api,

@@ -48,3 +48,14 @@ claimed. All seven were killed.
    test binaries: 2,898 passed, 0 failed, 15 ignored. The two IPv6 tests were NOT-RUN, as in
    M264, because this container has no IPv6 loopback. `cargo deny check`, coverage and the
    mutation sweep were NOT-RUN here; CI runs them on the PR.
+
+## After CI's mutation shards (PR #65)
+- Shard 4: `map.len() > MAX_COMPUTED` replaced by `>=` was missed, since the refusals tested
+  257 names and none tested 256. `computed_attributes_refusals` now also asks for 256 names and
+  gets 256 values in `$computed`. The mutant, applied by hand, turns it red.
+- Shard 1: `Engine::computed`'s retry guard `hit` replaced by `true` and by `false` were missed:
+  nothing reaped a segment a cached HEAD named. `computed_retries_only_a_cached_snapshot` in
+  the engine's `snapshot` tests follows `a_scored_query_retries_only_a_cached_snapshot`. A
+  bounded read caches a HEAD, a compaction and GC reap its segments, and the next read
+  succeeds with one fresh HEAD read. An unknown text field on a fresh HEAD fails after one read,
+  with no retry. Each mutant, applied by hand, turns it red.

@@ -359,3 +359,39 @@ async fn the_lane_verdict_is_not_lent_to_other_lanes() {
     assert_eq!(own.unwrap(), Epoch(2));
     assert!(matches!(other, Some(EngineError::NotFolded)), "{other:?}");
 }
+
+/// M265 (CI's mutation shard): `compute_attributes`' statistics retry a cached HEAD naming a
+/// reaped segment once, fresh, as a scored query does -- and an error that came from no cached
+/// HEAD is not retried.
+#[tokio::test]
+async fn computed_retries_only_a_cached_snapshot() {
+    let bm25 = |field: &str| pstore_query::Expr::Bm25 {
+        field: field.to_owned(),
+        query: "q".to_owned(),
+        last_as_prefix: false,
+    };
+    let text = [bm25(pstore_format::text::DEFAULT_TEXT_FIELD)];
+    let level = Consistency::Bounded(Duration::from_secs(60));
+    let (store, r) = world().await;
+    store.rival.fold().await.unwrap();
+    // Cached: a HEAD naming the segments `a, b` and `c` live in.
+    r.computed("idx", &text, level).await.unwrap();
+    let w = Engine::new(Arc::clone(&store.inner), T, LaneId(1));
+    w.compact("idx").await.unwrap();
+    assert!(w.gc(0).await.unwrap() > 0, "nothing reaped");
+    let before = store.reads().0;
+    let got = r.computed("idx", &text, level).await;
+    assert!(got.is_ok(), "{:?}", got.err());
+    assert_eq!(store.reads().0 - before, 1);
+    // A BM25 clause over no text field fails on a fresh HEAD: one read, no retry.
+    let before = store.reads().0;
+    let refused = r
+        .computed("idx", &[bm25("zzz")], Consistency::Eventual)
+        .await;
+    assert!(
+        matches!(refused, Err(EngineError::UnknownTextField(ref f)) if f == "zzz"),
+        "{:?}",
+        refused.err()
+    );
+    assert_eq!(store.reads().0 - before, 1, "retried");
+}
