@@ -386,16 +386,24 @@ impl Acc {
     }
 
     /// One string, bool, datetime or uuid for `Min` and `Max` (M263), as a key orders it.
+    ///
+    /// By `Ord::min` and `Ord::max`, not a hand-written `<`: on a tie the two keys are equal,
+    /// so which one is kept cannot be observed, and a strict or non-strict comparison would
+    /// be a mutant no test can kill.
     fn other(&mut self, lo: Option<&Key>, hi: Option<&Key>) {
-        if let Some(k) = lo
-            && self.lo.as_ref().is_none_or(|m| k < m)
-        {
-            self.lo = Some(k.clone());
+        if let Some(k) = lo {
+            self.lo = Some(
+                self.lo
+                    .take()
+                    .map_or_else(|| k.clone(), |m| m.min(k.clone())),
+            );
         }
-        if let Some(k) = hi
-            && self.hi.as_ref().is_none_or(|m| k > m)
-        {
-            self.hi = Some(k.clone());
+        if let Some(k) = hi {
+            self.hi = Some(
+                self.hi
+                    .take()
+                    .map_or_else(|| k.clone(), |m| m.max(k.clone())),
+            );
         }
     }
 
