@@ -45,3 +45,10 @@ tests and reverted it. No `cargo mutants` run is claimed. All five were killed.
    `scripts/gen-clients.py --check` passes after regenerating the clients, and
    `scripts/clients.sh` passes. The two IPv6 tests were NOT-RUN, as in M265. `cargo deny
    check`, coverage and the mutation sweep were NOT-RUN here; CI runs them on the PR.
+
+## After CI's mutation shard (PR #65)
+Shard 8: `at += 1` for an expression in `computed_rows` replaced by `*=` was missed, since no
+test named an expression before a highlight. `computed_highlight_ranks_fragments` now asks
+for `a` (BM25 `common`) and `h` (a highlight ranked by BM25 `rare common`): the highlight
+keeps the `rare` sentence, which it would lose ranked by `a`. The mutant, applied by hand,
+turns it red.

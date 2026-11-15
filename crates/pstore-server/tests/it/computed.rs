@@ -548,6 +548,21 @@ async fn computed_highlight_ranks_fragments() {
     )
     .await;
     assert_eq!(first(&b), "The <em>common</em> word sits here.", "{b}");
+    // M266 (CI's mutation shard): an expression named before the highlight is the
+    // evaluator's first; the highlight ranks by its own, the second.
+    let b = ask(
+        &api,
+        &json!({"text": "rare", "top_k": 5, "compute_attributes": {
+            "a": ["text", "BM25", "common"],
+            "h": ["Highlight", "text", {"fragment_by": "sentence", "fragment_limit": 1,
+                  "rank_fragments_by": ["text", "BM25", "rare common"]}]}}),
+    )
+    .await;
+    assert_eq!(first(&b), "A <em>rare</em> gem appears later.", "{b}");
+    assert!(
+        row(&b, "r00")["$computed"]["a"].as_f64().unwrap() > 0.0,
+        "{b}"
+    );
     // A vector query names its ranking, and its terms are marked.
     let b = ask(
         &api,
