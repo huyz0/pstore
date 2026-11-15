@@ -400,6 +400,7 @@ that differs is refused, and an upgrade never retokenizes an index.
 | `word_v0`, `word_v1` (the default) | Runs of letters and digits, ideographs included: `東京タワー` is one token. Emoji are dropped |
 | `word_v2` | As `word_v1`, but each ideograph is a token of its own (`東` `京` `タワー`), and an emoji or a flag is one token |
 | `word_v3`, `word_v4` | Unicode word boundaries (UAX #29): `can't` and `3.14` stay whole, ideographs are one each, an emoji or a flag is one token |
+| `whitespace` | Runs between Unicode whitespace, punctuation kept: `stop.` and `don't` are tokens ([M261](milestones/M261/SPEC.md)). `stemming` and `remove_stopwords` are refused; `language` changes nothing |
 | `pre_tokenized_array` | Each string of a `[]string` value is one token, as written ([M158](milestones/M158/SPEC.md)) |
 
 `"max_token_length": n`, an integer from 1 to 255, drops any token of more than `n`

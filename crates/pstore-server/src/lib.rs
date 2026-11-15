@@ -6297,6 +6297,20 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                         .join(", ")
                 ));
             }
+            // M261: whitespace tokens keep their punctuation, which no stemmer or stopword list
+            // was written for, as the vendor documents.
+            if fts.analyzer.tokenizer == Tokenizer::Whitespace {
+                let a = &fts.analyzer;
+                if let Some(what) = [
+                    ("stemming: true", a.stemming),
+                    ("remove_stopwords: true", a.remove_stopwords),
+                ]
+                .iter()
+                .find_map(|(what, set)| set.then_some(*what))
+                {
+                    return Err(format!("full_text_search: whitespace takes no {what}"));
+                }
+            }
             // M158: a pre-tokenized token is kept byte for byte, so nothing may change it --
             // and it is matched case-sensitively, whatever was declared.
             if fts.analyzer.tokenizer == Tokenizer::PreTokenizedArray {

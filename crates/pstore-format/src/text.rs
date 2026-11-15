@@ -199,6 +199,9 @@ pub enum Tokenizer {
     WordV3,
     /// [`Tokenizer::WordV3`]'s tokens (M181): the vendor's edge-case fixes are not published.
     WordV4,
+    /// Maximal runs of characters that are not Unicode whitespace (M261): punctuation stays
+    /// in the token. No stemming and no stopwords.
+    Whitespace,
     /// The client's own tokens: a document's string is one token, kept byte for byte, and a
     /// query operand is its tokens joined by [`TOKEN_SEPARATOR`].
     PreTokenizedArray,
@@ -206,12 +209,13 @@ pub enum Tokenizer {
 
 impl Tokenizer {
     /// Every tokenizer, in the order the wire lists them.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::WordV0,
         Self::WordV1,
         Self::WordV2,
         Self::WordV3,
         Self::WordV4,
+        Self::Whitespace,
         Self::PreTokenizedArray,
     ];
 
@@ -224,6 +228,7 @@ impl Tokenizer {
             Self::WordV2 => "word_v2",
             Self::WordV3 => "word_v3",
             Self::WordV4 => "word_v4",
+            Self::Whitespace => "whitespace",
             Self::PreTokenizedArray => "pre_tokenized_array",
         }
     }
@@ -651,6 +656,23 @@ fn raw_spans(tokenizer: Tokenizer, s: &str) -> Vec<std::ops::Range<usize>> {
                     .into_iter()
                     .map(|r| r.start + from..r.end + from),
             );
+            out
+        }
+        // M261: every run between whitespace, whole.
+        Tokenizer::Whitespace => {
+            let mut out = Vec::new();
+            let mut start = None;
+            for (i, c) in s.char_indices() {
+                match (start, c.is_whitespace()) {
+                    (None, false) => start = Some(i),
+                    (Some(from), true) => {
+                        out.push(from..i);
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            out.extend(start.map(|from| from..s.len()));
             out
         }
         Tokenizer::WordV3 | Tokenizer::WordV4 => s

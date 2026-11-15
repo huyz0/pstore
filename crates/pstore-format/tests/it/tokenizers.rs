@@ -286,3 +286,70 @@ fn tokenizer_tables_are_unicode_16() {
     assert!(text::is_regional_indicator('\u{1F1E6}'));
     assert!(!text::is_regional_indicator('A'));
 }
+
+/// M261: golden `whitespace` tokens, written from the definition by hand.
+#[test]
+fn whitespace_tokens() {
+    let ws = with(Tokenizer::Whitespace);
+    let golden: &[(&str, &[&str])] = &[
+        ("don't stop.", &["don't", "stop."]),
+        ("a\tb\nc\r\nd", &["a", "b", "c", "d"]),
+        // U+3000 ideographic space and U+00A0 no-break space are whitespace.
+        ("東京\u{3000}タワー\u{a0}x", &["東京", "タワー", "x"]),
+        ("  lead and trail  ", &["lead", "and", "trail"]),
+        ("e-mail,3.14!🎉", &["e-mail,3.14!🎉"]),
+        ("", &[]),
+        ("   ", &[]),
+    ];
+    for (input, want) in golden {
+        assert_eq!(raw(&ws, input), *want, "{input:?}");
+    }
+    // Spans cut the input exactly.
+    let s = "  Ab, \u{3000}cd ";
+    let spans: Vec<_> = tokens(&ws, s).into_iter().map(|t| t.span).collect();
+    assert_eq!(spans, [2..5, 9..11]);
+    // Then the usual pipeline: case, folding, the limit.
+    assert_eq!(analyze(&ws, "Don't STOP."), ["don't", "stop."]);
+    let cased = Analyzer {
+        case_sensitive: true,
+        ..ws
+    };
+    assert_eq!(analyze(&cased, "Don't STOP."), ["Don't", "STOP."]);
+    let folded = Analyzer {
+        ascii_folding: true,
+        ..ws
+    };
+    assert_eq!(analyze(&folded, "Café, déjà-vu"), ["cafe,", "deja-vu"]);
+    let short = limited(Tokenizer::Whitespace, 3);
+    assert_eq!(analyze(&short, "ab abc abcd a.b."), ["ab", "abc"]);
+    // A query is tokenized as a document.
+    assert_eq!(analyze_query(&ws, "stop. now"), ["stop.", "now"]);
+}
+
+#[test]
+fn whitespace_lines_round_trip() {
+    for max in [None, Some(3)] {
+        let f = full(Analyzer {
+            max_token_length: max,
+            ..with(Tokenizer::Whitespace)
+        });
+        let line = f.encode();
+        match max {
+            None => assert!(
+                line.starts_with("v2;") && line.ends_with(";whitespace"),
+                "{line}"
+            ),
+            Some(m) => assert!(
+                line.starts_with("v3;") && line.ends_with(&format!(";whitespace;{m}")),
+                "{line}"
+            ),
+        }
+        assert_eq!(FullText::decode(&line), Some(f), "{line}");
+    }
+    // Every other tokenizer's line is what it was: none names `whitespace`.
+    for t in Tokenizer::ALL {
+        if t != Tokenizer::Whitespace {
+            assert!(!full(with(t)).encode().contains("whitespace"), "{t:?}");
+        }
+    }
+}
