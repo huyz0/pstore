@@ -1,5 +1,15 @@
 # Native API migration notes
 
+## M264: `meta.performance` on every query
+
+A query's and a multi-query's `meta` gain `performance`: `server_total_ms` and
+`query_execution_ms` (floats, milliseconds), `cache_hit_bytes` and `cache_miss_bytes` (the
+tenant's read cache over this request's cacheable reads), and `cache_hit_ratio` (`null`
+without a cache or a cacheable read). The byte counts are attributed as `cost` is: exact with
+one request in flight, blurred under concurrency. A client that refuses unknown fields in
+`meta` must accept the new one; nothing else changes. Evidence is in
+[M264 verification](milestones/M264/VERIFIED.md).
+
 ## M263: `Min` and `Max` over strings, bools, datetimes and uuids
 
 `aggregate_by` takes `["Min", attribute, {"non_numeric": true}]`, and `Max` alike: when the

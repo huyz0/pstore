@@ -58,8 +58,8 @@ pub use peers::{GossipConfig, PeerConfig, PeerGossip, peer_list_of};
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IdempotencyKeyResponse, IndexList,
-    IndexProgress, IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta,
-    QueryRequest, QueryResponse, ReadOnlyResponse, RecallGroundTruth, RecallNeighbor,
+    IndexProgress, IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, Performance,
+    QueryMeta, QueryRequest, QueryResponse, ReadOnlyResponse, RecallGroundTruth, RecallNeighbor,
     RecallResponse, ResultRow, Schema, StorageSettings, TextIn, WarmMeta, WarmResponse,
     WriteRequest, WriteResponse,
 };
@@ -3018,6 +3018,7 @@ async fn query_index<S: BlobStore + 'static>(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
+    let started = std::time::Instant::now();
     let tenant = tenant_of(&headers)?;
     let token = session_of(&headers, tenant)?;
     let fast = fast_query(&body);
@@ -3045,6 +3046,8 @@ async fn query_index<S: BlobStore + 'static>(
         let _reserved = api.ingress.reserve_rows(tenant, rows)?;
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
+        let traffic = engine.store().traffic();
+        let executing = std::time::Instant::now();
         let peers = api.query_peers(tenant, &req);
         let explaining = req.explain;
         let ((got, faceted), explained) = explain::collect(explaining, async {
@@ -3074,6 +3077,7 @@ async fn query_index<S: BlobStore + 'static>(
             })
         })
         .await?;
+        let execution = executing.elapsed();
         let facets_epoch = faceted.as_ref().map(|f| f.epoch);
         let facets = faceted.map(|f| facets::render(f.aggregations, f.aggregation_groups));
         let session = got.token.encode();
@@ -3088,6 +3092,12 @@ async fn query_index<S: BlobStore + 'static>(
                     epoch: got.epoch,
                     unfolded_hits: got.unfolded_hits,
                     cost: api.spend(tenant).since(before),
+                    performance: Performance::of(
+                        started,
+                        execution,
+                        engine.store().traffic(),
+                        traffic,
+                    ),
                     consistency: got.consistency,
                     session: session.clone(),
                     staleness_ms: got.staleness_ms,
@@ -3112,6 +3122,8 @@ async fn query_index<S: BlobStore + 'static>(
     let _reserved = api.ingress.reserve_rows(tenant, rows)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
+    let traffic = engine.store().traffic();
+    let executing = std::time::Instant::now();
     // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
     let peers: Vec<Option<peers::QueryPeers>> =
         reqs.iter().map(|r| api.query_peers(tenant, r)).collect();
@@ -3157,6 +3169,7 @@ async fn query_index<S: BlobStore + 'static>(
         None => all().await,
     };
     let got = api.requesting(tenant, got).await?;
+    let execution = executing.elapsed();
     // From the sub-queries' own tokens, never the request's: each already carries it, less
     // the entries its HEAD covers, and merging the request's back would restore them.
     let mut merged = got
@@ -3195,6 +3208,7 @@ async fn query_index<S: BlobStore + 'static>(
                 epochs,
                 unfolded_hits,
                 cost: api.spend(tenant).since(before),
+                performance: Performance::of(started, execution, engine.store().traffic(), traffic),
                 consistencies,
                 session: session.clone(),
                 staleness_ms,

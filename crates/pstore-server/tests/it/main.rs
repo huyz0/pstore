@@ -69,6 +69,7 @@ mod patterns;
 mod peer_fixture;
 mod peer_startup;
 mod peers;
+mod performance;
 mod persistent_types;
 mod pre_tokenized;
 mod progress;

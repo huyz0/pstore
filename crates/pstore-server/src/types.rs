@@ -649,6 +649,52 @@ pub struct HighlightMatch {
     pub array_index: Option<usize>,
 }
 
+/// How long a query took and what its cache answered (M264).
+///
+/// ⚠️ The cache's bytes are `cost`'s kind of number: differences of the tenant's monotone
+/// counters, exact with one request in flight and cross-attributed under concurrency.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Performance {
+    /// Milliseconds from the handler's first line to the response being built, its body's
+    /// serialisation not included.
+    pub server_total_ms: f64,
+    /// Milliseconds running the planned queries and facets: `server_total_ms` less parsing,
+    /// planning and admission.
+    pub query_execution_ms: f64,
+    /// `cache_hit_bytes / (cache_hit_bytes + cache_miss_bytes)`; `null` when the request made
+    /// no cacheable read or the server keeps no cache.
+    pub cache_hit_ratio: Option<f64>,
+    /// Bytes of cacheable reads (ranges, suffixes, immutable objects) the cache answered.
+    pub cache_hit_bytes: u64,
+    /// Bytes of cacheable reads that went to the store.
+    pub cache_miss_bytes: u64,
+}
+
+impl Performance {
+    /// From the request's start, its execution's span, and the tenant's cache counters
+    /// after and before.
+    #[must_use]
+    pub fn of(
+        started: std::time::Instant,
+        execution: std::time::Duration,
+        after: pstore_cache::Traffic,
+        before: pstore_cache::Traffic,
+    ) -> Self {
+        let hit = after.hit_bytes.saturating_sub(before.hit_bytes);
+        let miss = after.miss_bytes.saturating_sub(before.miss_bytes);
+        let asked = hit.saturating_add(miss);
+        #[allow(clippy::cast_precision_loss, reason = "a ratio of byte counts")]
+        let ratio = (asked > 0).then(|| hit as f64 / asked as f64);
+        Self {
+            server_total_ms: started.elapsed().as_secs_f64() * 1e3,
+            query_execution_ms: execution.as_secs_f64() * 1e3,
+            cache_hit_ratio: ratio,
+            cache_hit_bytes: hit,
+            cache_miss_bytes: miss,
+        }
+    }
+}
+
 /// What the answer cost and how fresh it is.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryMeta {
@@ -663,6 +709,8 @@ pub struct QueryMeta {
     pub unfolded_hits: usize,
     /// What it cost.
     pub cost: Cost,
+    /// How long it took and what its cache answered (M264).
+    pub performance: Performance,
     /// The level served: `eventual` or `strong` (M9i.2).
     pub consistency: &'static str,
     /// The session token, as the `x-pstore-session` header carries it (M11.1).
@@ -807,6 +855,8 @@ pub struct MultiQueryMeta {
     pub unfolded_hits: Vec<usize>,
     /// What the whole request cost.
     pub cost: Cost,
+    /// How long the whole request took and what its cache answered (M264).
+    pub performance: Performance,
     /// Each query's level served (M9i.2).
     pub consistencies: Vec<&'static str>,
     /// The session token, merged over every query (M11.1).

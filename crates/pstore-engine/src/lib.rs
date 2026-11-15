@@ -2777,6 +2777,13 @@ async fn backoff(lane: LaneId, attempt: u32) {
 }
 
 impl<S: BlobStore> Engine<S> {
+    /// The store this engine reads and writes through: for a server, the tenant's cached
+    /// view, whose read counters a response reports (M264).
+    #[must_use]
+    pub fn store(&self) -> &Arc<S> {
+        &self.store
+    }
+
     /// A writer on one lane of one tenant.
     pub fn new(store: Arc<S>, tenant: TenantId, lane: LaneId) -> Self {
         Self {
