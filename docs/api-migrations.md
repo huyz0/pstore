@@ -34,6 +34,24 @@ whitespace, punctuation kept, then case, folding and `max_token_length` as usual
 schema with `k3` is refused by an older build. Evidence is in
 [M260 verification](milestones/M260/VERIFIED.md).
 
+## M236: every leg of a request from one snapshot
+
+M131's one snapshot now covers every multi-query and every faceted query:
+
+- Legs at different consistencies run at the **strongest** of them: `strong`, then
+  `eventual`, then `bounded` with the smallest `max_staleness_ms`. A weaker leg is served
+  the stronger snapshot, which keeps its promise; its `staleness_ms` is that snapshot's (0
+  unless it came from the `bounded` cache). A strong leg that finds an unfolded write still
+  refuses the whole request `not_folded`, as before.
+- A leg with `as_of` no longer runs apart: it reads its past epoch from the request's one
+  HEAD, unless that HEAD came from the `bounded` cache, when it reads its own as before.
+- The strong legs of a request probe each lane once between them, not once each.
+
+Every answer keeps its level's promise; a `bounded` leg beside a fresher one is now answered
+from the fresher HEAD, so its answer and `staleness_ms` can be newer than before. The request
+reads HEAD once, and probes L lanes instead of L
+per strong leg. Evidence is in the [M236 verification](milestones/M236/VERIFIED.md).
+
 ## M213: buffered rows are charged the memory they hold
 
 `tenant_buffered_bytes` and `tenant_flush_bytes` (M141) keep their names and defaults, but a
@@ -609,9 +627,8 @@ A sub-query of `{"queries": [...]}` may now be an aggregation (`aggregate_by`, w
   and one more, below.
   Aggregations and facets count their own filtered set: no other sub-query's `top_k` or
   `offset`, and no outer `rerank_by` window, cuts them.
-- Every sub-query, aggregation and facet query answers from one snapshot when the
-  sub-queries share a level and none reads `as_of` (M131). Otherwise each faceted sub-query
-  still counts its facets at its own hits' snapshot.
+- Every sub-query, aggregation and facet query answers from one snapshot (M131, and since
+  M236 whatever the sub-queries' levels and `as_of`).
 - An aggregation sub-query beside an outer `rerank_by` is refused: fusion ranks rows.
   Facets beside it are kept per sub-query.
 
@@ -1120,7 +1137,7 @@ one snapshot: one HEAD and one view of the unfolded rows, taken before any of th
 Every epoch in `meta.epochs` is the same, and `meta.facets_epoch` equals `meta.epoch`. A
 request reads HEAD once instead of once per leg.
 
-This applies when every leg has the same consistency (`session` counts as the level it
+⚠️ Superseded by M236, which pins every request. This applied when every leg had the same consistency (`session` counts as the level it
 maps to; two `bounded` legs need the same `max_staleness_ms`) and none has `as_of`. Any
 other request runs its legs separately, as before. If a `bounded` request's cached HEAD
 names a segment that has since been reaped, the whole request is retried once from a
