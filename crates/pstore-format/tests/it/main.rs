@@ -22,6 +22,7 @@ mod lance;
 mod lance21;
 mod multi_text;
 mod parquet;
+mod parquet_write;
 mod pre_tokenized;
 mod search;
 mod sections;

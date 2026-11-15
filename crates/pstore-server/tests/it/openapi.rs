@@ -108,6 +108,7 @@ fn operations(spec: &Value) -> Vec<Op> {
                     let schema = r
                         .pointer("/content/application~1json/schema")
                         .or_else(|| r.pointer("/content/text~1plain/schema"))
+                        .or_else(|| r.pointer("/content/application~1vnd.apache.parquet/schema"))
                         .cloned()
                         .unwrap_or(Value::Null);
                     (s.clone(), schema)

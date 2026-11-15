@@ -184,6 +184,42 @@
    "invalid": true
   },
   {
+   "name": "the rows as one Parquet page",
+   "operation": "export_parquet",
+   "path": {
+    "index": "fx"
+   },
+   "query": {
+    "limit": "2",
+    "include_vectors": "true"
+   },
+   "status": 200
+  },
+  {
+   "name": "an export page holds at least one row",
+   "operation": "export_parquet",
+   "path": {
+    "index": "fx"
+   },
+   "query": {
+    "limit": "0"
+   },
+   "status": 400,
+   "invalid": true
+  },
+  {
+   "name": "include_vectors is true or false",
+   "operation": "export_parquet",
+   "path": {
+    "index": "fx"
+   },
+   "query": {
+    "include_vectors": "maybe"
+   },
+   "status": 400,
+   "invalid": true
+  },
+  {
    "name": "a page of one index",
    "operation": "list_indexes",
    "query": {

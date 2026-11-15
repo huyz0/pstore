@@ -759,6 +759,11 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .route("/v1/indexes/{index}/query", Read.on(post(query_index::<S>)))
             .route("/v1/indexes/{index}/warm", Read.on(post(warm_index::<S>)))
+            // M235: one page of an export at one epoch, as a Parquet file.
+            .route(
+                "/v1/indexes/{index}/export.parquet",
+                Read.on(get(export_parquet::<S>)),
+            )
             // M162: the index's recall, measured at one snapshot.
             .route(
                 "/v1/indexes/{index}/recall",
@@ -4599,6 +4604,118 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
         }),
         other => Err(bad(&format!("{other:?} is not rrf, sum or max"))),
     }
+}
+
+/// `GET /v1/indexes/{index}/export.parquet` (M235): one page of M199's export loop -- the rows
+/// folded by `as_of` (the present HEAD's epoch by default), in id order after `after`, at most
+/// `limit` (10,000, or 1,000 with vectors: the JSON export's bounds) -- as a Parquet file. `x-pstore-epoch` names the epoch and `x-pstore-next-after`
+/// the next page's `after`, absent on the last page.
+async fn export_parquet<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let vectors = match params.get("include_vectors").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "include_vectors must be true or false, not {other:?}"
+            )));
+        }
+    };
+    // The JSON export's bounds, so a page holds no more in memory than one of its pages.
+    let most = if vectors {
+        MAX_VECTOR_ROWS
+    } else {
+        MAX_ORDERED
+    };
+    let limit = match params.get("limit") {
+        None => most,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=most).contains(n))
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "limit is a count of rows from 1 to {most}{}, not {v:?}",
+                    if vectors { " with vectors" } else { "" }
+                ))
+            })?,
+    };
+    let engine = api.engine(tenant).await;
+    let epoch = match params.get("as_of") {
+        Some(v) => pstore_types::Epoch(
+            v.parse::<u64>()
+                .map_err(|_| ApiError::bad_request(format!("as_of is an epoch, not {v:?}")))?,
+        ),
+        None => engine.index_stats_at(&index).await?.0,
+    };
+    let after = params.get("after").map(|a| {
+        pstore_query::Predicate::Cmp(
+            pstore_query::ID_ATTRIBUTE.to_owned(),
+            pstore_query::Op::Gt,
+            pstore_format::Value::Str(a.clone()),
+        )
+    });
+    let by = pstore_query::OrderBy {
+        attr: pstore_query::ID_ATTRIBUTE.to_owned(),
+        desc: false,
+    };
+    // One row past the page says whether another follows.
+    let got = engine
+        .ordered_projected_as_of(
+            &index,
+            by,
+            after.as_ref(),
+            0,
+            limit + 1,
+            epoch,
+            vectors,
+            &[],
+            false,
+        )
+        .await?;
+    if !got.exists {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found",
+            format!("this tenant has no index {index}"),
+        ));
+    }
+    let mut rows = got.rows;
+    let next = (rows.len() > limit).then(|| {
+        rows.truncate(limit);
+        rows.last().map(|d| d.id.clone()).unwrap_or_default()
+    });
+    let fields = if vectors {
+        vec![pstore_format::DEFAULT_FIELD.to_owned()]
+    } else {
+        Vec::new()
+    };
+    // The page's cursor rides in the file too, so a client that keeps only the body pages on.
+    let mut meta = vec![
+        ("pstore.index".to_owned(), index.clone()),
+        ("pstore.epoch".to_owned(), epoch.0.to_string()),
+    ];
+    if let Some(n) = &next {
+        meta.push(("pstore.next_after".to_owned(), n.clone()));
+    }
+    let (file, _) =
+        pstore_format::parquet::write::write(&rows, &fields, &meta, &|v| to_json(v).to_string());
+    let mut res = axum::response::Response::new(axum::body::Body::from(file));
+    let h = res.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/vnd.apache.parquet"),
+    );
+    h.insert("x-pstore-epoch", axum::http::HeaderValue::from(epoch.0));
+    if let Some(n) = next.and_then(|n| axum::http::HeaderValue::from_str(&n).ok()) {
+        h.insert("x-pstore-next-after", n);
+    }
+    Ok(res)
 }
 
 /// `GET /v1/indexes/{index}`.

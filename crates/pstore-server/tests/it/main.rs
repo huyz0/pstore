@@ -61,6 +61,7 @@ mod numeric_scoring;
 mod openapi;
 mod order;
 mod order_keys;
+mod parquet_export;
 mod patch;
 mod patch_by_filter;
 mod patterns;

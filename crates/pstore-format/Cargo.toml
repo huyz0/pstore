@@ -39,3 +39,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Test-only: compressors, to build pages that lie about their size.
 brotli = { version = "8", default-features = false, features = ["std"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "std"] }
+parquet = { version = "60.1.0", default-features = false }
