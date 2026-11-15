@@ -583,3 +583,220 @@ fn bare_and_authenticated_constructors_keep_the_default_limits() {
         assert_eq!(api.request_limits(), RequestLimits::default());
     }
 }
+
+/// M238: `limits(1024, 2, 1, 2048)` with refused bodies drained.
+fn draining() -> RequestLimits {
+    RequestLimits::builder()
+        .body_bytes(1024)
+        .active_requests(2)
+        .tenant_active_requests(1)
+        .reserved_body_bytes(2048)
+        .drain_refused_bodies(true)
+        .build()
+        .unwrap()
+}
+
+/// A body of `chunks` chunks of `size` bytes each, counting the bytes it yields.
+fn counted(chunks: usize, size: usize, read: &Arc<AtomicUsize>) -> Body {
+    let read = Arc::clone(read);
+    let mut left = chunks;
+    Body::from_stream(futures_util::stream::poll_fn(move |_| {
+        if left == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        left -= 1;
+        read.fetch_add(size, Ordering::SeqCst);
+        std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(bytes::Bytes::from(vec![
+            b' ';
+            size
+        ]))))
+    }))
+}
+
+/// M238 criterion 1: each refusal before the body reads it to its end, and is the same refusal.
+#[tokio::test]
+async fn a_refused_body_is_read_to_its_end_when_draining() {
+    let (api, store) = serve(bearer(), draining());
+    let before = requests(&store);
+    let read_only = token("9", &["read"]);
+    let bad = [
+        (None, None, StatusCode::UNAUTHORIZED, "unauthenticated"),
+        (
+            Some("not-a-token"),
+            None,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+        ),
+        (
+            Some(read_only.as_str()),
+            None,
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        ),
+        (
+            Some(read_only.as_str()),
+            Some("gzip"),
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        ),
+    ];
+    for (bearer, encoding, status, code) in bad {
+        let read = Arc::new(AtomicUsize::new(0));
+        let mut req = put(None, bearer).header("content-length", "1000");
+        if let Some(e) = encoding {
+            req = req.header("content-encoding", e);
+        }
+        let got = call(
+            api.clone().router(),
+            req.body(counted(10, 100, &read)).unwrap(),
+        )
+        .await;
+        refused(&got, status, code);
+        assert_eq!(read.load(Ordering::SeqCst), 1000, "{bearer:?}: not drained");
+        assert_eq!(api.ingress_counts(), IngressCounts::default());
+    }
+    // 415 and 429, refused by ingress after authentication.
+    let nine = token("9", &["write"]);
+    let read = Arc::new(AtomicUsize::new(0));
+    let got = call(
+        api.clone().router(),
+        put(None, Some(&nine))
+            .header("content-encoding", "gzip")
+            .header("content-length", "1000")
+            .body(counted(10, 100, &read))
+            .unwrap(),
+    )
+    .await;
+    refused(
+        &got,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported_content_encoding",
+    );
+    assert_eq!(read.load(Ordering::SeqCst), 1000, "415 not drained");
+    let (tx, body) = channel();
+    let held = tokio::spawn(call(
+        api.clone().router(),
+        put(None, Some(&nine)).body(body).unwrap(),
+    ));
+    until(&api, |c| c.active == 1).await;
+    let read = Arc::new(AtomicUsize::new(0));
+    let got = call(
+        api.clone().router(),
+        put(None, Some(&nine))
+            .header("content-length", "1000")
+            .body(counted(10, 100, &read))
+            .unwrap(),
+    )
+    .await;
+    refused(&got, StatusCode::TOO_MANY_REQUESTS, "overloaded");
+    assert_eq!(read.load(Ordering::SeqCst), 1000, "429 not drained");
+    drop(tx);
+    held.await.unwrap();
+    assert_eq!(requests(&store), before, "a refusal reached the store");
+}
+
+/// M238 criterion 2: a body declared over `body_bytes` is refused unread, as before.
+#[tokio::test]
+async fn a_body_declared_too_large_is_never_read() {
+    let (api, _store) = serve(bearer(), draining());
+    let polled = Arc::new(AtomicBool::new(false));
+    let got = call(
+        api.clone().router(),
+        put(None, None)
+            .header("content-length", "1025")
+            .body(spy(&polled))
+            .unwrap(),
+    )
+    .await;
+    refused(&got, StatusCode::UNAUTHORIZED, "unauthenticated");
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "a body past the bound was polled"
+    );
+}
+
+/// M238 criterion 2 (code review): a client awaiting `100 Continue` has sent nothing, and is
+/// not asked to upload a body only to be refused.
+#[tokio::test]
+async fn a_body_behind_expect_continue_is_never_read() {
+    let (api, _store) = serve(bearer(), draining());
+    let read = Arc::new(AtomicUsize::new(0));
+    let got = call(
+        api.clone().router(),
+        put(None, None)
+            .header("content-length", "1000")
+            .header("expect", "100-continue")
+            .body(counted(10, 100, &read))
+            .unwrap(),
+    )
+    .await;
+    refused(&got, StatusCode::UNAUTHORIZED, "unauthenticated");
+    assert_eq!(
+        read.load(Ordering::SeqCst),
+        0,
+        "a body behind Expect was read"
+    );
+}
+
+/// M238 criterion 3: a body of no declared length is read at most `body_bytes` and one chunk.
+#[tokio::test]
+async fn draining_stops_at_its_bound() {
+    let (api, _store) = serve(bearer(), draining());
+    let read = Arc::new(AtomicUsize::new(0));
+    let got = call(
+        api.clone().router(),
+        put(None, None).body(counted(40, 100, &read)).unwrap(),
+    )
+    .await;
+    refused(&got, StatusCode::UNAUTHORIZED, "unauthenticated");
+    let n = read.load(Ordering::SeqCst);
+    assert!((1000..=1100).contains(&n), "read {n} of 4000");
+}
+
+/// M238 criterion 4: a refused body that stops arriving is abandoned at the read deadline.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_refused_body_is_abandoned_at_the_deadline() {
+    let limits = RequestLimits::builder()
+        .body_read_timeout(std::time::Duration::from_millis(500))
+        .drain_refused_bodies(true)
+        .build()
+        .unwrap();
+    let (api, _store) = serve(bearer(), limits);
+    let polled = Arc::new(AtomicBool::new(false));
+    let started = tokio::time::Instant::now();
+    let got = call(
+        api.clone().router(),
+        put(None, None)
+            .header("content-length", "10")
+            .body(spy(&polled))
+            .unwrap(),
+    )
+    .await;
+    refused(&got, StatusCode::UNAUTHORIZED, "unauthenticated");
+    assert!(
+        polled.load(Ordering::SeqCst),
+        "the stalled body was never polled"
+    );
+    assert_eq!(started.elapsed(), std::time::Duration::from_millis(500));
+}
+
+/// M238 criterion 5: off by default, and read from the limits configuration.
+#[test]
+fn drain_refused_bodies_is_read_from_the_config() {
+    assert!(!RequestLimits::default().drain_refused_bodies());
+    let read = |raw: &str| {
+        RequestLimits::from_vars(|k| (k == "PSTORE_REQUEST_LIMITS_CONFIG").then(|| raw.to_owned()))
+    };
+    assert!(!read(r#"{"version":1}"#).unwrap().drain_refused_bodies());
+    assert!(
+        !read(r#"{"version":1,"drain_refused_bodies":false}"#)
+            .unwrap()
+            .drain_refused_bodies()
+    );
+    assert!(
+        read(r#"{"version":1,"drain_refused_bodies":true}"#)
+            .unwrap()
+            .drain_refused_bodies()
+    );
+    assert!(read(r#"{"version":1,"drain_refused_bodies":1}"#).is_err());
+}

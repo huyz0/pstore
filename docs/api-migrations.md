@@ -1,5 +1,15 @@
 # Native API migration notes
 
+## M238: refused bodies can be drained
+
+`PSTORE_REQUEST_LIMITS_CONFIG` accepts `"drain_refused_bodies": true` (default `false`). With
+it, a request refused before its body was read (401, 403, 415, 429, and any other non-2xx)
+has the rest of its body read and discarded, up to `body_bytes` and within the body-read
+deadline, before the refusal is sent; a body declared over `body_bytes` is still refused
+unread. Refusals, their codes and admission are unchanged. Turn it on behind a reverse proxy,
+which otherwise may answer `502` for a refused body over about 1 MiB. Evidence is in the
+[M238 verification](milestones/M238/VERIFIED.md).
+
 ## M236: every leg of a request from one snapshot
 
 M131's one snapshot now covers every multi-query and every faceted query:
