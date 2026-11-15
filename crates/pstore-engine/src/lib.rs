@@ -1880,9 +1880,11 @@ fn describe(f: &FullText) -> String {
         .max_token_length
         .map(|m| format!(", max_token_length {m}"))
         .unwrap_or_default();
+    // M260: named only when set, so a conflict on `k3` alone reads as one.
+    let k3 = f.k3.map(|k| format!(", k3 {k}")).unwrap_or_default();
     format!(
         "tokenizer {}, language {}, stemming {}, remove_stopwords {}, case_sensitive {}, \
-         ascii_folding {}{max}, k1 {}, b {}",
+         ascii_folding {}{max}, k1 {}, b {}{k3}",
         a.tokenizer.name(),
         a.language.name(),
         a.stemming,

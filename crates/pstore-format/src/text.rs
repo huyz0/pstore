@@ -259,6 +259,9 @@ pub struct FullText {
     pub k1: f32,
     /// BM25's length normalisation, in `[0, 1]`.
     pub b: f32,
+    /// BM25's query-term frequency saturation (M260), in `(0, 1000]`; `None` scores each
+    /// distinct query term once, as before M260.
+    pub k3: Option<f32>,
 }
 
 impl PartialEq for FullText {
@@ -266,6 +269,7 @@ impl PartialEq for FullText {
         self.analyzer == other.analyzer
             && self.k1.to_bits() == other.k1.to_bits()
             && self.b.to_bits() == other.b.to_bits()
+            && self.k3.map(f32::to_bits) == other.k3.map(f32::to_bits)
     }
 }
 
@@ -277,6 +281,7 @@ impl Default for FullText {
             analyzer: Analyzer::default(),
             k1: 1.2,
             b: 0.75,
+            k3: None,
         }
     }
 }
@@ -309,11 +314,22 @@ impl FullText {
         };
         // M204: stopwords beyond English, behind a prefix no earlier grammar reads -- a build
         // before would drop English's list from the text instead.
-        if Self::new_stopwords(a) {
+        let line = if Self::new_stopwords(a) {
             format!("v4:{line}")
         } else {
             line
+        };
+        // M260: `k3` outermost, behind a prefix no earlier grammar reads.
+        match self.k3 {
+            Some(k3) => format!("k3:{:08x}:{line}", k3.to_bits()),
+            None => line,
         }
+    }
+
+    /// Whether `k3` is one a declaration can hold (M260): in `(0, 1000]`.
+    #[must_use]
+    pub fn k3_in_range(k3: f32) -> bool {
+        k3 > 0.0 && k3 <= 1000.0
     }
 
     /// Whether `a` drops a list a build before M204 did not have.
@@ -324,6 +340,24 @@ impl FullText {
     /// The full-text schema [`Self::encode`] wrote, or `None` for anything else.
     #[must_use]
     pub fn decode(s: &str) -> Option<Self> {
+        // M260: `k3`, its bits, then the line it would otherwise have.
+        if let Some(rest) = s.strip_prefix("k3:") {
+            let (bits, line) = rest.split_once(':')?;
+            // One spelling: eight lowercase hex digits, as `encode` writes them.
+            if bits.len() != 8 || !bits.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+                return None;
+            }
+            let k3 = f32::from_bits(u32::from_str_radix(bits, 16).ok()?);
+            if !Self::k3_in_range(k3) {
+                return None;
+            }
+            return Self::decode_unprefixed(line).map(|f| Self { k3: Some(k3), ..f });
+        }
+        Self::decode_unprefixed(s)
+    }
+
+    /// A line with no `k3:` prefix.
+    fn decode_unprefixed(s: &str) -> Option<Self> {
         // M204: one spelling each -- the prefix exactly when there is a new list.
         let (prefixed, line) = s.strip_prefix("v4:").map_or((false, s), |l| (true, l));
         Self::decode_line(line).filter(|f| {
@@ -386,6 +420,7 @@ impl FullText {
             },
             k1,
             b,
+            k3: None,
         })
     }
 }

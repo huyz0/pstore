@@ -18,6 +18,7 @@ mod geo;
 mod guards;
 mod ids_at;
 mod index_rows;
+mod k3;
 mod lance;
 mod lance21;
 mod multi_text;

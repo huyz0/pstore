@@ -384,6 +384,7 @@ fn a_full_text_schema_round_trips_live_and_dropped() {
         },
         k1: 2.0,
         b: 0.5,
+        k3: None,
     };
     // A dropped schema whose analyzer is the default but whose `b` is not: written too.
     h.dropped[0].2.fts.b = 0.1;

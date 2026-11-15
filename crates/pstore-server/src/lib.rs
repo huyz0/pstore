@@ -6270,6 +6270,17 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                     "ascii_folding" => a.ascii_folding = flag(v, k)?,
                     "k1" => fts.k1 = param(v, k, 3.0)?,
                     "b" => fts.b = param(v, k, 1.0)?,
+                    // M260: above zero, so a repeated query term never weighs nothing.
+                    "k3" => {
+                        fts.k3 = Some(
+                            v.as_f64()
+                                .map(|x| x as f32)
+                                .filter(|x| FullText::k3_in_range(*x))
+                                .ok_or_else(|| {
+                                    "full_text_search: k3 must be a number in (0, 1000]".to_owned()
+                                })?,
+                        );
+                    }
                     _ => return Err(format!("full_text_search: unknown option {k:?}")),
                 }
             }
@@ -6521,6 +6532,10 @@ fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
     // M181: reported only when set, as a field that never declared one is unchanged.
     if let (Some(max), Some(o)) = (a.max_token_length, out.as_object_mut()) {
         o.insert("max_token_length".to_owned(), max.into());
+    }
+    // M260: likewise.
+    if let (Some(k3), Some(o)) = (f.k3, out.as_object_mut()) {
+        o.insert("k3".to_owned(), k3.into());
     }
     out
 }

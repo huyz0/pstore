@@ -19,6 +19,7 @@ mod common;
 mod exq;
 mod external;
 mod fde_clusters;
+mod k3;
 mod ladder;
 mod lire;
 mod persisted;

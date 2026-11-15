@@ -2656,7 +2656,7 @@ async fn leg<S: BlobStore>(
             let (terms, prefixes) = leg_terms(&text.analyzer, query, *last_as_prefix);
             let hits = idx
                 .search_prefixed(
-                    store, key, &terms, &prefixes, stats, *limit, text.k1, text.b,
+                    store, key, &terms, &prefixes, stats, *limit, text.k1, text.b, text.k3,
                 )
                 .await?;
             Ok(hits

@@ -75,6 +75,7 @@ fn texts() -> Texts {
                 },
                 k1: 1.6,
                 b: 0.4,
+                k3: None,
             },
         )]),
     }

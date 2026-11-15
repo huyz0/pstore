@@ -532,3 +532,127 @@ async fn a_negative_zero_parameter_is_zero() {
     fold(a).await;
     ok_put(a, &[("s", "she runs")], Some(json!({"b": -0.0}))).await;
 }
+
+/// [`oracle`] with M260's `k3`: each distinct query term once, weighed
+/// `((k3 + 1) · qtf) / (k3 + qtf)` when `k3` is set.
+fn oracle_k3(corpus: &[(&str, &str)], query: &str, k3: Option<f64>) -> BTreeMap<String, f64> {
+    let words: Vec<String> = query.split(' ').map(str::to_lowercase).collect();
+    let mut distinct = words.clone();
+    distinct.sort();
+    distinct.dedup();
+    let mut out = BTreeMap::new();
+    for term in &distinct {
+        let qtf = words.iter().filter(|w| *w == term).count() as f64;
+        let w = k3.map_or(1.0, |k3| ((k3 + 1.0) * qtf) / (k3 + qtf));
+        for (id, s) in oracle(corpus, term, 1.2, 0.75) {
+            *out.entry(id).or_insert(0.0) += s * w;
+        }
+    }
+    out
+}
+
+fn close(got: &[(String, f64)], want: &BTreeMap<String, f64>, what: &str) {
+    let got: BTreeMap<String, f64> = got.iter().cloned().collect();
+    assert_eq!(
+        got.keys().collect::<Vec<_>>(),
+        want.keys().collect::<Vec<_>>(),
+        "{what}"
+    );
+    for (id, s) in &got {
+        assert!(
+            (s - want[id]).abs() < 1e-4,
+            "{what} {id}: {s} vs {}",
+            want[id]
+        );
+    }
+}
+
+#[tokio::test]
+async fn k3_over_http() {
+    let q = "revenue revenue board";
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    ok_put(a, CORPUS, Some(json!({"k3": 8}))).await;
+    // Unfolded rows, then folded: one answer.
+    let want = oracle_k3(CORPUS, q, Some(8.0));
+    close(&bm25(a, q).await, &want, "unfolded");
+    fold(a).await;
+    close(&bm25(a, q).await, &want, "folded");
+    // The weight is visible: without `k3`, the repeated term counts once.
+    let unset = oracle_k3(CORPUS, q, None);
+    assert!(
+        want.iter().any(|(id, s)| (s - unset[id]).abs() > 1e-3),
+        "k3 changed nothing"
+    );
+    // A query with no repeated term scores as without `k3`.
+    close(
+        &bm25(a, "revenue board").await,
+        &oracle_k3(CORPUS, "revenue board", None),
+        "no repeats",
+    );
+    let st = stats(a).await;
+    assert_eq!(st["schema"]["full_text_search"]["k3"], json!(8.0), "{st}");
+    // Fixed with the index: another `k3` is a conflict that names it.
+    let (s, b) = put(a, &[("x", "anything")], Some(json!({"k3": 2}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], "schema_conflict", "{b}");
+    assert!(b.to_string().contains("k3 8"), "{b}");
+    assert!(b.to_string().contains("k3 2"), "{b}");
+    // The same `k3` again is no conflict.
+    ok_put(a, &[("y", "revenue")], Some(json!({"k3": 8}))).await;
+}
+
+#[tokio::test]
+async fn k3_unset_is_reported_absent_and_scores_once() {
+    let q = "revenue revenue board";
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    ok_put(a, CORPUS, Some(json!({"k1": 1.2}))).await;
+    fold(a).await;
+    close(&bm25(a, q).await, &oracle_k3(CORPUS, q, None), "unset");
+    let st = stats(a).await;
+    assert!(st["schema"]["full_text_search"].get("k3").is_none(), "{st}");
+}
+
+#[tokio::test]
+async fn k3_out_of_range_is_refused() {
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    for bad in [json!(0), json!(-1), json!(1001), json!("8"), json!(null)] {
+        let (s, b) = put(a, CORPUS, Some(json!({"k3": bad}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {b}");
+        assert!(b.to_string().contains("k3"), "{bad}: {b}");
+    }
+    // The bounds themselves are accepted.
+    let (_, w) = apis(&[2]);
+    ok_put(&w[0], CORPUS, Some(json!({"k3": 1000}))).await;
+}
+
+#[tokio::test]
+async fn k3_in_rank_by_expressions() {
+    let q = "revenue revenue board";
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    ok_put(a, CORPUS, Some(json!({"k3": 8}))).await;
+    fold(a).await;
+    let (s, b) = send(
+        a,
+        "POST",
+        "/v1/indexes/docs/query",
+        &json!({"rank_by": ["Sum", [["text", "BM25", q]]], "top_k": 100}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let got: Vec<(String, f64)> = b["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().to_owned(),
+                r["$dist"].as_f64().or_else(|| r["score"].as_f64()).unwrap(),
+            )
+        })
+        .collect();
+    close(&got, &oracle_k3(CORPUS, q, Some(8.0)), "rank_by Sum");
+}

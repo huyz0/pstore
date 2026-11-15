@@ -443,6 +443,20 @@ How this differs from the vendor's options of the same names:
   reading it with English's list, but may read a row's stamp as no declaration and record
   the index with the default analyzer, as M181 states for its own lines.
 
+## BM25 `k3`
+
+`full_text_search.k3`, a number in `(0, 1000]`, weighs a term the query repeats
+([M260](milestones/M260/SPEC.md)): each distinct term's BM25 is multiplied by
+`((k3 + 1) · qtf) / (k3 + qtf)`, where `qtf` is how often the analyzed query holds it. Unset
+(the default), each distinct term counts once, as before M260; a query that repeats no term
+scores the same either way. It is fixed with the field, like `k1` and `b`. The vendor's
+default is 8.0; pstore's stays unset.
+
+- A `last_as_prefix` token is a prefix, not a term: it adds to no term's `qtf`.
+- ⚠️ Declare `k3` only once every server runs M260: its schema line is new (`k3:`). An older
+  build refuses such a schema in a HEAD, but may read a row's stamp as no declaration and
+  record the index with the default analyzer, as M181 states for its own lines.
+
 ## Replication
 
 An index can follow another index, in the same tenant, another tenant, or another bucket

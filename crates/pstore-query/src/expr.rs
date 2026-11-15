@@ -574,7 +574,7 @@ impl<'a> Node<'a> {
                 };
                 let row = row.get_or_insert_with(|| f.row(d));
                 f64::from(row_score(
-                    terms, prefixes, row, &f.stats, f.text.k1, f.text.b,
+                    terms, prefixes, row, &f.stats, f.text.k1, f.text.b, f.text.k3,
                 ))
             }
             Self::Sum(all) => all.iter().map(|n| n.score(fields, d, rows)).sum(),

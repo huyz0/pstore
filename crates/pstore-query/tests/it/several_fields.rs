@@ -39,6 +39,7 @@ fn fts_b() -> FullText {
         },
         k1: 1.6,
         b: 0.4,
+        k3: None,
     }
 }
 
