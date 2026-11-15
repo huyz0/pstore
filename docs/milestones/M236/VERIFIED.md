@@ -63,3 +63,9 @@ nested `pinned` would inherit the outer pin's cleared `hit` (the server no longe
 a failing `as_of` leg under a `bounded` cache hit reruns every leg once from a fresh HEAD;
 the M131 and M164 test names say "unpinned" (kept, as their assertions are); a request of only
 past-epoch legs builds the unfolded view it does not read (CPU, no request).
+
+CI's mutation shard found three survivors in `pinned_settle` (each `&&` of its key turned to
+`||`): no test ran a strong read under the pin whose HEAD or lanes differed from the pin's.
+`the_lane_verdict_is_not_lent_to_other_lanes` (engine) does: under a strong pin, a new lane
+registers and flushes, and a strong read of another index refuses `not_folded`. Green, and
+each of the three mutants applied by hand fails it.

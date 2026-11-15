@@ -329,3 +329,33 @@ async fn a_scored_query_retries_only_a_cached_snapshot() {
     );
     assert_eq!(store.reads().0 - before, 1, "retried");
 }
+
+/// M236 (CI's mutation shard): under a strong pin, the shared lane verdict serves only reads of
+/// the pin's own HEAD and lanes. A strong read of another index, after a new lane registered
+/// and flushed, reads its own registry, probes that lane, and refuses -- it does not borrow
+/// the verdict the pin's leg took before the lane existed.
+#[tokio::test]
+async fn the_lane_verdict_is_not_lent_to_other_lanes() {
+    let (store, r) = world().await;
+    store.rival.fold().await.unwrap();
+    let late = Engine::new(Arc::clone(&store.inner), T, LaneId(7));
+    let (own, other) = r
+        .pinned("idx", Consistency::Strong, || async {
+            let own = r
+                .ordered_as("idx", &by_id(), None, 0, 10, None, Consistency::Strong)
+                .await
+                .map(|o| o.epoch);
+            late.write("other", vec![Document::new("z", vec![1.0, 0.5])])
+                .await
+                .unwrap();
+            late.flush().await.unwrap();
+            let other = r
+                .ordered_as("other", &by_id(), None, 0, 10, None, Consistency::Strong)
+                .await;
+            Ok::<_, EngineError>((own, other.err()))
+        })
+        .await
+        .unwrap();
+    assert_eq!(own.unwrap(), Epoch(2));
+    assert!(matches!(other, Some(EngineError::NotFolded)), "{other:?}");
+}
