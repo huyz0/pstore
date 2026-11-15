@@ -201,6 +201,50 @@ mod tests {
         assert!(c.held() <= c.budget());
     }
 
+    /// Two hits in a row each become the newest, and every entry stays evictable (CI's
+    /// mutation review of #59: `get`'s `tick += 1` as `*=` gave both hits one tick, so the
+    /// second overwrote the first's place in the order and orphaned two entries for good).
+    #[test]
+    fn hits_in_a_row_keep_every_entry_evictable() {
+        let c = MaskCache::new(cost(999, 1) * 8 + cost(999, 1) / 2);
+        for n in 0..8 {
+            c.insert(key(n), mask(999));
+        }
+        assert!(c.get(&key(0)).is_some());
+        assert!(c.get(&key(1)).is_some());
+        // Seven more evict 2..=7, then 0, the older of the two hits.
+        for n in 8..15 {
+            c.insert(key(n), mask(999));
+        }
+        assert_eq!(c.len(), 8);
+        // Held entries are not empty, and what is held is what they cost (CI's mutation review
+        // of #59: `is_empty` as `true`, and an eviction's `held -= c` as `/=`, missed).
+        assert!(!c.is_empty());
+        let held: usize = [1, 8, 9, 10, 11, 12, 13, 14]
+            .iter()
+            .map(|n| cost(999, *n))
+            .sum();
+        assert_eq!(c.held(), held);
+        for n in [0, 2, 3, 4, 5, 6, 7] {
+            assert!(c.get(&key(n)).is_none(), "{n} held");
+        }
+        for n in [1, 8, 9, 10, 11, 12, 13, 14] {
+            assert!(c.get(&key(n)).is_some(), "{n} evicted");
+        }
+    }
+
+    /// Entries that fill the budget exactly are all held (CI's mutation review of #59:
+    /// `held + cost > budget` as `>=` evicted one to make room it already had).
+    #[test]
+    fn entries_filling_the_budget_exactly_are_all_held() {
+        let c = MaskCache::new(cost(999, 1) * 8);
+        for n in 0..8 {
+            c.insert(key(n), mask(999));
+        }
+        assert_eq!(c.len(), 8);
+        assert_eq!(c.held(), c.budget());
+    }
+
     #[test]
     fn a_large_mask_and_a_zero_budget_keep_nothing() {
         let c = MaskCache::new(8 * cost(1000, 1));
