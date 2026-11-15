@@ -620,6 +620,35 @@ async fn created_schema_refusals_match_writes() {
     assert_eq!(s, StatusCode::OK, "{b}");
     let (_, b) = send(&a, "GET", "/v1/indexes/docs", &Value::Null).await;
     assert_eq!(b["schema"]["vector_types"]["vector"], "[2]f16", "{b}");
+    // `[N]f32` is the default kind: accepted, and nothing further recorded.
+    let (s, b) = create(
+        &a,
+        "plain",
+        &json!({"dims": 2, "schema": {"vector": "[2]f32"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (_, b) = send(&a, "GET", "/v1/indexes/plain", &Value::Null).await;
+    assert!(b["schema"].get("vector_types").is_none(), "{b}");
+    // An array type spelled as a string is not a named vector: the write's parser refuses it.
+    let (s, b) = create(
+        &a,
+        "tags",
+        &json!({"dims": 2, "schema": {"tags": "[]string"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("a write declares"), "{b}");
+    // A vector type on an index with no width says so.
+    let (s, b) = create(
+        &a,
+        "nodims",
+        &json!({"dims": 0, "schema": {"vector": "[2]f16",
+            "text": {"type": "string", "full_text_search": true}}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("has no dims"), "{b}");
     // The width spelled as a write may spell it.
     let (s, b) = create(
         &a,
