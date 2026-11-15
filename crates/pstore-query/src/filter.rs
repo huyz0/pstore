@@ -917,6 +917,11 @@ fn compare(have: &Value, op: Op, want: &Value) -> bool {
 pub(crate) struct Mask(Vec<bool>);
 
 impl Mask {
+    /// The rows it spans, a byte each: what holding it costs (M234).
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// Whether `row` is admitted.
     pub(crate) fn contains(&self, row: &usize) -> bool {
         self.0.get(*row).copied().unwrap_or(false)

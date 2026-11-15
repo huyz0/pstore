@@ -1,5 +1,6 @@
 //! M231: an index's storage settings. The cluster's default comes from `PSTORE_BLOCK_LAYOUT`,
-//! `PSTORE_EQUALITY_FILTERS` and `PSTORE_BLOCK_AGGREGATES`; `PATCH /v1/indexes/{index}`
+//! `PSTORE_EQUALITY_FILTERS` and `PSTORE_BLOCK_AGGREGATES` (and M234's
+//! `PSTORE_FILTER_CACHE_BYTES`); `PATCH /v1/indexes/{index}`
 //! overrides it per index, and the index's summary says what its next fold writes.
 #![allow(
     clippy::unwrap_used,
@@ -66,10 +67,26 @@ fn the_cluster_default_is_read_from_the_environment() {
             aggregates: false,
         }
     );
+    // M234: the filter-mask cache's budget.
+    let c = Config::from_vars(vars(&[("PSTORE_LANE", "1")])).unwrap();
+    assert_eq!(
+        c.filter_cache_bytes,
+        pstore_server::DEFAULT_FILTER_CACHE_BYTES
+    );
+    for (v, want) in [("0", 0), ("1048576", 1 << 20)] {
+        let c = Config::from_vars(vars(&[
+            ("PSTORE_LANE", "1"),
+            ("PSTORE_FILTER_CACHE_BYTES", v),
+        ]))
+        .unwrap();
+        assert_eq!(c.filter_cache_bytes, want);
+    }
     for (var, bad) in [
         ("PSTORE_BLOCK_LAYOUT", "row"),
         ("PSTORE_EQUALITY_FILTERS", "true"),
         ("PSTORE_BLOCK_AGGREGATES", ""),
+        ("PSTORE_FILTER_CACHE_BYTES", "-1"),
+        ("PSTORE_FILTER_CACHE_BYTES", "64MiB"),
     ] {
         let e = Config::from_vars(vars(&[("PSTORE_LANE", "1"), (var, bad)])).unwrap_err();
         assert!(e.to_string().contains(&format!("{var}={bad}")), "{e}");
@@ -147,6 +164,9 @@ async fn columnar(store: &Accounted<MemoryStore>) -> Vec<bool> {
 async fn an_index_overrides_the_cluster_default_and_says_so() {
     let store = Accounted::new(MemoryStore::new());
     let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    // The server binary's default cache (M234): an `Api` keeps none until it is set.
+    assert!(api.mask_cache().is_none());
+    api.set_filter_cache_bytes(pstore_server::DEFAULT_FILTER_CACHE_BYTES);
     // The cluster default is rows, as an operator mid-rollout sets it.
     api.set_block_options(BlockOptions {
         columnar: false,
@@ -160,14 +180,15 @@ async fn an_index_overrides_the_cluster_default_and_says_so() {
     assert_eq!(
         storage(&api).await,
         json!({"block_layout": "rows", "equality_filters": true, "block_aggregates": true,
-               "overrides": {}})
+               "filter_cache": true, "overrides": {}})
     );
     assert_eq!(columnar(&store).await, [false]);
 
     let (s, b) = send(&api, "PATCH", "/v1/indexes/t", &patch).await;
     assert_eq!(s, StatusCode::OK, "{b}");
     let want = json!({"block_layout": "columnar", "equality_filters": true,
-                      "block_aggregates": true, "overrides": {"block_layout": "columnar"}});
+                      "block_aggregates": true, "filter_cache": true,
+                      "overrides": {"block_layout": "columnar"}});
     assert_eq!(b["storage"], want);
     assert!(b.get("read_only").is_none(), "{b}");
     assert_eq!(storage(&api).await, want);
@@ -200,6 +221,41 @@ async fn an_index_overrides_the_cluster_default_and_says_so() {
     assert_eq!(b["storage"]["block_layout"], "rows");
     write(&api, 40, 60).await;
     assert_eq!(columnar(&store).await, [false, true, false]);
+
+    // M234: the cache override, and a server keeping no cache, which no override turns on.
+    let (s, b) = send(
+        &api,
+        "PATCH",
+        "/v1/indexes/t",
+        &json!({"storage": {"filter_cache": false}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["storage"]["filter_cache"], false);
+    assert_eq!(b["storage"]["overrides"], json!({"filter_cache": false}));
+    let none = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    none.set_filter_cache_bytes(0);
+    assert!(none.mask_cache().is_none());
+    write(&none, 0, 5).await;
+    let (s, b) = send(
+        &none,
+        "PATCH",
+        "/v1/indexes/t",
+        &json!({"storage": {"filter_cache": true}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["storage"]["filter_cache"], false);
+    assert_eq!(b["storage"]["overrides"], json!({"filter_cache": true}));
+    let (s, b) = send(
+        &api,
+        "PATCH",
+        "/v1/indexes/t",
+        &json!({"storage": {"filter_cache": null}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["storage"]["filter_cache"], true);
 
     // Refused by name: an unknown setting, a value it does not take, an empty patch.
     for (body, says) in [

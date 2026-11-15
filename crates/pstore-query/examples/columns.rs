@@ -432,6 +432,84 @@ async fn run(rows: usize) {
                 answer[0].1
             );
         }
+        // M234: a filtered vector query, its masks uncached, built and kept (a miss), and
+        // read from the cache (a hit).
+        println!(
+            "{:<40} {:>11} {:>10} {:>11} {:>10} {:>11} {:>10}",
+            "filtered query", "B uncached", "ms", "B miss", "ms", "B hit", "ms"
+        );
+        let text = pstore_format::text::FullText::default();
+        let legs = vec![pstore_query::Prefetch::Dense {
+            field: pstore_format::DEFAULT_FIELD.to_owned(),
+            query: vec![0.6, 0.8],
+            limit: 10,
+            tune: pstore_index::vec_index::Query::default(),
+        }];
+        for (label, p) in predicates(rows, &docs) {
+            let ask = |scope: Option<pstore_query::masks::Scope>| {
+                let (view, target, legs, text, none, p) = (&view, &target, &legs, &text, &none, &p);
+                async move {
+                    pstore_query::masks::scope(
+                        scope,
+                        pstore_query::query_rows_filtered(
+                            view,
+                            std::slice::from_ref(target),
+                            legs,
+                            text,
+                            Some(p),
+                            none,
+                            pstore_query::Fusion::default(),
+                            10,
+                        ),
+                    )
+                    .await
+                    .expect("query")
+                    .into_iter()
+                    .map(|(h, _, _)| h.row)
+                    .collect::<Vec<_>>()
+                }
+            };
+            let fresh = || {
+                Some(pstore_query::masks::Scope {
+                    cache: std::sync::Arc::new(pstore_query::masks::MaskCache::new(64 << 20)),
+                    tenant: "1".to_owned(),
+                })
+            };
+            let warm = fresh();
+            let want = ask(None).await;
+            assert_eq!(
+                ask(warm.clone()).await,
+                want,
+                "{label}: a miss answered otherwise"
+            );
+            let mut cells = Vec::new();
+            for arm in 0..3 {
+                let scope = || match arm {
+                    0 => None,
+                    1 => fresh(),
+                    _ => warm.clone(),
+                };
+                let bytes0 = acct.bytes(tenant, OpClass::Read);
+                assert_eq!(
+                    ask(scope()).await,
+                    want,
+                    "{label}: arm {arm} answered otherwise"
+                );
+                let moved = acct.bytes(tenant, OpClass::Read) - bytes0;
+                let mut times = Vec::with_capacity(RUNS);
+                for _ in 0..RUNS {
+                    let s = scope();
+                    let t = Instant::now();
+                    ask(s).await;
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                cells.push((moved, median(times)));
+            }
+            println!(
+                "{label:<40} {:>11} {:>10.3} {:>11} {:>10.3} {:>11} {:>10.3}",
+                cells[0].0, cells[0].1, cells[1].0, cells[1].1, cells[2].0, cells[2].1
+            );
+        }
         // M233: order-bys, through the same path.
         println!(
             "{:<40} {:>5} {:>11} {:>10}  first",

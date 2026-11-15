@@ -976,15 +976,23 @@ pub struct StorageSettings {
     pub equality_filters: bool,
     /// Whether segments carry per-block counts and sums an aggregation reads (M232).
     pub block_aggregates: bool,
+    /// Whether its filtered queries use the server's filter-mask cache (M234). Not a storage
+    /// format: it changes no segment, only what a query reads again.
+    pub filter_cache: bool,
     /// The settings the index overrides; any other takes this server's default
-    /// (`PSTORE_BLOCK_LAYOUT`, `PSTORE_EQUALITY_FILTERS`, `PSTORE_BLOCK_AGGREGATES`).
+    /// (`PSTORE_BLOCK_LAYOUT`, `PSTORE_EQUALITY_FILTERS`, `PSTORE_BLOCK_AGGREGATES`,
+    /// `PSTORE_FILTER_CACHE_BYTES`).
     pub overrides: serde_json::Map<String, serde_json::Value>,
 }
 
 impl StorageSettings {
-    /// `overrides` over the server's `default`.
+    /// `overrides` over the server's `default`, and whether it keeps a filter-mask `cache`.
     #[must_use]
-    pub fn of(overrides: pstore_engine::Storage, default: pstore_format::BlockOptions) -> Self {
+    pub fn of(
+        overrides: pstore_engine::Storage,
+        default: pstore_format::BlockOptions,
+        cache: bool,
+    ) -> Self {
         let b = overrides.over(default);
         let layout = |columnar: bool| if columnar { "columnar" } else { "rows" };
         let mut o = serde_json::Map::new();
@@ -997,10 +1005,14 @@ impl StorageSettings {
         if let Some(a) = overrides.aggregates {
             o.insert("block_aggregates".to_owned(), a.into());
         }
+        if let Some(f) = overrides.filter_cache {
+            o.insert("filter_cache".to_owned(), f.into());
+        }
         Self {
             block_layout: layout(b.columnar),
             equality_filters: b.equality,
             block_aggregates: b.aggregates,
+            filter_cache: cache && overrides.filter_cache_over(true),
             overrides: o,
         }
     }

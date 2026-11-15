@@ -166,6 +166,7 @@ const ROWS_OVERRIDE: Storage = Storage {
     columnar: Some(false),
     equality: Some(false),
     aggregates: Some(false),
+    filter_cache: None,
 };
 
 #[tokio::test]
@@ -179,6 +180,7 @@ async fn a_cluster_default_of_rows_is_overridden_per_index() {
         columnar: Some(true),
         equality: Some(true),
         aggregates: None,
+        filter_cache: None,
     };
     e.set_storage("col", |_| on).await.unwrap().unwrap();
     assert_eq!(e.index_stats("col").await.unwrap().unwrap().storage, on);

@@ -330,6 +330,8 @@ pub struct Storage {
     pub equality: Option<bool>,
     /// The per-block aggregate statistics (M232).
     pub aggregates: Option<bool>,
+    /// The server's filter-mask cache for this index's queries (M234).
+    pub filter_cache: Option<bool>,
 }
 
 impl Storage {
@@ -349,6 +351,13 @@ impl Storage {
         }
     }
 
+    /// Whether its queries use the server's filter-mask cache, over the cluster's `default`
+    /// (M234).
+    #[must_use]
+    pub fn filter_cache_over(self, default: bool) -> bool {
+        self.filter_cache.unwrap_or(default)
+    }
+
     /// Its byte in HEAD: two bits a setting, 0 unset, 1 off, 2 on.
     fn byte(self) -> u8 {
         let code = |v: Option<bool>| match v {
@@ -356,10 +365,16 @@ impl Storage {
             Some(false) => 1,
             Some(true) => 2,
         };
-        code(self.columnar) | code(self.equality) << 2 | code(self.aggregates) << 4
+        // A sum, not `|`, as `Dicts::byte` does: the codes sit in disjoint bits, so `|` and `^`
+        // agree and a sweep cannot tell them apart (#58's sweep found it).
+        code(self.columnar)
+            + 4 * code(self.equality)
+            + 16 * code(self.aggregates)
+            + 64 * code(self.filter_cache)
     }
 
-    /// The overrides a byte names; a code of 3 or a high bit set is corrupt.
+    /// The overrides a byte names; a code of 3 in any setting is corrupt. The top two bits
+    /// are M234's `filter_cache`: a reader before it refuses them.
     fn from_byte(b: u8) -> Result<Self, EngineError> {
         let get = |shift: u8| match (b >> shift) & 3 {
             0 => Ok(None),
@@ -367,13 +382,11 @@ impl Storage {
             2 => Ok(Some(true)),
             _ => Err(EngineError::CorruptHead),
         };
-        if b >> 6 != 0 {
-            return Err(EngineError::CorruptHead);
-        }
         Ok(Self {
             columnar: get(0)?,
             equality: get(2)?,
             aggregates: get(4)?,
+            filter_cache: get(6)?,
         })
     }
 }
@@ -3642,12 +3655,20 @@ mod tests {
             columnar: Some(true),
             equality: Some(false),
             aggregates: Some(true),
+            filter_cache: Some(false),
         };
+        // M234: the fourth setting alone, each way.
+        let cache_on = Storage {
+            filter_cache: Some(true),
+            ..Storage::default()
+        };
+        assert_eq!(Storage::from_byte(0x80)?, cache_on);
+        assert_eq!(Storage::from_byte(0x40)?.filter_cache, Some(false));
         for base in [Head::default(), sample(), every_section()] {
             let mut plain = base.clone();
             plain.indexes.insert("idx".to_owned(), vec![one.clone()]);
             plain.indexes.insert("other".to_owned(), vec![one.clone()]);
-            for s in [rows, every] {
+            for s in [rows, every, cache_on] {
                 let mut with = plain.clone();
                 with.storage.insert("idx".to_owned(), s);
                 assert_eq!(Head::decode(&with.encode())?, with);
@@ -3676,13 +3697,14 @@ mod tests {
                 assert_ne!(hex(&with.encode()), hex(&held.encode()), "{name}");
                 assert_eq!(Head::decode(&with.encode())?, with, "{name}");
             }
-            // Malformed: a code of 3, a high bit, an all-unset byte, a name twice, a trailing
-            // byte.
+            // Malformed: a code of 3 in the first or the last setting, an all-unset byte, a name
+            // twice, a trailing byte. (M231 refused 0x40 and 0x80 as high bits; M234 gives them
+            // to `filter_cache`, and decodes them above.)
             let mut with = plain.clone();
             with.storage.insert("idx".to_owned(), rows);
             let bytes = with.encode();
             let at = bytes.len() - 1;
-            for bad in [3u8, 0x40, 0x80, 0] {
+            for bad in [3u8, 0xc0, 0] {
                 let mut b = bytes.clone();
                 b[at] = bad;
                 assert!(Head::decode(&b).is_err(), "byte {bad:#x}");
@@ -3725,7 +3747,10 @@ mod tests {
             columnar: Some(true),
             equality: None,
             aggregates: Some(false),
+            filter_cache: Some(false),
         };
+        assert!(!s.filter_cache_over(true));
+        assert!(Storage::default().filter_cache_over(true));
         assert_eq!(
             s.over(off),
             pstore_format::BlockOptions {

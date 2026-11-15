@@ -55,6 +55,7 @@ mod lanes;
 mod late;
 mod lengths;
 mod linearizability;
+mod mask_cache;
 mod memtable_races;
 mod multi;
 mod multi_text;

@@ -588,7 +588,7 @@ found an unsharded HEAD stays cheaper than an extra round trip up to about 29,70
 
 ## Storage settings
 
-Since M231 three settings decide how a fold or compaction lays out a segment's blocks. Each has
+Since M231 three settings decide how a fold or compaction lays out a segment's blocks (and since M234 a fourth decides whether queries use the filter-mask cache). Each has
 a cluster default, set by environment on every server, and an index can override any of them:
 
 | Setting | Default variable | Values | What it buys, and what it costs |
@@ -596,6 +596,7 @@ a cluster default, set by environment on every server, and an index can override
 | `block_layout` | `PSTORE_BLOCK_LAYOUT` | `columnar` (unset), `rows` | Columnar blocks (M231): segments about a third the size, filters and resolves read about a third of the bytes. Costs some write CPU, and **a binary before M231 cannot read them** |
 | `equality_filters` | `PSTORE_EQUALITY_FILTERS` | `on` (unset), `off` | The equality section (M230): `=` and `In` on a string, `=` on a bool, skip blocks without the value. Can cost more GETs when the blocks kept are not next to each other |
 | `block_aggregates` | `PSTORE_BLOCK_AGGREGATES` | `on` (unset), `off` | Per-block counts and sums (M232): an aggregation reads a block its filter admits whole from the open instead |
+| `filter_cache` | `PSTORE_FILTER_CACHE_BYTES` | bytes, 64 MiB (unset); `0` for none | Not a layout: the server's filter-mask cache (M234). A filtered vector or text query that repeats a filter reads no block for its masks. Costs the memory budgeted, shared by every tenant; an index set `false` keeps its queries out. `true` cannot give a server without a cache one |
 
 An index's override, through `PATCH /v1/indexes/{index}`:
 
@@ -623,7 +624,8 @@ HEAD section, and an older binary refuses a HEAD with bytes past the sections it
 (`CorruptHead`), so one `PATCH ... {"storage": ...}` stops every older server reading every
 index of that tenant. Do not set an override until every server runs M231 or later, and clear
 every override (`null`) before rolling back below it: a HEAD without overrides keeps its old
-bytes.
+bytes. Likewise a `filter_cache` override is refused below M234: clear it before rolling back
+below M234.
 
 ## Listing indexes while they change
 
@@ -748,6 +750,7 @@ Fleet quotas remain incomplete: `pstore-meter` exists and is not wired.
 | `PSTORE_BLOCK_LAYOUT` | `columnar` | The cluster's default block layout, `columnar` or `rows` (M231, [Storage settings](#storage-settings)). |
 | `PSTORE_EQUALITY_FILTERS` | `on` | The cluster's default for the equality section, `on` or `off` (M230, M231). |
 | `PSTORE_BLOCK_AGGREGATES` | `on` | The cluster's default for per-block counts and sums, `on` or `off` (M232). |
+| `PSTORE_FILTER_CACHE_BYTES` | `67108864` | The bytes of filter masks a server keeps for its queries, `0` for none (M234, [Storage settings](#storage-settings)). |
 | `PSTORE_REPLICATION_IDLE_S` | `60` | The sync interval of a tenant whose sources do not change. |
 | `PSTORE_REPLICATION_MAX_LAG_S` | — | Bounds a replica's lag behind a source in this bucket ([M192](milestones/M192/SPEC.md)): the worker folds the source every half of it. At least `2`. Set it on every server. |
 | `PSTORE_REPLICATION_SHARDS` | `64` | The register's shard count, **fixed when the register is first created**: about 2,000 tenants with jobs per shard. |
