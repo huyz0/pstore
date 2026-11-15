@@ -570,6 +570,10 @@ async fn min_max_options_are_refused_when_malformed() {
             "options are",
         ),
         (json!(["Max", "s", true]), "options are"),
+        (
+            json!(["Min", "id", {"non_numeric": true}]),
+            "the id is not an attribute",
+        ),
     ] {
         let q = json!({"aggregate_by": {"a": agg}});
         let (s, b) = send(&api, "POST", "/v1/indexes/docs/query", &q).await;

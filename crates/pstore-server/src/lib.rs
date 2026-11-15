@@ -3413,7 +3413,12 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
             ("Count", a) => Aggregate::Count(Some(a.to_owned())),
             (kind @ ("Sum" | "Min" | "Max" | "Avg"), pstore_query::ID_ATTRIBUTE) => {
                 return Err(ApiError::bad_request(format!(
-                    "aggregate {label}: {kind} of id is not a number"
+                    "aggregate {label}: {kind} of id {}",
+                    if non_numeric {
+                        "is refused: the id is not an attribute"
+                    } else {
+                        "is not a number"
+                    }
                 )));
             }
             ("Sum", a) => Aggregate::Sum(a.to_owned()),
@@ -5448,34 +5453,48 @@ fn created_schema(
         .ok_or_else(|| bad("an object of attribute names to declarations".to_owned()))?;
     let mut types = typed::Declarations::new();
     for (name, ty) in &map {
-        let Some(t) = ty
+        if name == pstore_format::DEFAULT_FIELD {
+            continue;
+        }
+        if let Some(t) = ty
             .as_str()
             .filter(|t| t.starts_with('[') && t.contains(']'))
-        else {
-            continue;
-        };
-        if name != pstore_format::DEFAULT_FIELD {
+        {
             return Err(bad(format!(
                 "{name:?} is declared {t}; a named vector field is declared by the write that \
                  first carries it"
             )));
         }
-        let kind = match t.strip_prefix(&format!("[{dims}]")) {
-            Some("f32") => None,
-            Some("f16") => Some(pstore_format::typed::Kind::F16),
-            Some("i8") => Some(pstore_format::typed::Kind::I8),
+    }
+    // `vector` is always a vector field, so anything but `[N]f32|f16|i8` of the create's
+    // width is refused, as a write refuses it (`vector_declaration`).
+    if let Some(ty) = map.get(pstore_format::DEFAULT_FIELD) {
+        let name = pstore_format::DEFAULT_FIELD;
+        let parsed = ty.as_str().and_then(|t| {
+            let (n, kind) = t.strip_prefix('[')?.split_once(']')?;
+            let n: u32 = n.parse().ok()?;
+            let kind = match kind {
+                "f32" => None,
+                "f16" => Some(pstore_format::typed::Kind::F16),
+                "i8" => Some(pstore_format::typed::Kind::I8),
+                _ => return None,
+            };
+            Some((n, kind))
+        });
+        let kind = match parsed {
+            Some((n, kind)) if n == dims && dims > 0 => kind,
+            Some(_) if dims == 0 => {
+                return Err(bad(format!(
+                    "{name:?} is declared {ty} and the index has no dims"
+                )));
+            }
             _ => {
                 return Err(bad(format!(
-                    "{name:?} is declared {t}; this index's vectors are [{dims}]f32, [{dims}]f16 \
-                     or [{dims}]i8"
+                    "{name:?} is a vector field and is declared {ty}; this index's vectors are \
+                     [{dims}]f32, [{dims}]f16 or [{dims}]i8"
                 )));
             }
         };
-        if dims == 0 {
-            return Err(bad(format!(
-                "{name:?} is declared {t} and the index has no dims"
-            )));
-        }
         if let Some(kind) = kind {
             types.insert(pstore_format::typed::vector_key(name), kind);
         }
@@ -6399,19 +6418,6 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                     _ => return Err(format!("full_text_search: unknown option {k:?}")),
                 }
             }
-            // M204: every language with a stopword list.
-            if fts.analyzer.remove_stopwords && fts.analyzer.language.stopwords().is_none() {
-                return Err(format!(
-                    "full_text_search: remove_stopwords has no list for {}; it has one for {}",
-                    fts.analyzer.language.name(),
-                    Language::ALL
-                        .into_iter()
-                        .filter(|l| l.stopwords().is_some())
-                        .map(Language::name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
             // M261: whitespace tokens keep their punctuation, which no stemmer or stopword list
             // was written for, as the vendor documents.
             if fts.analyzer.tokenizer == Tokenizer::Whitespace {
@@ -6425,6 +6431,19 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                 {
                     return Err(format!("full_text_search: whitespace takes no {what}"));
                 }
+            }
+            // M204: every language with a stopword list.
+            if fts.analyzer.remove_stopwords && fts.analyzer.language.stopwords().is_none() {
+                return Err(format!(
+                    "full_text_search: remove_stopwords has no list for {}; it has one for {}",
+                    fts.analyzer.language.name(),
+                    Language::ALL
+                        .into_iter()
+                        .filter(|l| l.stopwords().is_some())
+                        .map(Language::name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
             // M158: a pre-tokenized token is kept byte for byte, so nothing may change it --
             // and it is matched case-sensitively, whatever was declared.

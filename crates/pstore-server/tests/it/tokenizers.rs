@@ -243,6 +243,9 @@ async fn whitespace_tokenizer_over_http() {
     for (i, refused) in [
         json!({"tokenizer": "whitespace", "stemming": true}),
         json!({"tokenizer": "whitespace", "remove_stopwords": true}),
+        // Named by the tokenizer even where the language has no stopword list (M204's
+        // refusal would otherwise speak first).
+        json!({"tokenizer": "whitespace", "remove_stopwords": true, "language": "arabic"}),
     ]
     .into_iter()
     .enumerate()

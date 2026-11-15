@@ -22,3 +22,10 @@ claimed for them. All were killed.
    -D warnings` pass. The workspace suite: NOT-RUN at this commit; it is run once over the
    PR's last commit and recorded in that milestone's ledger. `cargo deny check`, coverage
    and the mutation sweep are NOT-RUN here; they are CI's on the PR.
+
+## After code review (PR #63)
+
+`whitespace` with `remove_stopwords: true` under a language with no stopword list (Arabic)
+was refused by M204's "has no list" before M261's refusal, which names the tokenizer. M261's
+check now runs first. The case was added to `whitespace_tokenizer_over_http`. Killed: the
+two checks put back in the old order.

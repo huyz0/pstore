@@ -552,6 +552,14 @@ async fn create_without_schema_is_m147s() {
     assert_eq!(x["schema"]["regex"], json!([]), "{x}");
     assert_eq!(x["schema"]["attributes"], json!({}), "{x}");
     assert_eq!(x["schema"]["id"], "string", "{x}");
+    // The whole schema, pinned: what M147's create recorded before M262. A schema-less
+    // create recording any declaration, analyzer or further text field differs here.
+    let golden = json!({"attributes": {}, "dims": 3, "distance_metric": "cosine_distance",
+        "full_text_search": {"ascii_folding": false, "b": 0.75, "case_sensitive": false,
+            "k1": 1.200_000_047_683_715_8, "language": "english", "remove_stopwords": false,
+            "stemming": false, "tokenizer": "word_v1"},
+        "id": "string", "regex": [], "text_field": ""});
+    assert_eq!(x["schema"], golden, "{x}");
 }
 
 #[tokio::test]
@@ -586,6 +594,15 @@ async fn created_schema_refusals_match_writes() {
             "named vector field",
         ),
         ("vector width", json!({"vector": "[3]f32"}), "[2]f32"),
+        // Anything but `[N]kind` on `vector` is refused, as a write refuses it.
+        (
+            "vector object",
+            json!({"vector": {"type": "[2]f16"}}),
+            "[2]f32",
+        ),
+        ("vector scalar", json!({"vector": "uint64"}), "[2]f32"),
+        ("vector kind alone", json!({"vector": "f16"}), "[2]f32"),
+        ("vector kind unknown", json!({"vector": "[2]f64"}), "[2]f32"),
     ] {
         let before = puts(&store);
         let (s, b) = create(&a, "docs", &json!({"dims": 2, "schema": schema})).await;
@@ -603,4 +620,12 @@ async fn created_schema_refusals_match_writes() {
     assert_eq!(s, StatusCode::OK, "{b}");
     let (_, b) = send(&a, "GET", "/v1/indexes/docs", &Value::Null).await;
     assert_eq!(b["schema"]["vector_types"]["vector"], "[2]f16", "{b}");
+    // The width spelled as a write may spell it.
+    let (s, b) = create(
+        &a,
+        "padded",
+        &json!({"dims": 2, "schema": {"vector": "[02]i8"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
 }

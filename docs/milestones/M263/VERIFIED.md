@@ -38,3 +38,15 @@ claimed for them.
    container has no IPv6 loopback. `scripts/check-links.sh` and
    `scripts/gen-clients.py --check` pass. `cargo deny check`, coverage and the mutation
    sweep are NOT-RUN here; they are CI's on the PR.
+
+## After code review (PR #63)
+
+`["Min", "id", {"non_numeric": true}]` was refused as "Min of id is not a number", which
+reads wrong once the caller has opted into non-numbers. It is now refused as "the id is not
+an attribute". The case was added to `min_max_options_are_refused_when_malformed`. One minor
+point is not taken here: the opt-in path clones a row's string on every row (`Key::of`). It
+affects only queries that opt in, so it is left until a profile shows it.
+
+The review fixes change only `pstore-server`. After them, every `pstore-server` test was
+run (`cargo test -p pstore-server --no-fail-fast`): 816 passed, 0 failed, with the two IPv6
+tests NOT-RUN as above. The workspace count above is from the commit before the fixes.

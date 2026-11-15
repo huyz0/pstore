@@ -29,3 +29,18 @@ mutation reverted. No `cargo mutants` run is claimed for them. All were killed.
    for the create body's `schema`. The workspace suite: NOT-RUN at this commit; it is run
    once over the PR's last commit and recorded in that milestone's ledger. `cargo deny
    check`, coverage and the mutation sweep are NOT-RUN here; they are CI's on the PR.
+
+## After code review (PR #63)
+
+- **Fixed: a malformed `vector` declaration was silently dropped.** `{"vector": "f16"}`,
+  `"uint64"`, `{"type": "[2]f16"}` and `"[2]f64"` created an index with the declaration
+  ignored. Each is now refused `400`, as a write refuses it, and a width spelled `[02]` is
+  accepted as a write accepts it. Four refusal cases and the padded width were added to
+  `created_schema_refusals_match_writes`. Killed: the old filter (only `[..]`-shaped values
+  read on `vector`) restored.
+- **Strengthened: `create_without_schema_is_m147s`** now compares the whole recorded schema
+  to a golden. The golden was taken from the parent build (4104569, before M262) by a probe
+  test in a separate worktree, and it matched byte for byte. So a schema-less create that
+  records any analyzer, declaration or further text field now fails it.
+- `cargo test -p pstore-server --test it -- create:: tokenizers:: group_expanded::
+  analyzer::`: 38 passed, 0 failed, after the fixes.
