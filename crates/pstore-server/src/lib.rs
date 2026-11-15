@@ -8726,6 +8726,25 @@ pub async fn store_identity<S: BlobStore>(
 mod tests {
     use super::*;
 
+    /// M265 (CI's mutation shard): `vector_dist` under each metric, on vectors of norms other
+    /// than 1 -- an index stores cosine rows normalised, so no query through the server
+    /// tells the norms' product from their quotient.
+    #[test]
+    fn vector_dist_is_each_metrics() {
+        use pstore_engine::Metric;
+        let (q, v) = ([2.0_f32, 0.0], [3.0_f32, 4.0]);
+        let near = |got: Option<f32>, want: f32| {
+            let got = got.unwrap();
+            assert!((got - want).abs() < 1e-6, "{got} != {want}");
+        };
+        // dot 6, norms 2 and 5: cosine 1 - 6/10.
+        near(vector_dist(Metric::CosineDistance, &q, &v), 0.4);
+        near(vector_dist(Metric::DotProduct, &q, &v), -6.0);
+        near(vector_dist(Metric::EuclideanSquared, &q, &v), 17.0);
+        near(vector_dist(Metric::CosineDistance, &[0.0, 0.0], &v), 1.0);
+        assert_eq!(vector_dist(Metric::DotProduct, &q, &[1.0]), None);
+    }
+
     /// M172: a filter literal above `i64` is a uint64, one within it an int, and what no type
     /// holds is refused as before.
     #[test]

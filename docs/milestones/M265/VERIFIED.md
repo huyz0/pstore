@@ -62,3 +62,9 @@ claimed. All seven were killed.
 - Shard 9: `patterns > MAX_PATTERNS` in `computed_expression` replaced by `==` and by `>=` were
   missed. `computed_attributes_refusals` now asks for an `Or` of 16 globs, which is answered,
   and of 17, which is refused naming "16 patterns". Each mutant, applied by hand, turns it red.
+- Shard 7: `(qq * vv).sqrt()` in `vector_dist` replaced by `qq / vv` was missed, and no
+  server test can kill it. A cosine index stores its rows normalised, so `vv` is 1 and the
+  product equals the quotient. `vector_dist_is_each_metrics`, in `lib.rs`'s own tests, checks
+  each metric on `[2, 0]` against `[3, 4]`: cosine 0.4, dot product -6, euclidean squared
+  17, a zero vector's cosine 1, and `None` for another width. The mutant, applied by hand,
+  turns it red.
