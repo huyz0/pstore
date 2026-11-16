@@ -1,5 +1,15 @@
 # Native API migration notes
 
+## M269: the turbopuffer facade, part 2
+
+The facade's `POST /v2/namespaces/{ns}` now takes `delete_by_filter`, `patch_by_filter`,
+the three write conditions, the two `allow_partial` flags and `return_affected_ids`. A
+write carrying any of them is an `applied` write, so a server without
+`PSTORE_APPLIED_WRITES` answers it `unsupported_durability` (400). `POST
+/v2/namespaces/{ns}/query` with `queries` is the vendor's multi-query. Every native route,
+the OpenAPI contract and the generated clients are unchanged.
+[M269 verification](milestones/M269/VERIFIED.md).
+
 ## M268: a turbopuffer compatibility facade, part 1
 
 New routes on the vendor's paths: `GET /v1/namespaces`, `POST` and `DELETE

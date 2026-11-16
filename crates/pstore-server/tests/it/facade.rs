@@ -335,8 +335,8 @@ async fn facade_errors_are_the_vendors() {
     for (path, body, says) in [
         (
             "/v2/namespaces/made",
-            json!({"delete_by_filter": ["id", "Eq", 1]}),
-            "\"delete_by_filter\"",
+            json!({"copy_from_namespace": "other"}),
+            "\"copy_from_namespace\"",
         ),
         (
             "/v2/namespaces/made",
@@ -462,12 +462,29 @@ async fn facade_identity_never_reads_the_tenant_header() {
 
 #[tokio::test]
 async fn facade_adds_no_request() {
-    let depth = DepthCounting::new(MemoryStore::new());
-    let store = Accounted::new(depth.clone());
-    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
-    let spent =
-        || [OpClass::Read, OpClass::Write, OpClass::List].map(|c| store.count(TenantId(7), c));
-    written(&api, 7).await;
+    // Each call measured in a world of its own, built the same way, so neither side sees
+    // what the other wrote: requests grow with an index's history.
+    let cost_of = async |m: &str, p: &str, h: &[(&str, String)], b: &Value| {
+        let depth = DepthCounting::new(MemoryStore::new());
+        let store = Accounted::new(depth.clone());
+        let api = applied_api(store.clone());
+        let spent =
+            || [OpClass::Read, OpClass::Write, OpClass::List].map(|c| store.count(TenantId(7), c));
+        written(&api, 7).await;
+        let before = spent();
+        depth.reset();
+        let (s, body) = call(&api, m, p, h, Some(b)).await;
+        assert_eq!(s, StatusCode::OK, "{p}: {body}");
+        let after = spent();
+        (
+            before
+                .iter()
+                .zip(after)
+                .map(|(b, a)| a - b)
+                .collect::<Vec<_>>(),
+            depth.depth(),
+        )
+    };
     let mut pairs = Vec::new();
     for (path, f, n) in [
         (
@@ -482,34 +499,316 @@ async fn facade_adds_no_request() {
             json!({"durability": "durable", "distance_metric": "euclidean_squared",
                 "documents": [{"id": 9, "vector": [1.0, 0.0], "attributes": {"n": 1}}]}),
         ),
+        // M269: a conditional write, applied, and a two-query multi-query.
+        (
+            "",
+            json!({"patch_rows": [{"id": 1, "n": 4}], "patch_condition": ["n", "Lt", 9],
+                "return_affected_ids": true}),
+            json!({"durability": "applied", "affected_ids": true,
+                "patch_rows": [{"id": 1, "attributes": {"n": 4}}],
+                "patch_condition": ["n", "Lt", 9]}),
+        ),
+        (
+            "/query",
+            json!({"queries": [{"rank_by": ["vector", "ANN", [1.0, 0.1]], "limit": 3},
+                {"rank_by": ["n", "asc"], "limit": 2}]}),
+            json!({"queries": [{"vector": [1.0, 0.1], "top_k": 3, "consistency": "strong"},
+                {"rank_by": ["n", "asc"], "top_k": 2, "consistency": "strong"}]}),
+        ),
     ] {
         let (method, native_path) = if path.is_empty() {
             ("PUT", "/v1/indexes/docs/documents".to_owned())
         } else {
             ("POST", format!("/v1/indexes/docs{path}"))
         };
-        let mut cost = Vec::new();
-        for (m, p, h, b) in [
-            ("POST", format!("/v2/namespaces/docs{path}"), key(7), &f),
-            (method, native_path, native(7), &n),
-        ] {
-            let before = spent();
-            depth.reset();
-            let (s, body) = call(&api, m, &p, &h, Some(b)).await;
-            assert_eq!(s, StatusCode::OK, "{p}: {body}");
-            let after = spent();
-            cost.push((
-                before
-                    .iter()
-                    .zip(after)
-                    .map(|(b, a)| a - b)
-                    .collect::<Vec<_>>(),
-                depth.depth(),
-            ));
-        }
+        let cost = [
+            cost_of("POST", &format!("/v2/namespaces/docs{path}"), &key(7), &f).await,
+            cost_of(method, &native_path, &native(7), &n).await,
+        ];
         pairs.push(cost);
     }
     for cost in pairs {
         assert_eq!(cost[0], cost[1], "facade then native: {cost:?}");
+    }
+}
+
+// M269: writes by filter and condition, affected ids, multi-query.
+
+/// An unsecured server serving every applied-write level, as `scripts/facade.sh` runs one.
+fn applied_api<S: BlobStore + 'static>(store: Accounted<S>) -> Arc<Api<S>> {
+    let api = Api::unsecured(store, LaneId(1)).unwrap();
+    api.set_applied_writes(true);
+    api.set_affected_ids(true);
+    api.set_idempotency(true);
+    api.set_partial_filters(true);
+    api.set_filter_ids(true);
+    api
+}
+
+/// `index` holding [`rows`], written natively and folded.
+async fn seeded<S: BlobStore + 'static>(api: &Arc<Api<S>>, index: &str) {
+    let documents: Vec<Value> = rows()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let mut attrs = r.as_object().unwrap().clone();
+            let id = attrs.remove("id").unwrap();
+            let vector = attrs.remove("vector").unwrap();
+            json!({"id": id, "vector": vector, "attributes": attrs})
+        })
+        .collect();
+    let (s, b) = call(
+        api,
+        "PUT",
+        &format!("/v1/indexes/{index}/documents"),
+        &native(7),
+        Some(
+            &json!({"durability": "durable", "distance_metric": "euclidean_squared",
+            "documents": documents}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = call(api, "POST", "/v1/admin/fold", &native(7), Some(&json!({}))).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+}
+
+/// Each row's `n`, by id, as a native strong order reads them.
+async fn ns<S: BlobStore + 'static>(api: &Arc<Api<S>>, index: &str) -> Vec<(Value, Value)> {
+    let (s, b) = call(
+        api,
+        "POST",
+        &format!("/v1/indexes/{index}/query"),
+        &native(7),
+        Some(
+            &json!({"rank_by": ["id", "asc"], "top_k": 100, "include_attributes": ["n"],
+            "consistency": "strong"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    b["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["id"].clone(), r["attributes"]["n"].clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn facade_filters_and_conditions_are_native_calls() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    // Each case: the vendor's write, the native write it means, and the vendor answer's
+    // counts (upserted, patched, deleted) and ids.
+    let cases = [
+        (
+            json!({"delete_by_filter": ["kind", "Eq", "a"]}),
+            json!({"durability": "applied", "delete_by_filter": ["kind", "Eq", "a"]}),
+            (0, 0, 2),
+            json!({}),
+        ),
+        (
+            json!({"patch_by_filter": {"filters": ["kind", "Eq", "b"], "patch": {"n": 50}},
+                "return_affected_ids": true}),
+            json!({"durability": "applied", "affected_ids": true,
+                "patch_by_filter": {"filters": ["kind", "Eq", "b"], "attributes": {"n": 50}}}),
+            (0, 2, 0),
+            json!({"patched_ids": [3, 4]}),
+        ),
+        (
+            json!({"upsert_rows": [{"id": 1, "vector": [1.0, 0.0], "n": 30},
+                    {"id": 2, "vector": [1.0, 0.0], "n": 30}],
+                "upsert_condition": ["n", "Gte", 3], "return_affected_ids": true,
+                "distance_metric": "euclidean_squared"}),
+            json!({"durability": "applied", "affected_ids": true,
+                "documents": [{"id": 1, "vector": [1.0, 0.0], "attributes": {"n": 30}},
+                    {"id": 2, "vector": [1.0, 0.0], "attributes": {"n": 30}}],
+                "upsert_condition": ["n", "Gte", 3], "distance_metric": "euclidean_squared"}),
+            (1, 0, 0),
+            json!({"upserted_ids": [1]}),
+        ),
+        (
+            json!({"patch_rows": [{"id": 1, "n": 40}, {"id": 2, "n": 40}],
+                "patch_condition": ["n", "Lt", 3]}),
+            json!({"durability": "applied",
+                "patch_rows": [{"id": 1, "attributes": {"n": 40}},
+                    {"id": 2, "attributes": {"n": 40}}],
+                "patch_condition": ["n", "Lt", 3]}),
+            (0, 1, 0),
+            json!({}),
+        ),
+        (
+            json!({"deletes": [1, 2], "delete_condition": ["n", "Eq", 1],
+                "return_affected_ids": true}),
+            json!({"durability": "applied", "affected_ids": true, "deletes": [1, 2],
+                "delete_condition": ["n", "Eq", 1]}),
+            (0, 0, 1),
+            json!({"deleted_ids": [2]}),
+        ),
+        (
+            json!({"upsert_rows": [{"id": 8, "vector": [0.5, 0.5], "n": 8}],
+                "return_affected_ids": true, "distance_metric": "euclidean_squared"}),
+            json!({"durability": "applied", "affected_ids": true,
+                "distance_metric": "euclidean_squared",
+                "documents": [{"id": 8, "vector": [0.5, 0.5], "attributes": {"n": 8}}]}),
+            (1, 0, 0),
+            json!({"upserted_ids": [8]}),
+        ),
+    ];
+    for (i, (vendor, want_native, (up, patched, deleted), ids)) in cases.into_iter().enumerate() {
+        let (f, n) = (format!("f{i}"), format!("n{i}"));
+        seeded(&api, &f).await;
+        seeded(&api, &n).await;
+        let (s, fb) = call(
+            &api,
+            "POST",
+            &format!("/v2/namespaces/{f}"),
+            &key(7),
+            Some(&vendor),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{vendor} -> {fb}");
+        let (s, nb) = call(
+            &api,
+            "PUT",
+            &format!("/v1/indexes/{n}/documents"),
+            &native(7),
+            Some(&want_native),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{want_native} -> {nb}");
+        let a = &nb["applied"];
+        assert_eq!(
+            (
+                &fb["rows_upserted"],
+                &fb["rows_patched"],
+                &fb["rows_deleted"]
+            ),
+            (&a["upserted"], &a["patched"], &a["deleted"]),
+            "{vendor}: {fb} vs {nb}"
+        );
+        assert_eq!(
+            (
+                &fb["rows_upserted"],
+                &fb["rows_patched"],
+                &fb["rows_deleted"]
+            ),
+            (&json!(up), &json!(patched), &json!(deleted)),
+            "{vendor}: {fb}"
+        );
+        assert_eq!(fb["rows_affected"], up + patched + deleted, "{fb}");
+        // Only the non-empty lists, each the native outcome's.
+        for k in ["upserted_ids", "patched_ids", "deleted_ids"] {
+            assert_eq!(fb.get(k), ids.get(k), "{k}: {vendor} -> {fb}");
+        }
+        // The same rows remain, with the same values.
+        assert_eq!(ns(&api, &f).await, ns(&api, &n).await, "{vendor}");
+    }
+    // `patch_by_filter` holds filters and patch only.
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/f0",
+        &key(7),
+        Some(&json!({"patch_by_filter": {"filters": ["n", "Eq", 1], "patch": {}, "x": 1}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b["error"].as_str().unwrap().contains("\"x\""), "{b}");
+    // A server serving no applied writes refuses a conditional one, as natively.
+    let plain = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    seeded(&plain, "docs").await;
+    let (s, b) = call(
+        &plain,
+        "POST",
+        "/v2/namespaces/docs",
+        &key(7),
+        Some(&json!({"delete_by_filter": ["kind", "Eq", "a"]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("unsupported_durability: "),
+        "{b}"
+    );
+}
+
+#[tokio::test]
+async fn facade_multi_query_is_the_native_multi_query() {
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    written(&api, 7).await;
+    let (s, fb) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs/query",
+        &key(7),
+        Some(&json!({"queries": [
+                {"rank_by": ["vector", "ANN", [1.0, 0.1]], "limit": 2, "include_attributes": ["n"]},
+                {"rank_by": ["n", "asc"], "limit": 3, "include_attributes": ["n"],
+                    "filters": ["kind", "Eq", "a"]},
+                {"aggregate_by": {"c": ["Count"]}}
+            ],
+            "consistency": {"level": "eventual", "max_staleness_seconds": 5}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{fb}");
+    let (s, nb) = call(
+        &api,
+        "POST",
+        "/v1/indexes/docs/query",
+        &native(7),
+        Some(&json!({"queries": [
+            {"vector": [1.0, 0.1], "top_k": 2, "include_attributes": ["n"],
+                "consistency": "bounded", "max_staleness_ms": 5000},
+            {"rank_by": ["n", "asc"], "top_k": 3, "include_attributes": ["n"],
+                "filters": ["kind", "Eq", "a"], "consistency": "bounded",
+                "max_staleness_ms": 5000},
+            {"aggregate_by": {"c": ["Count"]}, "consistency": "bounded",
+                "max_staleness_ms": 5000}
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{nb}");
+    let results = fb["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3, "{fb}");
+    same_rows(&results[0], &json!({"results": nb["results"][0]}), "$dist");
+    same_rows(&results[1], &json!({"results": nb["results"][1]}), "score");
+    assert_eq!(
+        results[2]["aggregations"], nb["aggregations"][2],
+        "{fb} vs {nb}"
+    );
+    assert_eq!(results[2]["aggregations"]["c"], 4, "{fb}");
+    assert!(results[0].get("aggregations").is_none(), "{fb}");
+    assert!(fb["performance"]["server_total_ms"].is_u64(), "{fb}");
+    // Refusals: what a later part translates, and a sub-query's own consistency.
+    for (body, says) in [
+        (
+            json!({"queries": [{"rank_by": ["n", "asc"]}], "rerank_by": ["RRF"]}),
+            "\"rerank_by\"",
+        ),
+        (
+            json!({"queries": [{"rank_by": ["n", "asc"]}], "limit": 3}),
+            "\"limit\"",
+        ),
+        (
+            json!({"queries": [{"rank_by": ["n", "asc"], "consistency": {"level": "strong"}}]}),
+            "root's",
+        ),
+        (json!({"queries": 3}), "an array of queries"),
+    ] {
+        let (s, b) = call(
+            &api,
+            "POST",
+            "/v2/namespaces/docs/query",
+            &key(7),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body} -> {b}");
+        assert!(b["error"].as_str().unwrap().contains(says), "{body} -> {b}");
     }
 }
