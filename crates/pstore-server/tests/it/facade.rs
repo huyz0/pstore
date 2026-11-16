@@ -396,15 +396,19 @@ async fn facade_identity_never_reads_the_tenant_header() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let (s, _) = call(&api, "GET", "/v2/namespaces/docs/metadata", &[], None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    let (s, _) = call(
-        &api,
-        "GET",
-        "/v2/namespaces/docs/metadata",
-        &[("authorization", "Bearer seven".to_owned())],
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // Only plain decimal digits name a tenant: a sign, which `u128`'s parser would take, or
+    // nothing at all, is not one.
+    for k in ["Bearer seven", "Bearer +7", "Bearer "] {
+        let (s, _) = call(
+            &api,
+            "GET",
+            "/v2/namespaces/docs/metadata",
+            &[("authorization", k.to_owned())],
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{k}");
+    }
     // Secured: the credential's tenant, under the native scopes.
     let config = auth::config(&[("current", &auth::KEY)], "current");
     let (secured, _) = auth::api(&config);

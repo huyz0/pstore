@@ -67,3 +67,10 @@ Red runs.
      `scripts/check-verified.py` pass.
    - `cargo deny check`, coverage and the mutation sweep were NOT-RUN here; CI runs them on
      the PR.
+
+## After CI's mutation shard (PR #66)
+Shard 1: `!t.is_empty() && t.bytes().all(..)` in `identity` replaced by `||` was missed.
+With it, `Bearer +7` passes the filter and `u128`'s parser reads it as tenant 7. Every
+non-digit key the test sent also failed to parse, so the mutant made no difference to it.
+`facade_identity_never_reads_the_tenant_header` now refuses `Bearer +7` and an empty key as
+401. The mutant, applied by hand, turns it red: `Bearer +7` answers 200.
