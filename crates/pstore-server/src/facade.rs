@@ -511,7 +511,11 @@ pub(crate) fn metadata_answer(native: &Value) -> Value {
     let updating = native["unfolded"].as_bool().unwrap_or(false);
     json!({
         "approx_row_count": native["approx_row_count"],
-        "approx_logical_bytes": 0,
+        "approx_logical_bytes": native
+            .get("approx_logical_bytes")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or_else(|| json!(0)),
         "created_at": native["created_at"],
         "updated_at": native["updated_at"],
         "schema": native.pointer("/schema/attributes").cloned().unwrap_or(Value::Null),
@@ -526,6 +530,105 @@ pub(crate) fn list_answer(native: &Value) -> Value {
         .map(|a| a.iter().map(|id| json!({"id": id})).collect())
         .unwrap_or_default();
     json!({"namespaces": namespaces, "next_cursor": native["next_cursor"]})
+}
+
+/// The vendor's `explain_query` body as the native query asking for its plan (M270, Delta 1).
+pub(crate) fn explain_body(body: &[u8]) -> Result<Value, ApiError> {
+    let o = object(body)?;
+    if o.contains_key("queries") {
+        return Err(bad(
+            "explain_query explains one query: queries belongs to multi_query",
+        ));
+    }
+    let mut q = query_of(o)?;
+    if let Value::Object(m) = &mut q {
+        m.insert("explain".into(), true.into());
+    }
+    Ok(q)
+}
+
+/// The native query's plan as the vendor's `plan_text` (M270, Delta 1): `meta.explain` as
+/// indented JSON, or `null` when the query has no plan.
+pub(crate) fn explain_answer(native: &Value) -> Value {
+    let plan = native
+        .pointer("/meta/explain")
+        .filter(|p| !p.is_null())
+        .and_then(|p| serde_json::to_string_pretty(p).ok());
+    json!({ "plan_text": plan })
+}
+
+/// The native warm's answer as the vendor's hint answer (M270, Delta 2).
+pub(crate) fn warm_answer(native: &Value) -> Value {
+    json!({"status": "ACCEPTED", "message": format!("warmed {} segments", native["segments"])})
+}
+
+/// The keys the native recall takes from the vendor's body unchanged (M270, Delta 3).
+const RECALL_PASSED: [&str; 4] = ["num", "top_k", "filters", "include_ground_truth"];
+
+/// The vendor's recall body as the native one (M270, Delta 3).
+pub(crate) fn recall_body(body: &[u8]) -> Result<Value, ApiError> {
+    let o = object(body)?;
+    if let Some(k) = o.keys().find(|k| !RECALL_PASSED.contains(&k.as_str())) {
+        return Err(bad(format!(
+            "{k:?} is not translated by this facade: recall takes num, top_k, filters and \
+             include_ground_truth, and samples its query vectors from the index"
+        )));
+    }
+    Ok(Value::Object(o))
+}
+
+/// The native recall's answer as the vendor's (M270, Delta 3): each neighbor's `dist` as
+/// `$dist`, and no recall invented where the native one is `null`.
+pub(crate) fn recall_answer(native: &Value) -> Value {
+    let mut out = Map::new();
+    for k in ["avg_recall", "avg_ann_count", "avg_exhaustive_count"] {
+        out.insert(k.into(), native.get(k).cloned().unwrap_or(Value::Null));
+    }
+    if let Some(Value::Array(truth)) = native.get("ground_truth") {
+        let truth = truth
+            .iter()
+            .map(|g| {
+                let neighbors: Vec<Value> = g
+                    .get("nearest_neighbors")
+                    .and_then(Value::as_array)
+                    .map(|ns| {
+                        ns.iter()
+                            .map(|n| json!({"id": n.get("id"), "$dist": n.get("dist")}))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                json!({"query_vector": g.get("query_vector"), "nearest_neighbors": neighbors})
+            })
+            .collect();
+        out.insert("ground_truth".into(), Value::Array(truth));
+    }
+    Value::Object(out)
+}
+
+/// The vendor's `update_metadata` body as the native index patch, or `None` when it asks
+/// for nothing (M270, Delta 5).
+pub(crate) fn metadata_patch(body: &[u8]) -> Result<Option<Value>, ApiError> {
+    let mut o = object(body)?;
+    match o.remove("pinning") {
+        None | Some(Value::Null | Value::Bool(false)) => {}
+        Some(_) => {
+            return Err(bad(
+                "pinning is not served: pstore pins no namespace, so pinning takes only null \
+                 or false",
+            ));
+        }
+    }
+    let read_only = match o.remove("read_only") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(b),
+        Some(_) => return Err(bad("read_only is true or false")),
+    };
+    if let Some(k) = o.keys().next() {
+        return Err(bad(format!(
+            "{k:?} is not translated by this facade: update_metadata takes read_only and pinning"
+        )));
+    }
+    Ok(read_only.map(|r| json!({ "read_only": r })))
 }
 
 /// A native refusal as the vendor's envelope: `{"status": "error", "error"}`. ⚠️ A 409 that
@@ -711,6 +814,122 @@ pub(crate) async fn metadata<S: BlobStore + 'static>(
             .map(IntoResponse::into_response),
         Err(e) => Err(e),
     };
+    translate(answer, |v| metadata_answer(&v)).await
+}
+
+/// `POST /v2/namespaces/{ns}/explain_query` (M270, Delta 1).
+pub(crate) async fn explain<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(ns): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<Principal>,
+    body: Bytes,
+) -> Response {
+    let prepared = identity(&principal, headers).and_then(|h| explain_body(&body).map(|b| (h, b)));
+    let answer = match prepared {
+        Ok((headers, native)) => {
+            crate::query_index(
+                State(api),
+                Path(ns),
+                headers,
+                Bytes::from(native.to_string()),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    translate(answer, |v| explain_answer(&v)).await
+}
+
+/// `GET /v1/namespaces/{ns}/hint_cache_warm` (M270, Delta 2). With no read cache there is
+/// nothing to warm, and the hint is still accepted.
+pub(crate) async fn warm<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(ns): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<Principal>,
+) -> Response {
+    let answer = match identity(&principal, headers) {
+        Ok(headers) => crate::warm_index(State(api), Path(ns), headers)
+            .await
+            .map(IntoResponse::into_response),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &answer
+        && e.code == "no_read_cache"
+    {
+        return axum::Json(json!({"status": "ACCEPTED",
+            "message": "this server has no read cache: nothing was warmed"}))
+        .into_response();
+    }
+    translate(answer, |v| warm_answer(&v)).await
+}
+
+/// `POST /v1/namespaces/{ns}/_debug/recall` (M270, Delta 3).
+pub(crate) async fn recall<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(ns): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<Principal>,
+    body: Bytes,
+) -> Response {
+    let prepared = identity(&principal, headers).and_then(|h| recall_body(&body).map(|b| (h, b)));
+    let answer = match prepared {
+        Ok((headers, native)) => crate::recall_index(
+            State(api),
+            Path(ns),
+            headers,
+            Bytes::from(native.to_string()),
+        )
+        .await
+        .map(IntoResponse::into_response),
+        Err(e) => Err(e),
+    };
+    translate(answer, |v| recall_answer(&v)).await
+}
+
+/// `POST /v1/namespaces/{ns}/schema` (M270, Delta 4): the native schema patch, which refuses.
+pub(crate) async fn update_schema(
+    Path(ns): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<Principal>,
+) -> Response {
+    let refused = match identity(&principal, headers) {
+        Ok(headers) => crate::patch_schema(Path(ns), headers).await,
+        Err(e) => e,
+    };
+    translate(Err(refused), |v| v).await
+}
+
+/// `PATCH /v1/namespaces/{ns}/metadata` (M270, Delta 5): the native patch when it asks for
+/// one, then the native summary, which is what the vendor answers.
+pub(crate) async fn update_metadata<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(ns): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<Principal>,
+    body: Bytes,
+) -> Response {
+    let (headers, patch) =
+        match identity(&principal, headers).and_then(|h| metadata_patch(&body).map(|p| (h, p))) {
+            Ok(prepared) => prepared,
+            Err(e) => return translate(Err(e), |v| v).await,
+        };
+    if let Some(patch) = patch {
+        let patched = crate::patch_index(
+            State(Arc::clone(&api)),
+            Path(ns.clone()),
+            headers.clone(),
+            Bytes::from(patch.to_string()),
+        )
+        .await;
+        if let Err(e) = patched {
+            return translate(Err(e), |v| v).await;
+        }
+    }
+    let answer = crate::index_summary(State(api), Path(ns), Query(HashMap::new()), headers)
+        .await
+        .map(IntoResponse::into_response);
     translate(answer, |v| metadata_answer(&v)).await
 }
 

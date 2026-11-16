@@ -853,6 +853,27 @@ impl<S: BlobStore + 'static> Api<S> {
                 "/v1/namespaces/{index}/schema",
                 Read.on(get(facade::schema::<S>)),
             )
+            // M270: explain, warm, recall, and the schema and metadata updates.
+            .facade(
+                "/v2/namespaces/{index}/explain_query",
+                Read.on(post(facade::explain::<S>)),
+            )
+            .facade(
+                "/v1/namespaces/{index}/hint_cache_warm",
+                Read.on(get(facade::warm::<S>)),
+            )
+            .facade(
+                "/v1/namespaces/{index}/_debug/recall",
+                Read.on(post(facade::recall::<S>)),
+            )
+            .facade(
+                "/v1/namespaces/{index}/schema",
+                Write.on(post(facade::update_schema)),
+            )
+            .facade(
+                "/v1/namespaces/{index}/metadata",
+                Write.on(axum::routing::patch(facade::update_metadata::<S>)),
+            )
     }
 
     /// The routes. `api-design.md`'s surface, minus everything M7c defers.

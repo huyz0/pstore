@@ -1,5 +1,14 @@
 # Native API migration notes
 
+## M270: the turbopuffer facade, part 3
+
+New facade routes: `POST /v2/namespaces/{ns}/explain_query`, `GET
+/v1/namespaces/{ns}/hint_cache_warm`, `POST /v1/namespaces/{ns}/_debug/recall`, `POST
+/v1/namespaces/{ns}/schema` (always refused `schema_immutable`) and `PATCH
+/v1/namespaces/{ns}/metadata` (`read_only` only). The facade's metadata now answers the
+native `approx_logical_bytes` instead of 0. Every native route, the OpenAPI contract and the
+generated clients are unchanged. [M270 verification](milestones/M270/VERIFIED.md).
+
 ## M269: the turbopuffer facade, part 2
 
 The facade's `POST /v2/namespaces/{ns}` now takes `delete_by_filter`, `patch_by_filter`,

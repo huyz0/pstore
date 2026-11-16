@@ -18,12 +18,16 @@ which is two.
 1. **`explain_query`** (`POST /v2/namespaces/{ns}/explain_query`). The body is translated as
    M268's Delta 4 translates a query, and sent as the native query with `"explain": true`
    (M165). The answer is `{"plan_text"}`: the native `meta.explain`, as indented JSON text.
-   It is `null` when the native query has no plan, as for an unranked query. A body holding
-   `queries` is refused, naming it.
+   An order-by or aggregation query has no legs to explain. The native explain refuses it
+   with a 400, and the facade refuses it the same way. A body holding `queries` is refused,
+   naming it.
 2. **`hint_cache_warm`** (`GET /v1/namespaces/{ns}/hint_cache_warm`). This is the native warm
    (`POST /v1/indexes/{index}/warm`, M21). The answer is `{"status": "ACCEPTED", "message"}`,
    and the message names the segments warmed. The native warm finishes before it answers,
-   so the warm has run when the SDK gets `ACCEPTED`.
+   so the warm has run when the SDK gets `ACCEPTED`. On a server with no read cache, the
+   native warm refuses `no_read_cache` (409). The facade answers that `ACCEPTED`, with a
+   message saying nothing was warmed. The vendor's call is a hint, and a hint with nothing
+   to do is not an error the SDK should raise.
 3. **`recall`** (`POST /v1/namespaces/{ns}/_debug/recall`). This is the native recall (M162):
    - `num`, `top_k`, `filters` and `include_ground_truth` pass through. `filters` is
      translated as a query's filters are.
@@ -53,7 +57,8 @@ changes.
 1. **The SDK, against pstore** (`./scripts/facade.sh`; Python test names carry no code
    marks):
    - explain_query on an ANN query answers plan_text, which names the dense leg;
-   - hint_cache_warm answers status ACCEPTED;
+   - hint_cache_warm answers status ACCEPTED. `scripts/facade.sh` runs the in-memory store,
+     which takes no read cache, so this is the nothing-to-warm answer; AC2 warms a cache;
    - recall with num 2 and top_k 2 answers an avg_recall from 0 to 1, and with
      include_ground_truth, two ground truths whose neighbors carry `$dist`;
    - recall with rank_by is refused BadRequestError, naming it;
@@ -65,7 +70,8 @@ changes.
    - metadata's approx_logical_bytes is above 0 once a fold has written a segment.
 2. **Translation, in process** (`crates/pstore-server/tests/it/facade.rs`):
    - `facade_explain_warm_and_recall_are_native_calls`: items 1 to 3, each answer compared
-     to the native call's on a twin index;
+     to the native call's on a twin index, the warm on a server with a read cache and on one
+     without;
    - `facade_schema_and_metadata_updates_are_native_calls`: items 4 to 6 against the native
      answers, including `read_only` set and cleared and the refusals;
    - `facade_adds_no_request` extended: explain, warm, recall and update_schema each cost
@@ -80,7 +86,7 @@ AC1 and AC2 are red against M269, which has none of these routes and answers
 
 | AC | Mutation |
 |---|---|
-| 2 | `explain` not set on the native query; `plan_text` taken from something other than `meta.explain`; `rank_by` not refused; `dist` not renamed `$dist`; `read_only` not passed to the native patch; `pinning: true` accepted; `approx_logical_bytes` answered 0 |
+| 2 | `explain` not set on the native query; `plan_text` taken from something other than `meta.explain`; `no_read_cache` answered as an error; `rank_by` not refused; `dist` not renamed `$dist`; `read_only` not passed to the native patch; `pinning: true` accepted; `approx_logical_bytes` answered 0 |
 
 ## RA budget
 None. Each route is the native call it names, and `update_metadata`'s second call is the

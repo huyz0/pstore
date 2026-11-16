@@ -144,6 +144,41 @@ class Sdk(unittest.TestCase):
         self.assertIn("rerank_by", str(e.exception))
         ns.delete_all()
 
+    def test_explain_warm_recall_schema_and_metadata(self):
+        """M270: each one native call, or two for update_metadata."""
+        tpuf = client()
+        ns = tpuf.namespace("sdk-ops")
+        ns.write(upsert_rows=ROWS, distance_metric="euclidean_squared")
+        native("/v1/admin/fold", {})
+        plan = ns.explain_query(rank_by=("vector", "ANN", [1.0, 0.1]), top_k=2)
+        self.assertIn('"dense"', plan.plan_text)
+        self.assertEqual(ns.hint_cache_warm().status, "ACCEPTED")
+        r = ns.recall(num=2, top_k=2, include_ground_truth=True)
+        self.assertTrue(0.0 <= r.avg_recall <= 1.0)
+        self.assertEqual(len(r.ground_truth), 2)
+        for g in r.ground_truth:
+            self.assertTrue(all(isinstance(n["$dist"], float) for n in g.nearest_neighbors))
+        with self.assertRaises(turbopuffer.BadRequestError) as e:
+            ns.recall(num=1, rank_by=("vector", "ANN", [1.0, 0.0]))
+        self.assertIn("rank_by", str(e.exception))
+        with self.assertRaises(turbopuffer.BadRequestError) as e:
+            ns.update_schema(schema={"n": {"type": "int", "filterable": True}})
+        self.assertIn("schema_immutable", str(e.exception))
+        meta = ns.update_metadata(read_only=True)
+        self.assertEqual(meta.approx_row_count, 3)
+        self.assertGreater(meta.approx_logical_bytes, 0)
+        with self.assertRaises(turbopuffer.BadRequestError) as e:
+            ns.write(upsert_rows=[{"id": 9, "vector": [1.0, 0.0]}],
+                     distance_metric="euclidean_squared")
+        self.assertIn("index_read_only", str(e.exception))
+        ns.update_metadata(read_only=False)
+        ns.write(upsert_rows=[{"id": 9, "vector": [1.0, 0.0]}],
+                 distance_metric="euclidean_squared")
+        with self.assertRaises(turbopuffer.BadRequestError) as e:
+            ns.update_metadata(pinning=True)
+        self.assertIn("pinning", str(e.exception))
+        ns.delete_all()
+
     def test_a_refusal_is_the_sdks_error(self):
         tpuf = client()
         with self.assertRaises(turbopuffer.NotFoundError):
