@@ -1459,3 +1459,65 @@ async fn facade_async_copy_is_the_native_copy() {
     .await;
     refused(s, &b, "\"source_api_key\" is not served");
 }
+
+// M272: the compatibility manifest, held to the code.
+
+const MANIFEST: &str = include_str!("../../../../api/compat/turbopuffer.json");
+
+fn manifest() -> Value {
+    serde_json::from_str(MANIFEST).unwrap()
+}
+
+#[test]
+fn the_manifest_is_the_facades_routes() {
+    // Every `.facade(` registration in the router: its path and each method on it.
+    let lib = include_str!("../../src/lib.rs");
+    let path = regex::Regex::new(r#"^\s*"(/v[12]/[^"]*)""#).unwrap();
+    let method = regex::Regex::new(r"(get|post|patch|put|delete)\(facade::").unwrap();
+    let mut registered = std::collections::BTreeSet::new();
+    for block in lib.split(".facade(").skip(1) {
+        let block = block.split(".route(").next().unwrap();
+        let block = block.split("\n    }").next().unwrap();
+        let p = block
+            .lines()
+            .find_map(|l| path.captures(l))
+            .unwrap_or_else(|| panic!("a facade route with no path: {block}"))[1]
+            .replace("{index}", "{namespace}");
+        for m in method.captures_iter(block) {
+            registered.insert(format!("{} {p}", m[1].to_uppercase()));
+        }
+    }
+    assert!(registered.len() >= 13, "{registered:?}");
+    let listed: std::collections::BTreeSet<String> = manifest()["operations"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|o| o["route"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(registered, listed, "registered, then the manifest's");
+}
+
+#[test]
+fn the_manifest_evidence_resolves() {
+    let sdk = include_str!("../../../../clients/turbopuffer/test_sdk.py");
+    let rust = [
+        include_str!("facade.rs"),
+        include_str!("../../src/facade.rs"),
+    ];
+    let m = manifest();
+    for (name, op) in m["operations"].as_object().unwrap() {
+        let status = op["status"].as_str().unwrap();
+        assert!(matches!(status, "served" | "refused"), "{name}: {status}");
+        let evidence = op["evidence"].as_array().unwrap();
+        assert!(!evidence.is_empty(), "{name} has no evidence");
+        for e in evidence {
+            let e = e.as_str().unwrap();
+            let found = match e.split_once(':') {
+                Some(("sdk", t)) => sdk.contains(&format!("def {t}(")),
+                Some(("rust", t)) => rust.iter().any(|r| r.contains(&format!("fn {t}("))),
+                _ => false,
+            };
+            assert!(found, "{name}: {e} names no test");
+        }
+    }
+}

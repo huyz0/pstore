@@ -1,0 +1,313 @@
+{
+  "sdk": {
+    "package": "turbopuffer",
+    "version": "3.1.0",
+    "wheel_sha256": "f5e44b540902f58e8201a62d0df0e98e8fe04987c41efec4bf8a83ea35254389"
+  },
+  "statuses": {
+    "served": "translated to the native call named, and run by the evidence",
+    "refused": "answered 400 naming it, never ignored",
+    "hint": "accepted and dropped: nothing in pstore means it"
+  },
+  "operations": {
+    "namespaces": {
+      "route": "GET /v1/namespaces",
+      "status": "served",
+      "native": "GET /v1/indexes",
+      "evidence": [
+        "sdk:test_the_sdk_against_the_facade",
+        "rust:facade_write_and_query_are_native_calls"
+      ],
+      "note": "prefix and page_size page the native list"
+    },
+    "write": {
+      "route": "POST /v2/namespaces/{namespace}",
+      "status": "served",
+      "native": "PUT /v1/indexes/{index}/documents",
+      "evidence": [
+        "sdk:test_the_sdk_against_the_facade",
+        "sdk:test_writes_by_filter_and_by_condition",
+        "rust:facade_write_and_query_are_native_calls",
+        "rust:facade_filters_and_conditions_are_native_calls"
+      ],
+      "note": "durable, or applied when its answer is the rows it changed (M269)"
+    },
+    "branch_from": {
+      "route": "POST /v2/namespaces/{namespace}",
+      "status": "served",
+      "native": "PUT /v1/indexes/{index}/documents with branch_from_namespace",
+      "evidence": [
+        "sdk:test_copy_branch_and_the_async_copy",
+        "rust:facade_branch_and_copy_are_the_native_branch"
+      ],
+      "note": "a copy-on-write branch; rows_affected 0"
+    },
+    "copy_from": {
+      "route": "POST /v2/namespaces/{namespace}",
+      "status": "served",
+      "native": "PUT /v1/indexes/{index}/documents with branch_from_namespace",
+      "evidence": [
+        "sdk:test_copy_branch_and_the_async_copy",
+        "rust:facade_branch_and_copy_are_the_native_branch"
+      ],
+      "note": "the native branch, which readers cannot tell from a copy; rows_affected 0"
+    },
+    "start_copy_from": {
+      "route": "POST /v2/namespaces/{namespace}/async",
+      "status": "served",
+      "native": "POST /v1/indexes/{index}/copy",
+      "evidence": [
+        "sdk:test_copy_branch_and_the_async_copy",
+        "rust:facade_async_copy_is_the_native_copy"
+      ],
+      "note": "the token is the native copy's run"
+    },
+    "poll_copy_from": {
+      "route": "GET /v1/namespaces/{namespace}/operations/{token}",
+      "status": "served",
+      "native": "GET /v1/indexes/{index}/copy",
+      "evidence": [
+        "sdk:test_copy_branch_and_the_async_copy",
+        "rust:facade_async_copy_is_the_native_copy",
+        "rust:an_operation_is_the_native_copys_state"
+      ],
+      "note": "the finished result carries no billing, so the SDK leaves it untyped"
+    },
+    "delete_all": {
+      "route": "DELETE /v2/namespaces/{namespace}",
+      "status": "served",
+      "native": "DELETE /v1/indexes/{index}",
+      "evidence": [
+        "sdk:test_the_sdk_against_the_facade"
+      ]
+    },
+    "query": {
+      "route": "POST /v2/namespaces/{namespace}/query",
+      "status": "served",
+      "native": "POST /v1/indexes/{index}/query",
+      "evidence": [
+        "sdk:test_the_sdk_against_the_facade",
+        "rust:facade_write_and_query_are_native_calls",
+        "rust:knn_is_exact_and_ann_is_not",
+        "rust:eventual_is_bounded_in_milliseconds"
+      ],
+      "note": "strong by default; eventual is bounded staleness"
+    },
+    "multi_query": {
+      "route": "POST /v2/namespaces/{namespace}/query",
+      "status": "served",
+      "native": "POST /v1/indexes/{index}/query with queries",
+      "evidence": [
+        "sdk:test_multi_query",
+        "rust:facade_multi_query_is_the_native_multi_query",
+        "rust:each_sub_query_takes_the_roots_consistency"
+      ],
+      "note": "root rerank_by, limit and offset refused"
+    },
+    "explain_query": {
+      "route": "POST /v2/namespaces/{namespace}/explain_query",
+      "status": "served",
+      "native": "POST /v1/indexes/{index}/query with explain",
+      "evidence": [
+        "sdk:test_explain_warm_recall_schema_and_metadata",
+        "rust:facade_explain_warm_and_recall_are_native_calls"
+      ],
+      "note": "plan_text is the native meta.explain as JSON text"
+    },
+    "metadata": {
+      "route": "GET /v2/namespaces/{namespace}/metadata",
+      "status": "served",
+      "native": "GET /v1/indexes/{index}",
+      "evidence": [
+        "sdk:test_the_sdk_against_the_facade",
+        "rust:facade_schema_and_metadata_updates_are_native_calls"
+      ],
+      "note": "schema as schema() answers it; approx_logical_bytes the native one"
+    },
+    "exists": {
+      "route": "GET /v1/namespaces/{namespace}/schema",
+      "status": "served",
+      "native": "GET /v1/indexes/{index}",
+      "evidence": [
+        "sdk:test_the_sdk_against_the_facade"
+      ],
+      "note": "the SDK's exists() reads the schema route"
+    },
+    "schema": {
+      "route": "GET /v1/namespaces/{namespace}/schema",
+      "status": "served",
+      "native": "GET /v1/indexes/{index}",
+      "evidence": [
+        "sdk:test_the_sdk_against_the_facade"
+      ],
+      "note": "the native summary's attribute types, which name only datetime, uuid, bytes and uint64 attributes (M173): text and numeric attributes are not listed"
+    },
+    "update_schema": {
+      "route": "POST /v1/namespaces/{namespace}/schema",
+      "status": "refused",
+      "native": "PATCH /v1/indexes/{index}/schema",
+      "evidence": [
+        "sdk:test_explain_warm_recall_schema_and_metadata",
+        "rust:facade_schema_and_metadata_updates_are_native_calls"
+      ],
+      "note": "schema_immutable: a schema is fixed at the first fold"
+    },
+    "update_metadata": {
+      "route": "PATCH /v1/namespaces/{namespace}/metadata",
+      "status": "served",
+      "native": "PATCH /v1/indexes/{index}, then GET /v1/indexes/{index}",
+      "evidence": [
+        "sdk:test_explain_warm_recall_schema_and_metadata",
+        "rust:facade_schema_and_metadata_updates_are_native_calls"
+      ],
+      "note": "read_only only; pinning refused unless null or false; two native calls"
+    },
+    "hint_cache_warm": {
+      "route": "GET /v1/namespaces/{namespace}/hint_cache_warm",
+      "status": "served",
+      "native": "POST /v1/indexes/{index}/warm",
+      "evidence": [
+        "sdk:test_explain_warm_recall_schema_and_metadata",
+        "rust:facade_explain_warm_and_recall_are_native_calls"
+      ],
+      "note": "ACCEPTED, and on a server with no read cache, nothing warmed"
+    },
+    "recall": {
+      "route": "POST /v1/namespaces/{namespace}/_debug/recall",
+      "status": "served",
+      "native": "POST /v1/indexes/{index}/recall",
+      "evidence": [
+        "sdk:test_explain_warm_recall_schema_and_metadata",
+        "rust:facade_explain_warm_and_recall_are_native_calls"
+      ],
+      "note": "rank_by refused: the native recall samples its own query vectors"
+    }
+  },
+  "write_keys": {
+    "branch_from_namespace": {
+      "status": "served",
+      "note": "the native branch (M271)"
+    },
+    "copy_from_namespace": {
+      "status": "served",
+      "note": "the native branch (M271)"
+    },
+    "create_namespace": {
+      "status": "refused"
+    },
+    "delete_by_filter": {
+      "status": "served",
+      "note": "applied"
+    },
+    "delete_by_filter_allow_partial": {
+      "status": "served",
+      "note": "applied"
+    },
+    "delete_condition": {
+      "status": "served",
+      "note": "applied"
+    },
+    "deletes": {
+      "status": "served"
+    },
+    "disable_backpressure": {
+      "status": "hint",
+      "note": "pstore bounds buffered rows, not unfolded backlog"
+    },
+    "distance_metric": {
+      "status": "served"
+    },
+    "encryption": {
+      "status": "refused"
+    },
+    "patch_by_filter": {
+      "status": "served",
+      "note": "patch becomes the native attributes; applied"
+    },
+    "patch_by_filter_allow_partial": {
+      "status": "served",
+      "note": "applied"
+    },
+    "patch_columns": {
+      "status": "served"
+    },
+    "patch_condition": {
+      "status": "served",
+      "note": "applied"
+    },
+    "patch_rows": {
+      "status": "served",
+      "note": "attributes flattened as the vendor writes them"
+    },
+    "return_affected_ids": {
+      "status": "served",
+      "note": "the native affected_ids; applied"
+    },
+    "schema": {
+      "status": "served"
+    },
+    "sharding": {
+      "status": "refused"
+    },
+    "upsert_columns": {
+      "status": "served"
+    },
+    "upsert_condition": {
+      "status": "served",
+      "note": "applied"
+    },
+    "upsert_rows": {
+      "status": "served",
+      "note": "attributes flattened as the vendor writes them"
+    }
+  },
+  "query_keys": {
+    "aggregate_by": {
+      "status": "served"
+    },
+    "compute_attributes": {
+      "status": "refused",
+      "note": "the native API has computed attributes (M264), not yet translated"
+    },
+    "consistency": {
+      "status": "served",
+      "note": "strong by default; eventual is bounded, max_staleness_seconds in milliseconds"
+    },
+    "distance_metric": {
+      "status": "refused"
+    },
+    "exclude_attributes": {
+      "status": "served"
+    },
+    "filters": {
+      "status": "served"
+    },
+    "group_by": {
+      "status": "served"
+    },
+    "include_attributes": {
+      "status": "served"
+    },
+    "limit": {
+      "status": "served",
+      "note": "the native top_k, and limit.per the native limit_per"
+    },
+    "offset": {
+      "status": "refused"
+    },
+    "rank_by": {
+      "status": "served",
+      "note": "ANN and kNN become the native vector query, kNN exact"
+    },
+    "rerank_by": {
+      "status": "refused"
+    },
+    "top_k": {
+      "status": "served"
+    },
+    "vector_encoding": {
+      "status": "served"
+    }
+  },
+  "retries": "The SDK resends a 408, 409, 429 or 5xx. The facade answers a permanent 409 as 400, so it is not resent. A plain upsert, patch or delete resent after a 5xx writes the same rows again. A conditional or by-filter write resent after a 5xx is evaluated again against the rows as they are then, and may apply a second time: the SDK sends no idempotency key, and the native one (M132) is not reachable through the facade."
+}

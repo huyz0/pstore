@@ -81,6 +81,10 @@ class Sdk(unittest.TestCase):
         meta = ns.metadata()
         self.assertEqual(meta.approx_row_count, 3)
         self.assertTrue(ns.exists())
+        # The native schema records a type only for datetime, uuid, bytes and uint64
+        # attributes (M173), so schema() is exactly its attributes, empty here.
+        summary = native("/v1/indexes/sdk-docs")
+        self.assertEqual(ns.schema(), summary["schema"]["attributes"])
 
         tpuf.namespace("sdk-more").write(upsert_rows=[{"id": 1, "vector": [1.0, 0.0]}],
                                          distance_metric="cosine_distance")
@@ -229,6 +233,27 @@ class Sdk(unittest.TestCase):
         self.assertIn("source_region", str(e.exception))
         for ns in (src, branch, copy, by_write, later):
             ns.delete_all()
+
+    def test_the_manifest_names_everything_the_sdk_sends(self):
+        """M272: every namespace method, write key and query key of the pinned SDK."""
+        import inspect
+        from pathlib import Path
+
+        from turbopuffer.resources.namespaces import NamespacesResource
+        from turbopuffer.types import namespace_query_params, namespace_write_params
+
+        manifest = json.loads(
+            (Path(__file__).resolve().parents[2] / "api/compat/turbopuffer.json").read_text())
+        self.assertEqual(manifest["sdk"]["version"], turbopuffer.__version__)
+        methods = {m for m, v in inspect.getmembers(NamespacesResource)
+                   if not m.startswith("_") and inspect.isfunction(v)}
+        self.assertEqual(methods | {"namespaces"}, set(manifest["operations"]))
+        for params, keys in [
+            (namespace_write_params.NamespaceWriteParams, "write_keys"),
+            (namespace_query_params.NamespaceQueryParams, "query_keys"),
+        ]:
+            sent = set(params.__annotations__) - {"namespace"}
+            self.assertEqual(sent, set(manifest[keys]), keys)
 
     def test_a_refusal_is_the_sdks_error(self):
         tpuf = client()

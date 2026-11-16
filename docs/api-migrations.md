@@ -1,5 +1,13 @@
 # Native API migration notes
 
+## M272: the turbopuffer compatibility manifest
+
+`api/compat/turbopuffer.json` names, for the pinned SDK, every operation with its route,
+status, native call and the tests that run it, and every write and query key as served,
+hint or refused, with what a retry can do. Tests hold it to the facade's routes and
+translation and to the SDK's methods and parameters. No request changes.
+[M272 verification](milestones/M272/VERIFIED.md).
+
 ## M271: the turbopuffer facade, part 4
 
 The facade's write now takes `branch_from_namespace` and `copy_from_namespace`, a name or

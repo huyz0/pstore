@@ -1209,6 +1209,40 @@ mod tests {
         assert_eq!(code, StatusCode::NOT_FOUND, "{other}");
     }
 
+    /// M272: each manifest key's status is what the translation does with it.
+    #[test]
+    fn the_manifest_keys_are_the_translation() {
+        let m: Value =
+            serde_json::from_str(include_str!("../../../api/compat/turbopuffer.json")).unwrap();
+        let untranslated = |r: Result<Value, ApiError>, k: &str| match r {
+            Err(e) => e.message.contains(&format!("{k:?} is not translated")),
+            Ok(_) => false,
+        };
+        for (keys, translate) in [
+            (
+                "write_keys",
+                write_body as fn(&[u8]) -> Result<Value, ApiError>,
+            ),
+            ("query_keys", query_body),
+        ] {
+            let keys = m[keys].as_object().unwrap();
+            assert!(keys.len() >= 14, "{keys:?}");
+            for (k, entry) in keys {
+                let refused = untranslated(translate(json!({ k: 1 }).to_string().as_bytes()), k);
+                let status = entry["status"].as_str().unwrap();
+                assert!(
+                    matches!(status, "refused" | "served" | "hint"),
+                    "{k}: {status}"
+                );
+                if status == "refused" {
+                    assert!(refused, "{k} is marked refused and is translated");
+                } else {
+                    assert!(!refused, "{k} is marked {status} and is refused");
+                }
+            }
+        }
+    }
+
     #[test]
     fn each_sub_query_takes_the_roots_consistency() {
         let multi = query_body(
