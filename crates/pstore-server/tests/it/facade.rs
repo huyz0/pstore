@@ -16,6 +16,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use pstore_blob::{Accounted, BlobStore, MemoryStore, OpClass};
+use pstore_cache::CacheCore;
 use pstore_server::Api;
 use pstore_testkit::depth::DepthCounting;
 use pstore_types::{LaneId, TenantId};
@@ -462,19 +463,28 @@ async fn facade_identity_never_reads_the_tenant_header() {
 
 #[tokio::test]
 async fn facade_adds_no_request() {
-    // Each call measured in a world of its own, built the same way, so neither side sees
-    // what the other wrote: requests grow with an index's history.
-    let cost_of = async |m: &str, p: &str, h: &[(&str, String)], b: &Value| {
+    // Each side measured in a world of its own, built the same way, so neither sees what the
+    // other wrote: requests grow with an index's history. A side is one call or, for
+    // M270's update_metadata, the native calls it makes, in order.
+    type Step<'a> = (&'a str, String, Vec<(&'static str, String)>, Value);
+    let cost_of = async |steps: &[Step<'_>]| {
         let depth = DepthCounting::new(MemoryStore::new());
         let store = Accounted::new(depth.clone());
-        let api = applied_api(store.clone());
+        let api = cached_api(store.clone());
         let spent =
             || [OpClass::Read, OpClass::Write, OpClass::List].map(|c| store.count(TenantId(7), c));
         written(&api, 7).await;
         let before = spent();
         depth.reset();
-        let (s, body) = call(&api, m, p, h, Some(b)).await;
-        assert_eq!(s, StatusCode::OK, "{p}: {body}");
+        let mut statuses = Vec::new();
+        for (m, p, h, b) in steps {
+            let (s, body) = call(&api, m, p, h, Some(b)).await;
+            assert!(
+                s == StatusCode::OK || s == StatusCode::BAD_REQUEST,
+                "{p}: {s} {body}"
+            );
+            statuses.push(s);
+        }
         let after = spent();
         (
             before
@@ -483,53 +493,133 @@ async fn facade_adds_no_request() {
                 .map(|(b, a)| a - b)
                 .collect::<Vec<_>>(),
             depth.depth(),
+            statuses.last().copied(),
         )
     };
-    let mut pairs = Vec::new();
-    for (path, f, n) in [
+    let facade =
+        |m, p: &str, b: Value| -> Step<'_> { (m, format!("/v2/namespaces/docs{p}"), key(7), b) };
+    let v1 =
+        |m, p: &str, b: Value| -> Step<'_> { (m, format!("/v1/namespaces/docs{p}"), key(7), b) };
+    let native_step =
+        |m, p: &str, b: Value| -> Step<'_> { (m, format!("/v1/indexes/docs{p}"), native(7), b) };
+    let cases: Vec<(Step<'_>, Vec<Step<'_>>)> = vec![
         (
-            "/query",
-            json!({"rank_by": ["vector", "ANN", [1.0, 0.1]], "limit": 3}),
-            json!({"vector": [1.0, 0.1], "top_k": 3, "consistency": "strong"}),
+            facade(
+                "POST",
+                "/query",
+                json!({"rank_by": ["vector", "ANN", [1.0, 0.1]], "limit": 3}),
+            ),
+            vec![native_step(
+                "POST",
+                "/query",
+                json!({"vector": [1.0, 0.1], "top_k": 3, "consistency": "strong"}),
+            )],
         ),
         (
-            "",
-            json!({"upsert_rows": [{"id": 9, "vector": [1.0, 0.0], "n": 1}],
-                "distance_metric": "euclidean_squared"}),
-            json!({"durability": "durable", "distance_metric": "euclidean_squared",
-                "documents": [{"id": 9, "vector": [1.0, 0.0], "attributes": {"n": 1}}]}),
+            facade(
+                "POST",
+                "",
+                json!({"upsert_rows": [{"id": 9, "vector": [1.0, 0.0], "n": 1}],
+                    "distance_metric": "euclidean_squared"}),
+            ),
+            vec![native_step(
+                "PUT",
+                "/documents",
+                json!({"durability": "durable", "distance_metric": "euclidean_squared",
+                    "documents": [{"id": 9, "vector": [1.0, 0.0], "attributes": {"n": 1}}]}),
+            )],
         ),
         // M269: a conditional write, applied, and a two-query multi-query.
         (
-            "",
-            json!({"patch_rows": [{"id": 1, "n": 4}], "patch_condition": ["n", "Lt", 9],
-                "return_affected_ids": true}),
-            json!({"durability": "applied", "affected_ids": true,
-                "patch_rows": [{"id": 1, "attributes": {"n": 4}}],
-                "patch_condition": ["n", "Lt", 9]}),
+            facade(
+                "POST",
+                "",
+                json!({"patch_rows": [{"id": 1, "n": 4}], "patch_condition": ["n", "Lt", 9],
+                    "return_affected_ids": true}),
+            ),
+            vec![native_step(
+                "PUT",
+                "/documents",
+                json!({"durability": "applied", "affected_ids": true,
+                    "patch_rows": [{"id": 1, "attributes": {"n": 4}}],
+                    "patch_condition": ["n", "Lt", 9]}),
+            )],
         ),
         (
-            "/query",
-            json!({"queries": [{"rank_by": ["vector", "ANN", [1.0, 0.1]], "limit": 3},
-                {"rank_by": ["n", "asc"], "limit": 2}]}),
-            json!({"queries": [{"vector": [1.0, 0.1], "top_k": 3, "consistency": "strong"},
-                {"rank_by": ["n", "asc"], "top_k": 2, "consistency": "strong"}]}),
+            facade(
+                "POST",
+                "/query",
+                json!({"queries": [{"rank_by": ["vector", "ANN", [1.0, 0.1]], "limit": 3},
+                    {"rank_by": ["n", "asc"], "limit": 2}]}),
+            ),
+            vec![native_step(
+                "POST",
+                "/query",
+                json!({"queries": [{"vector": [1.0, 0.1], "top_k": 3, "consistency": "strong"},
+                    {"rank_by": ["n", "asc"], "top_k": 2, "consistency": "strong"}]}),
+            )],
         ),
-    ] {
-        let (method, native_path) = if path.is_empty() {
-            ("PUT", "/v1/indexes/docs/documents".to_owned())
-        } else {
-            ("POST", format!("/v1/indexes/docs{path}"))
-        };
-        let cost = [
-            cost_of("POST", &format!("/v2/namespaces/docs{path}"), &key(7), &f).await,
-            cost_of(method, &native_path, &native(7), &n).await,
-        ];
-        pairs.push(cost);
+        // M270: explain, warm, recall, the refused schema update, and update_metadata's two.
+        (
+            facade(
+                "POST",
+                "/explain_query",
+                json!({"rank_by": ["vector", "ANN", [1.0, 0.1]], "limit": 3}),
+            ),
+            vec![native_step(
+                "POST",
+                "/query",
+                json!({"vector": [1.0, 0.1], "top_k": 3, "consistency": "strong",
+                    "explain": true}),
+            )],
+        ),
+        (
+            v1("GET", "/hint_cache_warm", json!({})),
+            vec![native_step("POST", "/warm", json!({}))],
+        ),
+        (
+            v1("POST", "/_debug/recall", json!({"num": 2, "top_k": 2})),
+            vec![native_step(
+                "POST",
+                "/recall",
+                json!({"num": 2, "top_k": 2}),
+            )],
+        ),
+        (
+            v1("POST", "/schema", json!({"schema": {"n": {"type": "int"}}})),
+            vec![native_step("PATCH", "/schema", json!({}))],
+        ),
+        (
+            v1("PATCH", "/metadata", json!({"read_only": true})),
+            vec![
+                native_step("PATCH", "", json!({"read_only": true})),
+                native_step("GET", "", json!({})),
+            ],
+        ),
+    ];
+    let mut costs = Vec::new();
+    for (f, n) in &cases {
+        costs.push((
+            f.1.clone(),
+            cost_of(std::slice::from_ref(f)).await,
+            cost_of(n).await,
+        ));
     }
-    for cost in pairs {
-        assert_eq!(cost[0], cost[1], "facade then native: {cost:?}");
+    for (path, f, n) in costs {
+        assert_eq!(f, n, "{path}: facade then native");
     }
+}
+
+/// [`applied_api`] with a read cache, so a warm warms.
+fn cached_api<S: BlobStore + 'static>(store: Accounted<S>) -> Arc<Api<S>> {
+    let api =
+        Api::with_cache_unsecured(store, LaneId(1), Arc::new(CacheCore::memory(16 << 20))).unwrap();
+    api.set_applied_writes(true);
+    api.set_affected_ids(true);
+    api.set_idempotency(true);
+    api.set_partial_filters(true);
+    api.set_filter_ids(true);
+    api
 }
 
 // M269: writes by filter and condition, affected ids, multi-query.
@@ -811,4 +901,287 @@ async fn facade_multi_query_is_the_native_multi_query() {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{body} -> {b}");
         assert!(b["error"].as_str().unwrap().contains(says), "{body} -> {b}");
     }
+}
+
+// M270: explain, warm, recall, schema and metadata updates.
+
+/// The facade's error text, which names the native code.
+fn refused(status: StatusCode, body: &Value, names: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["status"], "error", "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains(names),
+        "{names}: {body}"
+    );
+}
+
+#[tokio::test]
+async fn facade_explain_warm_and_recall_are_native_calls() {
+    let api = cached_api(Accounted::new(MemoryStore::new()));
+    seeded(&api, "docs").await;
+    let v1 = |p: &str| format!("/v1/namespaces/docs{p}");
+
+    // Delta 1: the plan is the native query's `meta.explain`, as text.
+    for (f, n) in [(
+        json!({"rank_by": ["vector", "ANN", [1.0, 0.1]], "limit": 3}),
+        json!({"vector": [1.0, 0.1], "top_k": 3, "consistency": "strong", "explain": true}),
+    )] {
+        let (s, b) = call(
+            &api,
+            "POST",
+            "/v2/namespaces/docs/explain_query",
+            &key(7),
+            Some(&f),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (s, native_b) =
+            call(&api, "POST", "/v1/indexes/docs/query", &native(7), Some(&n)).await;
+        assert_eq!(s, StatusCode::OK, "{native_b}");
+        let plan = native_b
+            .pointer("/meta/explain")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let text = &b["plan_text"];
+        let got = text
+            .as_str()
+            .map_or(Value::Null, |t| serde_json::from_str(t).unwrap());
+        assert_eq!(got, plan, "{b} vs {native_b}");
+        assert_eq!(b.as_object().unwrap().len(), 1, "{b}");
+    }
+    // An order has no legs to explain: refused as the native explain refuses it.
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs/explain_query",
+        &key(7),
+        Some(&json!({"rank_by": ["n", "asc"], "limit": 2})),
+    )
+    .await;
+    let (native_status, n) = call(
+        &api,
+        "POST",
+        "/v1/indexes/docs/query",
+        &native(7),
+        Some(
+            &json!({"rank_by": ["n", "asc"], "top_k": 2, "consistency": "strong",
+            "explain": true}),
+        ),
+    )
+    .await;
+    assert_eq!(native_status, s, "{b} vs {n}");
+    refused(s, &b, n["error"]["message"].as_str().unwrap());
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs/explain_query",
+        &key(7),
+        Some(&json!({"vector": [1.0, 0.1], "top_k": 3})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs/explain_query",
+        &key(7),
+        Some(&json!({"queries": [{"rank_by": ["n", "asc"], "limit": 1}]})),
+    )
+    .await;
+    refused(s, &b, "explain_query explains one query");
+
+    // Delta 2: the warm, ACCEPTED, naming what the native warm warmed.
+    let (s, b) = call(&api, "GET", &v1("/hint_cache_warm"), &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, native_b) = call(&api, "POST", "/v1/indexes/docs/warm", &native(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{native_b}");
+    assert_eq!(
+        b,
+        json!({"status": "ACCEPTED",
+            "message": format!("warmed {} segments", native_b["segments"])}),
+    );
+    let (s, b) = call(
+        &api,
+        "GET",
+        "/v1/namespaces/nothing/hint_cache_warm",
+        &key(7),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+    // On a server with no read cache there is nothing to warm, and that is no error.
+    let plain = applied_api(Accounted::new(MemoryStore::new()));
+    seeded(&plain, "docs").await;
+    let (s, native_b) = call(&plain, "POST", "/v1/indexes/docs/warm", &native(7), None).await;
+    assert_eq!(native_b["error"]["code"], "no_read_cache", "{s} {native_b}");
+    let (s, b) = call(&plain, "GET", &v1("/hint_cache_warm"), &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["status"], "ACCEPTED", "{b}");
+    assert!(
+        b["message"].as_str().unwrap().contains("no read cache"),
+        "{b}"
+    );
+
+    // Delta 3: recall, the native one's numbers, `dist` as `$dist`.
+    for body in [
+        json!({"num": 2, "top_k": 2, "include_ground_truth": true}),
+        json!({"num": 1, "top_k": 3, "filters": ["kind", "Eq", "b"]}),
+    ] {
+        let (s, b) = call(&api, "POST", &v1("/_debug/recall"), &key(7), Some(&body)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (s, n) = call(
+            &api,
+            "POST",
+            "/v1/indexes/docs/recall",
+            &native(7),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{n}");
+        for k in ["avg_recall", "avg_ann_count", "avg_exhaustive_count"] {
+            assert_eq!(b[k], n[k], "{k}: {b} vs {n}");
+        }
+        for k in ["num", "epoch", "cost"] {
+            assert!(b.get(k).is_none(), "{k} in {b}");
+        }
+        match n.get("ground_truth") {
+            None => assert!(b.get("ground_truth").is_none(), "{b}"),
+            Some(truth) => {
+                let truth = truth.as_array().unwrap();
+                let got = b["ground_truth"].as_array().unwrap();
+                assert_eq!(got.len(), truth.len(), "{b}");
+                assert!(!got.is_empty(), "{b}");
+                for (g, t) in got.iter().zip(truth) {
+                    assert_eq!(g["query_vector"], t["query_vector"], "{g} vs {t}");
+                    let gn = g["nearest_neighbors"].as_array().unwrap();
+                    let tn = t["nearest_neighbors"].as_array().unwrap();
+                    assert_eq!(gn.len(), tn.len(), "{g} vs {t}");
+                    for (a, z) in gn.iter().zip(tn) {
+                        assert_eq!(
+                            (&a["id"], &a["$dist"]),
+                            (&z["id"], &z["dist"]),
+                            "{a} vs {z}"
+                        );
+                        assert!(a.get("dist").is_none(), "{a}");
+                    }
+                }
+            }
+        }
+    }
+    let (s, b) = call(
+        &api,
+        "POST",
+        &v1("/_debug/recall"),
+        &key(7),
+        Some(&json!({"num": 1, "rank_by": ["vector", "ANN", [1.0, 0.0]]})),
+    )
+    .await;
+    refused(s, &b, "\"rank_by\" is not translated by this facade");
+}
+
+#[tokio::test]
+async fn facade_schema_and_metadata_updates_are_native_calls() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    written(&api, 7).await;
+    let meta = "/v1/namespaces/docs/metadata";
+
+    // Delta 4: the native schema patch, refused as it refuses.
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v1/namespaces/docs/schema",
+        &key(7),
+        Some(&json!({"schema": {"n": {"type": "int", "filterable": true}}})),
+    )
+    .await;
+    refused(s, &b, "schema_immutable");
+    let (s, n) = call(
+        &api,
+        "PATCH",
+        "/v1/indexes/docs/schema",
+        &native(7),
+        Some(&json!({})),
+    )
+    .await;
+    assert_eq!(
+        (s, &n["error"]["code"]),
+        (StatusCode::BAD_REQUEST, &json!("schema_immutable"))
+    );
+
+    // Delta 6: the size is the native summary's.
+    let (s, summary) = call(&api, "GET", "/v1/indexes/docs", &native(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{summary}");
+    let (s, m) = call(&api, "GET", "/v2/namespaces/docs/metadata", &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    assert!(
+        summary["approx_logical_bytes"].as_u64().unwrap() > 0,
+        "{summary}"
+    );
+    assert_eq!(
+        m["approx_logical_bytes"], summary["approx_logical_bytes"],
+        "{m}"
+    );
+
+    // Delta 5: read_only set, writes refused; cleared, writes in again.
+    let (s, b) = call(
+        &api,
+        "PATCH",
+        meta,
+        &key(7),
+        Some(&json!({"read_only": true})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, after) = call(&api, "GET", "/v2/namespaces/docs/metadata", &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{after}");
+    assert_eq!(b, after);
+    let (_, summary) = call(&api, "GET", "/v1/indexes/docs", &native(7), None).await;
+    assert_eq!(summary["read_only"], true, "{summary}");
+    let one = json!({"upsert_rows": [{"id": 8, "vector": [1.0, 0.0]}],
+        "distance_metric": "euclidean_squared"});
+    let (s, b) = call(&api, "POST", "/v2/namespaces/docs", &key(7), Some(&one)).await;
+    refused(s, &b, "index_read_only");
+    let (s, b) = call(
+        &api,
+        "PATCH",
+        meta,
+        &key(7),
+        Some(&json!({"read_only": false, "pinning": null})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (_, summary) = call(&api, "GET", "/v1/indexes/docs", &native(7), None).await;
+    assert_eq!(summary["read_only"], false, "{summary}");
+    let (s, b) = call(&api, "POST", "/v2/namespaces/docs", &key(7), Some(&one)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+
+    // Asking for nothing answers the metadata; pinning is refused; nothing else is taken.
+    let (s, b) = call(
+        &api,
+        "PATCH",
+        meta,
+        &key(7),
+        Some(&json!({"pinning": false})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b["approx_row_count"].is_u64(), "{b}");
+    for (body, names) in [
+        (json!({"pinning": true}), "pinning"),
+        (json!({"pinning": {"replicas": 2}}), "pinning"),
+        (json!({"read_only": "yes"}), "read_only"),
+        (json!({"encryption": {}}), "encryption"),
+    ] {
+        let (s, b) = call(&api, "PATCH", meta, &key(7), Some(&body)).await;
+        refused(s, &b, names);
+    }
+    let (s, b) = call(
+        &api,
+        "PATCH",
+        "/v1/namespaces/nothing/metadata",
+        &key(7),
+        Some(&json!({"read_only": true})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
 }
