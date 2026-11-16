@@ -72,8 +72,8 @@ Red runs.
 Shard 1: `!t.is_empty() && t.bytes().all(..)` in `identity` replaced by `||` was missed.
 With it, `Bearer +7` passes the filter and `u128`'s parser reads it as tenant 7. Every
 non-digit key the test sent also failed to parse, so the mutant made no difference to it.
-`facade_identity_never_reads_the_tenant_header` now refuses `Bearer +7` and an empty key as
-401. The mutant, applied by hand, turns it red: `Bearer +7` answers 200.
+`facade_identity_never_reads_the_tenant_header` now refuses `Bearer +7` and an empty key,
+each with a 401. The mutant, applied by hand, turns it red: `Bearer +7` answers 200.
 
 Shard 3: two mutants in `query_body` were missed.
 - The default-field check `!=` replaced by `==`: no test used a named vector field.
