@@ -2321,6 +2321,8 @@ pub struct Answer {
     /// Each hit's sparse pairs (M193) as stored, in key order: one entry a hit, `None` for a
     /// row without the field. **Empty** for every query that does not project it.
     pub sparse: Vec<Option<Sparse>>,
+    /// The index's metric (M265): how `compute_attributes`' `VectorDist` measures.
+    pub metric: Metric,
 }
 
 /// A row's sparse pairs as a projection answers them (M193): each weight as stored, in key
@@ -2797,6 +2799,13 @@ async fn backoff(lane: LaneId, attempt: u32) {
 }
 
 impl<S: BlobStore> Engine<S> {
+    /// The store this engine reads and writes through: for a server, the tenant's cached
+    /// view, whose read counters a response reports (M264).
+    #[must_use]
+    pub fn store(&self) -> &Arc<S> {
+        &self.store
+    }
+
     /// A writer on one lane of one tenant.
     pub fn new(store: Arc<S>, tenant: TenantId, lane: LaneId) -> Self {
         Self {
@@ -8386,6 +8395,7 @@ impl<S: BlobStore> Engine<S> {
                 vectors: Vec::new(),
                 fields: Vec::new(),
                 sparse: Vec::new(),
+                metric,
             });
         }
 
@@ -8453,6 +8463,7 @@ impl<S: BlobStore> Engine<S> {
             vectors,
             fields,
             sparse,
+            metric,
         })
     }
 
@@ -8825,6 +8836,7 @@ impl<S: BlobStore> Engine<S> {
                 vectors: Vec::new(),
                 fields: Vec::new(),
                 sparse: Vec::new(),
+                metric: schema.metric,
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -8873,6 +8885,7 @@ impl<S: BlobStore> Engine<S> {
             vectors,
             fields: Vec::new(),
             sparse: Vec::new(),
+            metric: schema.metric,
         })
     }
 
@@ -9328,6 +9341,74 @@ impl<S: BlobStore> Engine<S> {
             }
             other => other,
         }
+    }
+
+    /// `compute_attributes`' expressions prepared to score a query's rows (M265): each
+    /// `BM25` clause's statistics over `index`'s snapshot, its segments' dictionaries and
+    /// its unfolded rows. Run inside [`Self::pinned`] beside the query, it reads the query's
+    /// snapshot, in the round the query opens its segments.
+    ///
+    /// # Errors
+    /// [`EngineError::Refused`] for an expression outside its limits,
+    /// [`EngineError::UnknownTextField`] for a `BM25` clause over a field that is not
+    /// full-text, and any read [`Self::scored_as`] can fail.
+    pub async fn computed(
+        &self,
+        index: &str,
+        exprs: &[pstore_query::Expr],
+        consistency: Consistency,
+    ) -> Result<pstore_query::Computed, EngineError> {
+        for e in exprs {
+            e.check_limits().map_err(EngineError::Refused)?;
+        }
+        let mut hit = false;
+        match self
+            .computed_once(index, exprs, consistency, true, &mut hit)
+            .await
+        {
+            Err(_) if hit => {
+                self.computed_once(index, exprs, consistency, false, &mut hit)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn computed_once(
+        &self,
+        index: &str,
+        exprs: &[pstore_query::Expr],
+        consistency: Consistency,
+        allow_hit: bool,
+        hit: &mut bool,
+    ) -> Result<pstore_query::Computed, EngineError> {
+        let Scope {
+            targets,
+            unfolded,
+            fts,
+            texts,
+            ..
+        } = self.scope(index, None, consistency, allow_hit, hit).await?;
+        if let Some(f) = exprs
+            .iter()
+            .flat_map(pstore_query::Expr::fields)
+            .find(|f| *f != pstore_format::text::DEFAULT_TEXT_FIELD && !texts.contains_key(*f))
+        {
+            return Err(EngineError::UnknownTextField(f.to_owned()));
+        }
+        let bound: Vec<pstore_query::Expr> = exprs
+            .iter()
+            .map(|e| e.bound_texts(&fts.analyzer, &texts))
+            .collect();
+        pstore_query::Computed::gather(
+            &*self.store,
+            &targets,
+            bound,
+            &scoring(fts, &texts),
+            &unfolded,
+        )
+        .await
+        .map_err(|e| EngineError::Query(e.to_string()))
     }
 
     #[allow(

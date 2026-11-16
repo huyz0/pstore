@@ -42,5 +42,5 @@
 mod cache;
 mod disk;
 
-pub use cache::{CacheCore, Caching, DiskState};
+pub use cache::{CacheCore, Caching, DiskState, Traffic};
 pub use disk::{DEFAULT_BLOCK, DiskConfig};

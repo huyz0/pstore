@@ -1047,3 +1047,44 @@ async fn a_cached_range_owns_its_bytes() {
         );
     }
 }
+
+/// M264: the bytes a view's cacheable reads asked for and fetched, cold then warm.
+#[tokio::test]
+async fn traffic_counts_each_cacheable_read() {
+    let (cache, acct, key) = fixture(1 << 20).await;
+    let t = |c: &Caching<TenantView<MemoryStore>>| {
+        let t = c.traffic();
+        (t.hit_bytes, t.miss_bytes)
+    };
+    assert_eq!(t(&cache), (0, 0));
+    // A whole-object `get` is never cached, so never counted.
+    cache.get(&key).await.unwrap();
+    assert_eq!(t(&cache), (0, 0));
+    // One range: cold, then warm.
+    cache.get_range(&key, 0..100).await.unwrap();
+    assert_eq!(t(&cache), (0, 100));
+    cache.get_range(&key, 0..100).await.unwrap();
+    assert_eq!(t(&cache), (100, 100));
+    // Batched: two ranges far apart, one repeated, and one within the coalescing gap of
+    // another, so the store fetches a span wider than what was asked. Counted as asked.
+    let rs = [2000..2010, 2000..2010, 2020..2030, 4000..4050];
+    cache.get_ranges(&key, &rs).await.unwrap();
+    assert_eq!(t(&cache), (100, 100 + 10 + 10 + 10 + 50));
+    cache.get_ranges(&key, &rs).await.unwrap();
+    assert_eq!(t(&cache), (100 + 80, 180));
+    // A suffix and an immutable whole object.
+    cache.get_suffix(&key, 64).await.unwrap();
+    assert_eq!(t(&cache), (180, 180 + 64));
+    cache.get_suffix(&key, 64).await.unwrap();
+    assert_eq!(t(&cache), (180 + 64, 244));
+    let whole = BODY as u64;
+    cache.get_immutable(&key, Class::default()).await.unwrap();
+    assert_eq!(t(&cache), (244, 244 + whole));
+    cache.get_immutable(&key, Class::default()).await.unwrap();
+    assert_eq!(t(&cache), (244 + whole, 244 + whole));
+    // An uncached view counts nothing.
+    let bare = Caching::over(Arc::new(acct.as_tenant(TenantId(1))), None);
+    bare.get_range(&key, 0..100).await.unwrap();
+    bare.get_suffix(&key, 8).await.unwrap();
+    assert_eq!(t(&bare), (0, 0));
+}

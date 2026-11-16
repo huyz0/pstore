@@ -5,6 +5,7 @@ use pstore_blob::{BlobError, BlobStore, Capabilities, Class, Key, Precondition, 
 use pstore_types::CasTag;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a cached answer is stored against.
@@ -110,6 +111,24 @@ pub struct Caching<S> {
     /// ⚠️ `None` forwards every call verbatim, so an uncached server keeps every request
     /// count it had (M20).
     core: Option<Arc<CacheCore>>,
+    /// Bytes this view's cacheable reads asked for (M264), monotone.
+    asked: AtomicU64,
+    /// Of those, bytes that reached `inner` (M264), monotone.
+    missed: AtomicU64,
+}
+
+/// What a view's cacheable reads asked of the cache (M264): monotone byte totals, which a
+/// request diffs as it diffs `Accounted`'s counts.
+///
+/// ⚠️ Ranges, suffixes and immutable objects only: a whole-object `get` is never cached and
+/// never counted. A range is counted as **asked**, never as the span coalescing fetched, and
+/// a range asked twice in one batch counts twice. A disk-tier hit is a hit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Traffic {
+    /// Bytes answered without a request to the store beneath.
+    pub hit_bytes: u64,
+    /// Bytes that needed one.
+    pub miss_bytes: u64,
 }
 
 /// The memory tier's split of `budget`.
@@ -343,6 +362,11 @@ impl<S: BlobStore> Caching<S> {
         let name: Arc<str> = key.as_str().into();
         let mut admitted = Vec::with_capacity(misses.len());
         for ((slots, r), bytes) in misses.into_iter().zip(fetched) {
+            // M264: every slot it fills is a miss, as asked.
+            self.missed.fetch_add(
+                len(&bytes).saturating_mul(len_of(&slots)),
+                Ordering::Relaxed,
+            );
             for i in slots {
                 if let Some(slot) = out.get_mut(i) {
                     *slot = Some(bytes.clone());
@@ -376,7 +400,44 @@ impl<S: BlobStore> Caching<S> {
     /// at all.
     #[must_use]
     pub fn over(inner: Arc<S>, core: Option<Arc<CacheCore>>) -> Self {
-        Self { inner, core }
+        Self {
+            inner,
+            core,
+            asked: AtomicU64::new(0),
+            missed: AtomicU64::new(0),
+        }
+    }
+
+    /// What this view's cacheable reads have asked of the cache so far (M264). Zero for a
+    /// view over no cache.
+    #[must_use]
+    pub fn traffic(&self) -> Traffic {
+        let asked = self.asked.load(Ordering::Relaxed);
+        let miss_bytes = self.missed.load(Ordering::Relaxed);
+        Traffic {
+            hit_bytes: asked.saturating_sub(miss_bytes),
+            miss_bytes,
+        }
+    }
+
+    /// Counts `got`'s bytes as asked (M264), and passes it on.
+    fn asked(&self, got: Result<Bytes, BlobError>) -> Result<Bytes, BlobError> {
+        if let Ok(b) = &got {
+            self.asked.fetch_add(len(b), Ordering::Relaxed);
+        }
+        got
+    }
+
+    /// `fetch` counted as a miss when it succeeds (M264).
+    async fn missing(
+        &self,
+        fetch: impl Future<Output = Result<Bytes, BlobError>>,
+    ) -> Result<Bytes, BlobError> {
+        let got = fetch.await;
+        if let Ok(b) = &got {
+            self.missed.fetch_add(len(b), Ordering::Relaxed);
+        }
+        got
     }
 
     /// Bytes held in memory in one class.
@@ -509,10 +570,12 @@ impl<S: BlobStore> BlobStore for Caching<S> {
             return self.inner.get_range_as(key, range, class).await;
         };
         let id = Id::Range(key.as_str().into(), range.start, range.end);
-        core.fetch_once(id, class, || {
-            self.inner.get_range_as(key, range.clone(), class)
-        })
-        .await
+        let got = core
+            .fetch_once(id, class, || {
+                self.missing(self.inner.get_range_as(key, range.clone(), class))
+            })
+            .await;
+        self.asked(got)
     }
 
     async fn get_ranges(&self, key: &Key, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, BlobError> {
@@ -602,11 +665,15 @@ impl<S: BlobStore> BlobStore for Caching<S> {
         }
         self.fill(core, key, class, &mut out, again).await?;
 
-        out.into_iter()
+        let out: Vec<Bytes> = out
+            .into_iter()
             .map(|b| {
                 b.ok_or_else(|| BlobError::Other("a requested range was never filled".to_owned()))
             })
-            .collect()
+            .collect::<Result<_, _>>()?;
+        self.asked
+            .fetch_add(out.iter().map(len).sum(), Ordering::Relaxed);
+        Ok(out)
     }
 
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
@@ -621,8 +688,12 @@ impl<S: BlobStore> BlobStore for Caching<S> {
             return self.inner.get_suffix_as(key, n, class).await;
         };
         let id = Id::Suffix(key.as_str().into(), n);
-        core.fetch_once(id, class, || self.inner.get_suffix_as(key, n, class))
-            .await
+        let got = core
+            .fetch_once(id, class, || {
+                self.missing(self.inner.get_suffix_as(key, n, class))
+            })
+            .await;
+        self.asked(got)
     }
 
     /// ⚠️ Cached, unlike `get` — because the caller has asserted the object never changes.
@@ -632,8 +703,12 @@ impl<S: BlobStore> BlobStore for Caching<S> {
             return self.inner.get_immutable(key, class).await;
         };
         let id = Id::Whole(key.as_str().into());
-        core.fetch_once(id, class, || self.inner.get_immutable(key, class))
-            .await
+        let got = core
+            .fetch_once(id, class, || {
+                self.missing(self.inner.get_immutable(key, class))
+            })
+            .await;
+        self.asked(got)
     }
 
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
@@ -672,6 +747,16 @@ impl<S: BlobStore> BlobStore for Caching<S> {
     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
         self.inner.list_unrestricted(prefix).await
     }
+}
+
+/// A byte count as `u64` (M264).
+fn len(b: &Bytes) -> u64 {
+    u64::try_from(b.len()).unwrap_or(u64::MAX)
+}
+
+/// A slot count as `u64` (M264).
+fn len_of<T>(v: &[T]) -> u64 {
+    u64::try_from(v.len()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

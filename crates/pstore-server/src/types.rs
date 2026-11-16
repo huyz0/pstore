@@ -546,6 +546,12 @@ pub struct QueryRequest {
     /// be the last.
     #[serde(default)]
     pub rank_by: Option<serde_json::Value>,
+    /// `{name: expression}`: values computed on each returned row, never changing the
+    /// ranking (M265). An expression is `[field, "VectorDist", vector]`, a `rank_by`
+    /// scoring expression, or `["Highlight", attr, config?]` (M266). Parsed by `lib.rs`'s
+    /// `computed_attributes`.
+    #[serde(default)]
+    pub compute_attributes: Option<serde_json::Value>,
     /// `{label: ["Count" | "Sum", attr]}`: counts and sums instead of rows (M12). Parsed by
     /// `lib.rs`'s `aggregation`.
     #[serde(default)]
@@ -596,6 +602,10 @@ pub struct ResultRow {
     /// Without `exact` it is the ranking rung's estimate.
     #[serde(rename = "$dist", skip_serializing_if = "Option::is_none")]
     pub dist: Option<f32>,
+    /// The query's `compute_attributes`, by name (M265): a number, a `Highlight`'s fragments
+    /// (M266), or `null` where the row has no value. Absent when the query asks for none.
+    #[serde(rename = "$computed", skip_serializing_if = "Option::is_none")]
+    pub computed: Option<std::collections::BTreeMap<String, Option<Computed>>>,
     /// Its attributes, **only when the query asked** — absent otherwise, so a query that
     /// did not ask gets exactly the response it always did.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,6 +642,16 @@ pub enum VectorOut {
     Base64(String),
 }
 
+/// One `compute_attributes` value of a row (M265, M266).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Computed {
+    /// An expression's value or a `VectorDist`, as the wire's `f32`.
+    Number(f32),
+    /// A `Highlight`'s fragments (M266), as M159's `$highlights` gives them.
+    Fragments(Vec<HighlightMatch>),
+}
+
 /// One fragment of a structured highlight (M159). Ranges are `[start, end)` into the
 /// attribute's value (its element, for an array), never into `text`.
 #[derive(Debug, Clone, Serialize)]
@@ -649,6 +669,52 @@ pub struct HighlightMatch {
     pub array_index: Option<usize>,
 }
 
+/// How long a query took and what its cache answered (M264).
+///
+/// ⚠️ The cache's bytes are `cost`'s kind of number: differences of the tenant's monotone
+/// counters, exact with one request in flight and cross-attributed under concurrency.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Performance {
+    /// Milliseconds from the handler's first line to the response being built, its body's
+    /// serialisation not included.
+    pub server_total_ms: f64,
+    /// Milliseconds running the planned queries and facets: `server_total_ms` less parsing,
+    /// planning and admission.
+    pub query_execution_ms: f64,
+    /// `cache_hit_bytes / (cache_hit_bytes + cache_miss_bytes)`; `null` when the request made
+    /// no cacheable read or the server keeps no cache.
+    pub cache_hit_ratio: Option<f64>,
+    /// Bytes of cacheable reads (ranges, suffixes, immutable objects) the cache answered.
+    pub cache_hit_bytes: u64,
+    /// Bytes of cacheable reads that went to the store.
+    pub cache_miss_bytes: u64,
+}
+
+impl Performance {
+    /// From the request's start, its execution's span, and the tenant's cache counters
+    /// after and before.
+    #[must_use]
+    pub fn of(
+        started: std::time::Instant,
+        execution: std::time::Duration,
+        after: pstore_cache::Traffic,
+        before: pstore_cache::Traffic,
+    ) -> Self {
+        let hit = after.hit_bytes.saturating_sub(before.hit_bytes);
+        let miss = after.miss_bytes.saturating_sub(before.miss_bytes);
+        let asked = hit.saturating_add(miss);
+        #[allow(clippy::cast_precision_loss, reason = "a ratio of byte counts")]
+        let ratio = (asked > 0).then(|| hit as f64 / asked as f64);
+        Self {
+            server_total_ms: started.elapsed().as_secs_f64() * 1e3,
+            query_execution_ms: execution.as_secs_f64() * 1e3,
+            cache_hit_ratio: ratio,
+            cache_hit_bytes: hit,
+            cache_miss_bytes: miss,
+        }
+    }
+}
+
 /// What the answer cost and how fresh it is.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryMeta {
@@ -663,6 +729,8 @@ pub struct QueryMeta {
     pub unfolded_hits: usize,
     /// What it cost.
     pub cost: Cost,
+    /// How long it took and what its cache answered (M264).
+    pub performance: Performance,
     /// The level served: `eventual` or `strong` (M9i.2).
     pub consistency: &'static str,
     /// The session token, as the `x-pstore-session` header carries it (M11.1).
@@ -807,6 +875,8 @@ pub struct MultiQueryMeta {
     pub unfolded_hits: Vec<usize>,
     /// What the whole request cost.
     pub cost: Cost,
+    /// How long the whole request took and what its cache answered (M264).
+    pub performance: Performance,
     /// Each query's level served (M9i.2).
     pub consistencies: Vec<&'static str>,
     /// The session token, merged over every query (M11.1).
@@ -1204,6 +1274,33 @@ pub struct Duties {
 )]
 mod tests {
     use super::*;
+
+    /// M264 (CI's mutation shard): both spans are in milliseconds, from seconds times 1000.
+    #[test]
+    fn performance_spans_are_milliseconds() {
+        let started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(50))
+            .unwrap_or_else(std::time::Instant::now);
+        let before = pstore_cache::Traffic::default();
+        let after = pstore_cache::Traffic {
+            hit_bytes: 3,
+            miss_bytes: 1,
+        };
+        let p = Performance::of(started, std::time::Duration::from_millis(20), after, before);
+        assert!(
+            (p.query_execution_ms - 20.0).abs() < 1e-9,
+            "{}",
+            p.query_execution_ms
+        );
+        // At least the 50 ms already spent, and nowhere near a second.
+        assert!(
+            (50.0..900.0).contains(&p.server_total_ms),
+            "{}",
+            p.server_total_ms
+        );
+        assert_eq!(p.cache_hit_ratio, Some(0.75));
+        assert_eq!((p.cache_hit_bytes, p.cache_miss_bytes), (3, 1));
+    }
 
     /// The derive `VectorIn` replaced (M119), verbatim, under its own name: the name is in
     /// its message.

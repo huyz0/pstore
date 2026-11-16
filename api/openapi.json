@@ -1711,6 +1711,49 @@
         "additionalProperties": false,
         "description": "What the request cost in blob-store requests and bytes. Native: present on every answer that touches the store."
       },
+      "Performance": {
+        "type": "object",
+        "description": "How long a query took and what its read cache answered (M264). The cache byte counts are, like cost, differences of the tenant's counters: exact with one request in flight, cross-attributed under concurrency.",
+        "properties": {
+          "server_total_ms": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Milliseconds from the request's arrival to its response being built."
+          },
+          "query_execution_ms": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Milliseconds running the planned queries and facets."
+          },
+          "cache_hit_ratio": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 1,
+            "description": "cache_hit_bytes / (cache_hit_bytes + cache_miss_bytes); null when the request made no cacheable read or the server keeps no cache."
+          },
+          "cache_hit_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Bytes of cacheable reads the cache answered."
+          },
+          "cache_miss_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Bytes of cacheable reads that went to the store."
+          }
+        },
+        "required": [
+          "server_total_ms",
+          "query_execution_ms",
+          "cache_hit_ratio",
+          "cache_hit_bytes",
+          "cache_miss_bytes"
+        ],
+        "additionalProperties": false
+      },
       "ErrorCode": {
         "type": "string",
         "description": "Stable across releases: the field a client switches on. x-pstore-status gives each code's HTTP status.",
@@ -2621,6 +2664,11 @@
           "rank_by": {
             "description": "An order (an attribute and asc or desc) or a scoring expression (M182; numeric nodes M203)."
           },
+          "compute_attributes": {
+            "type": "object",
+            "description": "1 to 256 values computed on each returned row of a relevance query (M265), never changing the ranking: each name (non-empty, not starting with $) to [field, \"VectorDist\", vector], a rank_by scoring expression, or [\"Highlight\", attr] / [\"Highlight\", attr, config] (M266: config holds fragment_by, fragment_limit (default 3), include_offsets, pre, post, max_chars and rank_fragments_by). Refused with as_of, rank_by or aggregate_by.",
+            "additionalProperties": {}
+          },
           "aggregate_by": {
             "description": "Aggregations instead of rows (M140)."
           },
@@ -2744,6 +2792,26 @@
             "type": "number",
             "description": "The vector distance under the index's metric: lower is nearer. Absent on an order or a text-only query."
           },
+          "$computed": {
+            "type": "object",
+            "description": "The query's compute_attributes by name (M265): a number, a Highlight's fragments as $highlights gives them (M266), or null where the row has no value.",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HighlightMatch"
+                  }
+                }
+              ]
+            }
+          },
           "attributes": {
             "type": "object",
             "additionalProperties": {},
@@ -2797,6 +2865,9 @@
           "cost": {
             "$ref": "#/components/schemas/Cost"
           },
+          "performance": {
+            "$ref": "#/components/schemas/Performance"
+          },
           "consistency": {
             "type": "string",
             "enum": [
@@ -2824,6 +2895,7 @@
           "epoch",
           "unfolded_hits",
           "cost",
+          "performance",
           "consistency",
           "session",
           "staleness_ms"
@@ -2880,6 +2952,9 @@
           "cost": {
             "$ref": "#/components/schemas/Cost"
           },
+          "performance": {
+            "$ref": "#/components/schemas/Performance"
+          },
           "consistencies": {
             "type": "array",
             "items": {
@@ -2917,6 +2992,7 @@
           "epochs",
           "unfolded_hits",
           "cost",
+          "performance",
           "consistencies",
           "session",
           "staleness_ms"

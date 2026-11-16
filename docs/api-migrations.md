@@ -1,5 +1,38 @@
 # Native API migration notes
 
+## M266: `Highlight` in `compute_attributes`
+
+`compute_attributes` also takes `["Highlight", attr]` and `["Highlight", attr, config]`. The
+config holds `fragment_by`, `fragment_limit` (default **3** here, not `highlight`'s 1),
+`include_offsets`, `pre`, `post`, `max_chars` and `rank_fragments_by`, a `rank_by` scoring
+expression that orders `attr`'s candidate fragments, each scored as if it were the row's whole
+`attr`. It defaults to the query's text over `attr`; a vector query must name one, and it must
+hold a `BM25` clause over `attr`, whose terms are marked. The value is the list of fragments
+`$highlights` gives, or `null`, so `$computed`'s values are now a number, `null` or such a
+list. `highlight` is unchanged. [M266 verification](milestones/M266/VERIFIED.md).
+
+## M265: `compute_attributes`
+
+A relevance query (`vector`, `text`, or both) takes `compute_attributes`, an object of 1 to
+256 names. Each name maps to `[field, "VectorDist", vector]` or to any `rank_by` scoring
+expression, and a computed value may be signed. Each returned row then carries
+`$computed: {name: number | null}`: an expression's value is the score `rank_by` with it would
+give the row, and a `VectorDist` is the metric's distance, nearest of a multi-vector field.
+The ranking, the page and every other field are unchanged, and a `VectorDist` field's
+vectors are returned only where `include_vectors` asks. It is refused beside `rank_by`,
+`aggregate_by` or `as_of`. A query without it is answered as before. Evidence is in
+[M265 verification](milestones/M265/VERIFIED.md).
+
+## M264: `meta.performance` on every query
+
+A query's and a multi-query's `meta` gain `performance`: `server_total_ms` and
+`query_execution_ms` (floats, milliseconds), `cache_hit_bytes` and `cache_miss_bytes` (the
+tenant's read cache over this request's cacheable reads), and `cache_hit_ratio` (`null`
+without a cache or a cacheable read). The byte counts are attributed as `cost` is: exact with
+one request in flight, blurred under concurrency. A client that refuses unknown fields in
+`meta` must accept the new one; nothing else changes. Evidence is in
+[M264 verification](milestones/M264/VERIFIED.md).
+
 ## M263: `Min` and `Max` over strings, bools, datetimes and uuids
 
 `aggregate_by` takes `["Min", attribute, {"non_numeric": true}]`, and `Max` alike: when the

@@ -109,8 +109,7 @@ impl Expr {
     /// M203: also a literal, midpoint, exponent or origin out of range, and a root that is not
     /// [non-negative](Expr::non_negative).
     pub fn check(&self) -> Result<(), String> {
-        let mut nodes = 0;
-        self.check_at(1, &mut nodes)?;
+        self.check_limits()?;
         if self.non_negative() {
             Ok(())
         } else {
@@ -121,6 +120,16 @@ impl Expr {
                     .to_owned(),
             )
         }
+    }
+
+    /// [`Self::check`] but for its root rule (M265): a value `compute_attributes` reports may
+    /// be signed, since it ranks nothing.
+    ///
+    /// # Errors
+    /// Why, in a sentence a caller can be shown.
+    pub fn check_limits(&self) -> Result<(), String> {
+        let mut nodes = 0;
+        self.check_at(1, &mut nodes)
     }
 
     /// Whether every score this node gives is `>= 0`, by its form alone (M203): `Attribute`
@@ -338,19 +347,7 @@ pub async fn rank<S: BlobStore>(
     expr.check().map_err(QueryError::Expression)?;
     let mut fields = Fields::of(expr, texts);
     let opened = open(store, targets, !fields.0.is_empty()).await?;
-    for f in &mut fields.0 {
-        f.stats = Stats::merge(
-            opened
-                .iter()
-                .filter(|o| o.segment.text_fields().contains(&f.name))
-                .filter_map(|o| o.dictionary.as_ref().map(|d| (&o.segment, d)))
-                .map(|(segment, d)| {
-                    TextIndex::for_field(segment, d, &f.name).map(|idx| idx.summary_for(&f.terms))
-                })
-                .chain(std::iter::once(Ok(f.unfolded_stats(unfolded))))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-    }
+    fields.gather(&opened, unfolded)?;
     let node = Node::of(expr, &fields);
     let fields = &fields;
     let node = &node;
@@ -393,8 +390,10 @@ pub async fn rank<S: BlobStore>(
 
 /// Each text field the expression's `BM25` clauses read: how it is analyzed and scored, the
 /// clauses' terms, and -- once gathered -- its statistics.
+#[derive(Debug)]
 struct Fields(Vec<Field>);
 
+#[derive(Debug)]
 struct Field {
     name: String,
     text: pstore_format::text::FullText,
@@ -437,6 +436,130 @@ impl Fields {
 
     fn index(&self, name: &str) -> usize {
         self.0.iter().position(|f| f.name == name).unwrap_or(0)
+    }
+
+    /// Each field's statistics: its segments' dictionaries' and the unfolded rows', merged.
+    fn gather(
+        &mut self,
+        opened: &[crate::order::Opened],
+        unfolded: &[Document],
+    ) -> Result<(), QueryError> {
+        for f in &mut self.0 {
+            f.stats = Stats::merge(
+                opened
+                    .iter()
+                    .filter(|o| o.segment.text_fields().contains(&f.name))
+                    .filter_map(|o| o.dictionary.as_ref().map(|d| (&o.segment, d)))
+                    .map(|(segment, d)| {
+                        TextIndex::for_field(segment, d, &f.name)
+                            .map(|idx| idx.summary_for(&f.terms))
+                    })
+                    .chain(std::iter::once(Ok(f.unfolded_stats(unfolded))))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Expressions prepared to score rows a query already fetched (M265, `compute_attributes`):
+/// each `BM25` clause's statistics gathered once over the snapshot's segments and unfolded
+/// rows, as [`rank`] gathers them, so a row's value is the score `rank` gives it.
+#[derive(Debug)]
+pub struct Computed {
+    exprs: Vec<Expr>,
+    fields: Fields,
+}
+
+impl Computed {
+    /// The statistics `exprs` read, over `targets` and `unfolded`: **one round**, each
+    /// target's footer, delete vector and term dictionary in one fan-out, and none when no
+    /// expression has a `BM25` clause.
+    ///
+    /// # Errors
+    /// An expression [`Expr::check`] refuses; a segment or dictionary that cannot be read.
+    pub async fn gather<S: BlobStore>(
+        store: &S,
+        targets: &[Target],
+        exprs: Vec<Expr>,
+        texts: &Texts,
+        unfolded: &[Document],
+    ) -> Result<Self, QueryError> {
+        for e in &exprs {
+            e.check_limits().map_err(QueryError::Expression)?;
+        }
+        // One walk over all of them: a `Sum` is only how their fields are found together.
+        let mut fields = Fields::of(&Expr::Sum(exprs.clone()), texts);
+        if !fields.0.is_empty() {
+            let opened = open(store, targets, true).await?;
+            fields.gather(&opened, unfolded)?;
+        }
+        Ok(Self { exprs, fields })
+    }
+
+    /// Each row's value of each expression, in order: the score `rank` gives the row, and
+    /// `None` where a root `Attribute` or `Dist` has no value.
+    #[must_use]
+    pub fn values(&self, rows: &[Document]) -> Vec<Vec<Option<f64>>> {
+        let nodes: Vec<Node<'_>> = self
+            .exprs
+            .iter()
+            .map(|e| Node::of(e, &self.fields))
+            .collect();
+        rows.iter()
+            .map(|d| {
+                let mut terms = vec![None; self.fields.0.len()];
+                nodes
+                    .iter()
+                    .map(|n| n.value(&self.fields, d, &mut terms))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Expression `i`'s value on each of `rows` (M266), as [`Computed::values`] gives it:
+    /// `rows` need not be returned rows. A highlight's fragments are scored this way, each a
+    /// document holding only the fragment.
+    #[must_use]
+    pub fn values_of(&self, i: usize, rows: &[Document]) -> Vec<Option<f64>> {
+        let Some(e) = self.exprs.get(i) else {
+            return vec![None; rows.len()];
+        };
+        let node = Node::of(e, &self.fields);
+        rows.iter()
+            .map(|d| {
+                let mut terms = vec![None; self.fields.0.len()];
+                node.value(&self.fields, d, &mut terms)
+            })
+            .collect()
+    }
+
+    /// The terms expression `i`'s `BM25` clauses over `field` match, under `field`'s
+    /// analyzer, with that analyzer (M266): what a highlight ranked by it marks. `None` when
+    /// it has no such clause.
+    #[must_use]
+    pub fn marked(
+        &self,
+        i: usize,
+        field: &str,
+    ) -> Option<(pstore_format::text::Analyzer, Vec<String>)> {
+        let e = self.exprs.get(i)?;
+        let f = self.fields.0.iter().find(|f| f.name == field)?;
+        let mut terms = Vec::new();
+        let mut any = false;
+        e.walk(&mut |e| {
+            if let Expr::Bm25 {
+                field: of,
+                query,
+                last_as_prefix,
+            } = e
+                && of == field
+            {
+                any = true;
+                terms.extend(leg_terms(&f.text.analyzer, query, *last_as_prefix).0);
+            }
+        });
+        any.then_some((f.text.analyzer, terms))
     }
 }
 

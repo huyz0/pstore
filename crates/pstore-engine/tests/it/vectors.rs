@@ -194,6 +194,7 @@ fn a_hit_whose_row_vanished_does_not_misalign_the_vectors() {
         sparse: (1..=3)
             .map(|i| Some(vec![(format!("k{i}"), i as f32)]))
             .collect(),
+        metric: pstore_engine::Metric::default(),
     };
     let got = e.resolve_rows_with_vectors(&answer);
     let pairs: Vec<(String, Option<Vec<f32>>)> = got
