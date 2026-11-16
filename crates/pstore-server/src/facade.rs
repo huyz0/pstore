@@ -530,6 +530,10 @@ mod tests {
         assert_eq!(knn["vector"], json!([1.0, 0.0]), "{knn}");
         let ann = query(&json!({"rank_by": ["vector", "ANN", [1.0, 0.0]], "top_k": 2}));
         assert!(ann.get("exact").is_none(), "{ann}");
+        // The default field is the native default, unnamed; another is named.
+        assert!(ann.get("field").is_none(), "{ann}");
+        let named = query(&json!({"rank_by": ["title_v", "ANN", [1.0, 0.0]], "top_k": 2}));
+        assert_eq!(named["field"], "title_v", "{named}");
     }
 
     /// Delta 6: only a permanent 409 becomes 400; a retryable 409 and a 503 keep their
@@ -582,5 +586,13 @@ mod tests {
         assert_eq!(default["max_staleness_ms"], 60_000, "{default}");
         let none = query(&json!({"rank_by": ["id", "asc"], "top_k": 1}));
         assert_eq!(none["consistency"], "strong", "{none}");
+        assert_eq!(at(json!({"level": "strong"}))["consistency"], "strong");
+        // A strong level holds nothing else.
+        let refused = query_body(
+            json!({"top_k": 1, "consistency": {"level": "strong", "max_staleness_seconds": 5}})
+                .to_string()
+                .as_bytes(),
+        );
+        assert!(refused.is_err(), "{refused:?}");
     }
 }

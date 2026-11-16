@@ -74,3 +74,13 @@ With it, `Bearer +7` passes the filter and `u128`'s parser reads it as tenant 7.
 non-digit key the test sent also failed to parse, so the mutant made no difference to it.
 `facade_identity_never_reads_the_tenant_header` now refuses `Bearer +7` and an empty key as
 401. The mutant, applied by hand, turns it red: `Bearer +7` answers 200.
+
+Shard 3: two mutants in `query_body` were missed.
+- The default-field check `!=` replaced by `==`: no test used a named vector field.
+- The `strong` guard `c.is_empty()` replaced by `false`: no test sent an explicit
+  `{"level": "strong"}`, because an absent consistency is strong too.
+
+`knn_is_exact_and_ann_is_not` now checks that `vector` is left unnamed and that `title_v` is
+named. `eventual_is_bounded_in_milliseconds` checks that an explicit strong level is strong,
+and that a strong level holding a staleness is refused. Each mutant, applied by hand, turns
+its test red.
