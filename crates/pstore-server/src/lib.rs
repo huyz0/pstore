@@ -34,6 +34,7 @@ mod boost;
 mod diversify;
 mod explain;
 mod external;
+mod facade;
 mod facets;
 mod highlight;
 mod ingress;
@@ -834,6 +835,24 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/admin/gc", Admin.on(post(gc_tenant::<S>)))
             .route("/v1/admin/duties", Admin.on(get(duties)))
             .route("/metrics", Admin.on(get(metrics::<S>)))
+            // M268: the turbopuffer facade, each route one native call under its scope.
+            .facade("/v1/namespaces", List.on(get(facade::list::<S>)))
+            .facade(
+                "/v2/namespaces/{index}",
+                Write.on(post(facade::write::<S>).delete(facade::delete_all::<S>)),
+            )
+            .facade(
+                "/v2/namespaces/{index}/query",
+                Read.on(post(facade::query::<S>)),
+            )
+            .facade(
+                "/v2/namespaces/{index}/metadata",
+                Read.on(get(facade::metadata::<S>)),
+            )
+            .facade(
+                "/v1/namespaces/{index}/schema",
+                Read.on(get(facade::schema::<S>)),
+            )
     }
 
     /// The routes. `api-design.md`'s surface, minus everything M7c defers.

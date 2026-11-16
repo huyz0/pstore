@@ -129,7 +129,8 @@ class Plumbing(unittest.TestCase):
                 raise urllib.error.HTTPError(req.full_url, 503, "x", headers, io.BytesIO(body))
             return opener
 
-        client = pstore_client.Client("http://unused")
+        # M267: the single-attempt mode this test pinned before retries existed.
+        client = pstore_client.Client("http://unused", max_retries=0)
         for body, code in [(b'{"error": {"code": "not_folded", "message": "m", "retryable": true}}',
                             "not_folded"), (b"<html>gateway</html>", "unparsed")]:
             original = pstore_client.urllib.request.urlopen

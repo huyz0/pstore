@@ -8,16 +8,22 @@ Parquet export), with its status in `Client.last_status`, and raises `PstoreErro
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
+import random
+import struct
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional, TypedDict, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, TypedDict, Union
 
 CONTRACT_VERSION = "1.0.0"
 CONTRACT_SHA256 = "c9b6458ea5639e014961aeb9672e43c1d95dad03621edec243a238143c171f17"
 
-__all__ = ["Client", "PstoreError", "CONTRACT_VERSION", "CONTRACT_SHA256"]
+__all__ = ["Client", "AsyncClient", "PstoreError", "encode_vector", "decode_vector",
+           "CONTRACT_VERSION", "CONTRACT_SHA256"]
 
 Cost = TypedDict("Cost", {"blob_reads": int, "blob_writes": int, "blob_lists": int, "bytes_read": int, "bytes_written": int}, total=False)
 # Cost: What the request cost in blob-store requests and bytes. Native: present on every answer that touches the store.
@@ -195,6 +201,31 @@ def _qv(v: Any) -> str:
     return str(v)
 
 
+def encode_vector(floats: Sequence[float]) -> str:
+    """`floats` as the wire's base64 vector (D-36): padded base64 of little-endian f32."""
+    return base64.b64encode(struct.pack(f"<{len(floats)}f", *floats)).decode()
+
+
+def decode_vector(text: str) -> List[float]:
+    """A base64 vector (D-36) as its floats."""
+    raw = base64.b64decode(text, validate=True)
+    if len(raw) % 4:
+        raise ValueError(f"a base64 vector holds whole f32s, and this holds {len(raw)} bytes")
+    return list(struct.unpack(f"<{len(raw) // 4}f", raw))
+
+
+#: Longest a `Retry-After` is waited, in seconds (M267).
+MAX_RETRY_AFTER = 60.0
+
+
+def backoff(attempt: int, retry_after: Optional[int]) -> float:
+    """Seconds to wait before retry `attempt` (0 first) (M267): the answer's `Retry-After`,
+    at most `MAX_RETRY_AFTER`, else `min(8, 0.5 * 2**attempt)` scaled into [0.75, 1]."""
+    if retry_after is not None:
+        return min(float(retry_after), MAX_RETRY_AFTER)
+    return min(8.0, 0.5 * 2 ** attempt) * random.uniform(0.75, 1.0)
+
+
 class Client:
     """A client for one pstore server.
 
@@ -203,18 +234,52 @@ class Client:
     returned, to pass as `session=` for a read that must see that write (M11.1). `last_status`
     holds the latest success's status, which some operations answer with meaning: `copy_index`
     is 202 when this request started the copy and 200 when an earlier one had.
+
+    M267: a call refused `retryable` (every 5xx and 429), or that never reached the server, is
+    sent again up to `max_retries` more times, waiting `backoff` between; `max_retries=0`
+    sends each once. `sleep` is how it waits.
     """
 
     def __init__(self, base_url: str, *, token: Optional[str] = None,
-                 tenant: Optional[str] = None, timeout: float = 30.0) -> None:
+                 tenant: Optional[str] = None, timeout: float = 30.0,
+                 max_retries: int = 2, sleep: Optional[Callable[[float], None]] = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.tenant = tenant
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.sleep = sleep or time.sleep
         self.last_session: Optional[str] = None
         self.last_status: Optional[int] = None
 
-    def _call(self, method: str, path: str, operation: str, *, query: Any = (),
+    def _call(self, method: str, path: str, operation: str, **call: Any) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return self._once(method, path, **call)
+            except PstoreError as e:
+                if not e.retryable or attempt >= self.max_retries:
+                    raise
+                wait = backoff(attempt, e.retry_after)
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                if attempt >= self.max_retries:
+                    raise
+                wait = backoff(attempt, None)
+            self.sleep(wait)
+            attempt += 1
+
+    def iter_indexes(self, *, prefix: Optional[str] = None,
+                     page_size: Optional[int] = None) -> Iterator[str]:
+        """Every index name, a page of `list_indexes` at a time, following `next_cursor` (M267)."""
+        cursor: Optional[str] = None
+        while True:
+            page = self.list_indexes(prefix=prefix, cursor=cursor, page_size=page_size)
+            yield from page.get("indexes", [])
+            cursor = page.get("next_cursor")
+            if cursor is None:
+                return
+
+    def _once(self, method: str, path: str, *, query: Any = (),
               body: Any = None, session: Optional[str] = None, text: bool = False,
               binary: bool = False) -> Any:
         url = self.base_url + path
@@ -409,3 +474,152 @@ class Client:
         "list_duties",
         "metrics",
     )
+
+
+class AsyncClient:
+    """`Client`'s operations as coroutines (M267), each run on a worker thread by
+    `asyncio.to_thread`: standard library only. `sync` is the `Client` they share, holding
+    `last_session` and `last_status`."""
+
+    def __init__(self, base_url: str, *, token: Optional[str] = None,
+                 tenant: Optional[str] = None, timeout: float = 30.0,
+                 max_retries: int = 2, sleep: Optional[Callable[[float], None]] = None) -> None:
+        self.sync = Client(base_url, token=token, tenant=tenant, timeout=timeout,
+                           max_retries=max_retries, sleep=sleep)
+
+    async def iter_indexes(self, *, prefix: Optional[str] = None,
+                           page_size: Optional[int] = None) -> AsyncIterator[str]:
+        """`Client.iter_indexes`, a page on a worker thread at a time."""
+        cursor: Optional[str] = None
+        while True:
+            page = await self.list_indexes(prefix=prefix, cursor=cursor, page_size=page_size)
+            for name in page.get("indexes", []):
+                yield name
+            cursor = page.get("next_cursor")
+            if cursor is None:
+                return
+
+    async def list_indexes(self, *, prefix: Optional[str] = None, cursor: Optional[str] = None, page_size: Optional[int] = None) -> "IndexList":
+        """`Client.list_indexes`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.list_indexes, prefix=prefix, cursor=cursor, page_size=page_size)
+
+    async def get_index(self, index: str, *, progress: Optional[bool] = None) -> "IndexSummary":
+        """`Client.get_index`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.get_index, index, progress=progress)
+
+    async def create_index(self, index: str, body: "CreateIndexRequest") -> "Committed":
+        """`Client.create_index`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.create_index, index, body)
+
+    async def patch_index(self, index: str, body: "PatchIndexRequest") -> "ReadOnlyResponse":
+        """`Client.patch_index`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.patch_index, index, body)
+
+    async def delete_index(self, index: str) -> "Committed":
+        """`Client.delete_index`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.delete_index, index)
+
+    async def write_documents(self, index: str, body: "WriteRequest", *, session: Optional[str] = None) -> "WriteResponse":
+        """`Client.write_documents`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.write_documents, index, body, session=session)
+
+    async def query(self, index: str, body: Union["QueryRequest", "MultiQueryRequest"], *, session: Optional[str] = None) -> Union["QueryResponse", "MultiQueryResponse"]:
+        """`Client.query`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.query, index, body, session=session)
+
+    async def export_parquet(self, index: str, *, limit: Optional[int] = None, include_vectors: Optional[bool] = None, as_of: Optional[int] = None, after: Optional[str] = None) -> bytes:
+        """`Client.export_parquet`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.export_parquet, index, limit=limit, include_vectors=include_vectors, as_of=as_of, after=after)
+
+    async def warm_index(self, index: str) -> "WarmResponse":
+        """`Client.warm_index`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.warm_index, index)
+
+    async def recall(self, index: str, body: Optional["RecallRequest"] = None) -> "RecallResponse":
+        """`Client.recall`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.recall, index, body)
+
+    async def issue_idempotency_key(self, index: str) -> "IdempotencyKey":
+        """`Client.issue_idempotency_key`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.issue_idempotency_key, index)
+
+    async def register_external(self, index: str, body: "ExternalRegisterRequest") -> "ExternalCommitted":
+        """`Client.register_external`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.register_external, index, body)
+
+    async def drop_external(self, index: str) -> "ExternalCommitted":
+        """`Client.drop_external`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.drop_external, index)
+
+    async def query_external(self, index: str, body: "ExternalQueryRequest") -> "ExternalAnswer":
+        """`Client.query_external`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.query_external, index, body)
+
+    async def copy_external(self, index: str, body: "ExternalCopyRequest") -> "ExternalCommitted":
+        """`Client.copy_external`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.copy_external, index, body)
+
+    async def export_quarantine(self, index: str) -> "QuarantineExport":
+        """`Client.export_quarantine`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.export_quarantine, index)
+
+    async def discard_quarantine(self, index: str, *, through: Optional[int] = None) -> "QuarantineDiscarded":
+        """`Client.discard_quarantine`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.discard_quarantine, index, through=through)
+
+    async def list_replications(self) -> "ReplicationList":
+        """`Client.list_replications`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.list_replications)
+
+    async def get_replication(self, index: str) -> "ReplicationStatus":
+        """`Client.get_replication`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.get_replication, index)
+
+    async def create_replication(self, index: str, body: "ReplicationRequest") -> "ReplicationStatus":
+        """`Client.create_replication`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.create_replication, index, body)
+
+    async def cancel_replication(self, index: str) -> "ReplicationCancelled":
+        """`Client.cancel_replication`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.cancel_replication, index)
+
+    async def get_copy(self, index: str) -> "CopyStatus":
+        """`Client.get_copy`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.get_copy, index)
+
+    async def copy_index(self, index: str, body: "CopyRequest") -> "CopyStatus":
+        """`Client.copy_index`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.copy_index, index, body)
+
+    async def pause_replication(self, index: str) -> "ReplicationStatus":
+        """`Client.pause_replication`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.pause_replication, index)
+
+    async def resume_replication(self, index: str) -> "ReplicationStatus":
+        """`Client.resume_replication`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.resume_replication, index)
+
+    async def sync_replication(self, index: str) -> "ReplicationSynced":
+        """`Client.sync_replication`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.sync_replication, index)
+
+    async def patch_schema(self, index: str) -> Any:
+        """`Client.patch_schema`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.patch_schema, index)
+
+    async def fold_tenant(self) -> "Committed":
+        """`Client.fold_tenant`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.fold_tenant)
+
+    async def gc_tenant(self, *, retention: Optional[int] = None) -> "GcResponse":
+        """`Client.gc_tenant`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.gc_tenant, retention=retention)
+
+    async def list_duties(self) -> "Duties":
+        """`Client.list_duties`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.list_duties)
+
+    async def metrics(self) -> str:
+        """`Client.metrics`, on a worker thread."""
+        return await asyncio.to_thread(self.sync.metrics)
+

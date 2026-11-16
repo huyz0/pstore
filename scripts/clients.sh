@@ -51,4 +51,5 @@ PSTORE_FIXTURE_TENANT=101 py -m unittest discover -s clients/python/tests -v
 # or did not run is not a passing client.
 echo "typescript client"
 tsc -p clients/typescript
-PSTORE_FIXTURE_TENANT=102 node --experimental-strip-types --no-warnings --test clients/typescript/test/fixtures.test.mjs
+PSTORE_FIXTURE_TENANT=102 node --experimental-strip-types --no-warnings --test \
+    clients/typescript/test/fixtures.test.mjs clients/typescript/test/runtime.test.mjs

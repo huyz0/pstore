@@ -321,6 +321,21 @@ jobs:
       - run: npm install --global typescript@5.9.3
       - run: ./scripts/clients.sh
 
+  # M268: the vendor's own turbopuffer SDK, pinned by hash, against the compatibility facade
+  # on a real server. Its own job: the SDK needs Python 3.11 or later.
+  facade:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: ./scripts/facade.sh
+
   # M237: the documented public TLS proxy (deploy/nginx/pstore-tls.conf) in front of the real
   # server, checked from a client's side. Its own job: it needs nginx and the server binary.
   tls-smoke:

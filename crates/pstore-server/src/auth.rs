@@ -432,6 +432,15 @@ impl<S: Clone + Send + Sync + 'static> ScopedRouter<S> {
         Self(self.0.route(path, method), self.1, table)
     }
 
+    /// M268: a turbopuffer facade route, authorized and admitted as [`ScopedRouter::route`]'s,
+    /// but not in [`ScopedRouter::table`]: the published contract is the native API's, and the
+    /// facade is not part of it.
+    pub(crate) fn facade(self, path: &str, route: ScopedRoute<S>) -> Self {
+        let table = self.2.clone();
+        let Self(router, ingress, _) = self.route(path, route);
+        Self(router, ingress, table)
+    }
+
     pub(crate) fn finish(self) -> axum::Router<S> {
         self.0
     }

@@ -1,5 +1,27 @@
 # Native API migration notes
 
+## M268: a turbopuffer compatibility facade, part 1
+
+New routes on the vendor's paths: `GET /v1/namespaces`, `POST` and `DELETE
+/v2/namespaces/{ns}`, `POST /v2/namespaces/{ns}/query`, `GET /v2/namespaces/{ns}/metadata`
+and `GET /v1/namespaces/{ns}/schema`. The turbopuffer SDK reaches them with its base URL set
+to a pstore server and its API key set to a pstore credential, or, on an unsecured server, to
+the tenant number. `X-Pstore-Tenant` is refused on these routes. Every native route, the
+OpenAPI contract and the generated clients are unchanged.
+[M268 verification](milestones/M268/VERIFIED.md).
+
+## M267: the generated clients retry, page and encode vectors
+
+Both generated clients now send a call again when pstore refuses it `retryable` (every 5xx
+and 429) or the request never reached it: up to `max_retries` / `maxRetries` more times,
+default **2**, waiting the answer's `Retry-After` (at most 60 s) or a jittered
+`min(8, 0.5 * 2^n)` s. Pass `0` for the old single attempt. A write is retried too; pstore's
+writes apply twice to the same state, and an idempotency key (M132) makes a retry exact.
+New helpers: `iter_indexes` / `listIndexesAll` follow `next_cursor`; Python's `AsyncClient`
+has every operation as a coroutine; `encode_vector` / `decode_vector` (`encodeVector` /
+`decodeVector`) convert floats to and from the wire's base64. The server and the contract
+are unchanged. [M267 verification](milestones/M267/VERIFIED.md).
+
 ## M266: `Highlight` in `compute_attributes`
 
 `compute_attributes` also takes `["Highlight", attr]` and `["Highlight", attr, config]`. The
