@@ -336,8 +336,8 @@ async fn facade_errors_are_the_vendors() {
     for (path, body, says) in [
         (
             "/v2/namespaces/made",
-            json!({"copy_from_namespace": "other"}),
-            "\"copy_from_namespace\"",
+            json!({"upsert_rows": [], "sharding": {"num_shards": 2}}),
+            "\"sharding\"",
         ),
         (
             "/v2/namespaces/made",
@@ -467,20 +467,28 @@ async fn facade_adds_no_request() {
     // other wrote: requests grow with an index's history. A side is one call or, for
     // M270's update_metadata, the native calls it makes, in order.
     type Step<'a> = (&'a str, String, Vec<(&'static str, String)>, Value);
-    let cost_of = async |steps: &[Step<'_>]| {
+    // M271: a poll needs a copy started first, unmeasured; `{run}` in a path is its run.
+    let cost_of = async |setup: &[Step<'_>], steps: &[Step<'_>]| {
         let depth = DepthCounting::new(MemoryStore::new());
         let store = Accounted::new(depth.clone());
         let api = cached_api(store.clone());
         let spent =
             || [OpClass::Read, OpClass::Write, OpClass::List].map(|c| store.count(TenantId(7), c));
         written(&api, 7).await;
+        let mut run = String::new();
+        for (m, p, h, b) in setup {
+            let (s, body) = call(&api, m, p, h, Some(b)).await;
+            assert!(s.is_success(), "{p}: {s} {body}");
+            run = body["run"].to_string();
+        }
         let before = spent();
         depth.reset();
         let mut statuses = Vec::new();
         for (m, p, h, b) in steps {
-            let (s, body) = call(&api, m, p, h, Some(b)).await;
+            let p = p.replace("{run}", &run);
+            let (s, body) = call(&api, m, &p, h, Some(b)).await;
             assert!(
-                s == StatusCode::OK || s == StatusCode::BAD_REQUEST,
+                s.is_success() || s == StatusCode::BAD_REQUEST,
                 "{p}: {s} {body}"
             );
             statuses.push(s);
@@ -493,7 +501,7 @@ async fn facade_adds_no_request() {
                 .map(|(b, a)| a - b)
                 .collect::<Vec<_>>(),
             depth.depth(),
-            statuses.last().copied(),
+            statuses.last().map(|s| s.is_success()),
         )
     };
     let facade =
@@ -601,8 +609,50 @@ async fn facade_adds_no_request() {
     for (f, n) in &cases {
         costs.push((
             f.1.clone(),
-            cost_of(std::slice::from_ref(f)).await,
-            cost_of(n).await,
+            cost_of(&[], std::slice::from_ref(f)).await,
+            cost_of(&[], n).await,
+        ));
+    }
+    // M271: a branch, an async copy's start, and its poll.
+    let started = vec![native_step(
+        "POST",
+        "2/copy",
+        json!({"source": {"index": "docs"}}),
+    )];
+    let copies: Vec<(Vec<Step<'_>>, Step<'_>, Vec<Step<'_>>)> = vec![
+        (
+            vec![],
+            facade(
+                "POST",
+                "2?stainless_overload=branchFrom",
+                json!({"branch_from_namespace": {"source_namespace": "docs"}}),
+            ),
+            vec![native_step(
+                "PUT",
+                "2/documents",
+                json!({"branch_from_namespace": "docs"}),
+            )],
+        ),
+        (
+            vec![],
+            facade(
+                "POST",
+                "2/async?stainless_overload=startCopyFrom",
+                json!({"copy_from_namespace": {"source_namespace": "docs"}}),
+            ),
+            started.clone(),
+        ),
+        (
+            started.clone(),
+            v1("GET", "2/operations/{run}", json!({})),
+            vec![native_step("GET", "2/copy", json!({}))],
+        ),
+    ];
+    for (setup, f, n) in &copies {
+        costs.push((
+            f.1.clone(),
+            cost_of(setup, std::slice::from_ref(f)).await,
+            cost_of(setup, n).await,
         ));
     }
     for (path, f, n) in costs {
@@ -1184,4 +1234,228 @@ async fn facade_schema_and_metadata_updates_are_native_calls() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+}
+
+// M271: copy, branch and the async copy.
+
+#[tokio::test]
+async fn facade_branch_and_copy_are_the_native_branch() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    seeded(&api, "src").await;
+    let source = ns(&api, "src").await;
+    assert_eq!(source.len(), 4, "{source:?}");
+    // The native branch, the twin every form is held against.
+    let (s, native_b) = call(
+        &api,
+        "PUT",
+        "/v1/indexes/twin/documents",
+        &native(7),
+        Some(&json!({"branch_from_namespace": "src"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{native_b}");
+    assert_eq!(ns(&api, "twin").await, source);
+    let answer = json!({"status": "OK", "message": "0 rows affected", "rows_affected": 0,
+        "rows_upserted": 0, "rows_patched": 0, "rows_deleted": 0});
+    // As the SDK's branch_from, copy_from and write(copy_from_namespace=) send them.
+    for (dest, query, body) in [
+        (
+            "b1",
+            "?stainless_overload=branchFrom",
+            json!({"branch_from_namespace": {"source_namespace": "src"}}),
+        ),
+        (
+            "b2",
+            "?stainless_overload=copyFrom",
+            json!({"copy_from_namespace": {"source_namespace": "src"}}),
+        ),
+        ("b3", "", json!({"copy_from_namespace": "src"})),
+        ("b4", "", json!({"branch_from_namespace": "src"})),
+        (
+            "b5",
+            "",
+            json!({"copy_from_namespace": {"source_namespace": "src"}}),
+        ),
+    ] {
+        let path = format!("/v2/namespaces/{dest}{query}");
+        let (s, b) = call(&api, "POST", &path, &key(7), Some(&body)).await;
+        assert_eq!(s, StatusCode::OK, "{path}: {b}");
+        assert_eq!(b, answer, "{path}");
+        assert_eq!(ns(&api, dest).await, source, "{path}");
+    }
+    // A write to a copy is its own.
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/b2",
+        &key(7),
+        Some(&json!({"patch_rows": [{"id": 1, "n": 99}]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = call(&api, "POST", "/v1/admin/fold", &native(7), Some(&json!({}))).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(ns(&api, "src").await, source);
+    assert_ne!(ns(&api, "b2").await, source);
+    // Refusals: another organization, region or key; two sources; a source of the wrong
+    // shape; and a branch beside a write, refused natively.
+    for (path, body, names) in [
+        (
+            "/v2/namespaces/r1?stainless_overload=copyFrom",
+            json!({"copy_from_namespace": {"source_namespace": "src", "source_region": "r"}}),
+            "\"source_region\" is not served",
+        ),
+        (
+            "/v2/namespaces/r1?stainless_overload=copyFrom",
+            json!({"copy_from_namespace": {"source_namespace": "src", "source_api_key": "k"}}),
+            "\"source_api_key\" is not served",
+        ),
+        (
+            "/v2/namespaces/r1?stainless_overload=copyFrom",
+            json!({"copy_from_namespace": {"source_namespace": "src", "dest_encryption": {}}}),
+            "\"dest_encryption\" is not served",
+        ),
+        (
+            "/v2/namespaces/r1",
+            json!({"copy_from_namespace": "src", "branch_from_namespace": "src"}),
+            "name one",
+        ),
+        (
+            "/v2/namespaces/r1",
+            json!({"copy_from_namespace": {"namespace": "src"}}),
+            "source_namespace",
+        ),
+        (
+            "/v2/namespaces/r1",
+            json!({"source_namespace": "src"}),
+            "\"source_namespace\" is not translated",
+        ),
+        (
+            "/v2/namespaces/r1",
+            json!({"copy_from_namespace": "src", "upsert_rows": [{"id": 9, "vector": [1.0, 0.0]}]}),
+            "must come alone",
+        ),
+    ] {
+        let (s, b) = call(&api, "POST", path, &key(7), Some(&body)).await;
+        refused(s, &b, names);
+    }
+    let (s, b) = call(&api, "GET", "/v2/namespaces/r1/metadata", &key(7), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "nothing made: {b}");
+}
+
+/// Runs this process's replication worker until `dest`'s copy has ended.
+async fn copied<S: BlobStore + 'static>(api: &Arc<Api<S>>, dest: &str) -> Value {
+    let mut worker = pstore_server::Worker::default();
+    for _ in 0..20 {
+        api.replication_tick(&mut worker).await;
+        let (s, b) = call(
+            api,
+            "GET",
+            &format!("/v1/indexes/{dest}/copy"),
+            &native(7),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        if !matches!(b["state"].as_str(), Some("running" | "paused")) {
+            return b;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    }
+    panic!("{dest}'s copy did not end");
+}
+
+#[tokio::test(start_paused = true)]
+async fn facade_async_copy_is_the_native_copy() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    seeded(&api, "src").await;
+    let start =
+        |dest: &str| format!("/v2/namespaces/{dest}/async?stainless_overload=startCopyFrom");
+    let (s, b) = call(
+        &api,
+        "POST",
+        &start("c1"),
+        &key(7),
+        Some(&json!({"copy_from_namespace": {"source_namespace": "src"}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let token = b["token"].as_str().unwrap().to_owned();
+    assert_eq!(b.as_object().unwrap().len(), 1, "{b}");
+    let (s, native_b) = call(&api, "GET", "/v1/indexes/c1/copy", &native(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{native_b}");
+    assert_eq!(token, native_b["run"].to_string(), "{native_b}");
+    let poll = |dest: &str, token: &str| format!("/v1/namespaces/{dest}/operations/{token}");
+
+    // Running, as the native status says, before the worker has run.
+    assert_eq!(native_b["state"], "running", "{native_b}");
+    let (s, b) = call(&api, "GET", &poll("c1", &token), &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["status"], "running", "{b}");
+    assert_eq!(b["start_time"], native_b["created_at"], "{b}");
+    let (s, b) = call(&api, "GET", &poll("c1", "999999"), &key(7), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+    assert!(
+        b["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("operation_not_found"),
+        "{b}"
+    );
+    let (s, b) = call(&api, "GET", &poll("none", &token), &key(7), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+
+    // Finished, with the native times, and the copy reads the source's rows.
+    let ended = copied(&api, "c1").await;
+    assert_eq!(ended["state"], "succeeded", "{ended}");
+    let (s, b) = call(&api, "GET", &poll("c1", &token), &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["status"], "finished", "{b}");
+    assert_eq!(
+        (&b["start_time"], &b["finish_time"]),
+        (&ended["created_at"], &ended["ended_at"])
+    );
+    assert_eq!(b["result"]["success"]["status"], "OK", "{b}");
+    assert_eq!(b["result"]["success"]["rows_affected"], 0, "{b}");
+    assert_eq!(ns(&api, "c1").await, ns(&api, "src").await);
+
+    // A missing source is refused before anything starts, as the native copy refuses it;
+    // a run that fails later is `operation_answer`'s unit test.
+    let (s, b) = call(
+        &api,
+        "POST",
+        &start("c2"),
+        &key(7),
+        Some(&json!({"copy_from_namespace": {"source_namespace": "missing"}})),
+    )
+    .await;
+    let (native_status, n) = call(
+        &api,
+        "POST",
+        "/v1/indexes/c2/copy",
+        &native(7),
+        Some(&json!({"source": {"index": "missing"}})),
+    )
+    .await;
+    assert_eq!(
+        (s, native_status),
+        (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+        "{b} vs {n}"
+    );
+    assert!(
+        b["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("source_not_found: "),
+        "{b}"
+    );
+    let (s, b) = call(
+        &api,
+        "POST",
+        &start("c4"),
+        &key(7),
+        Some(&json!({"copy_from_namespace": {"source_namespace": "src", "source_api_key": "k"}})),
+    )
+    .await;
+    refused(s, &b, "\"source_api_key\" is not served");
 }

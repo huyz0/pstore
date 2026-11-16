@@ -13,11 +13,11 @@ compatibility manifest.
 M268's rules hold: identity from the credential, the vendor's error envelope, and a permanent
 409 answered 400. Each request is **one native call**.
 
-1. **Branch and copy, synchronous.** The SDK sends either form:
-   - `branch_from` and `copy_from`: `POST /v2/namespaces/{ns}` with `{"source_namespace"}`,
-     named by `?stainless_overload=branchFrom` or `copyFrom`;
-   - a write holding `branch_from_namespace` or `copy_from_namespace`, either a name or
-     `{"source_namespace"}`.
+1. **Branch and copy, synchronous.** The SDK's `branch_from`, `copy_from` and
+   `write(copy_from_namespace=...)` each send a write to `POST /v2/namespaces/{ns}` holding
+   `branch_from_namespace` or `copy_from_namespace`. The value is a name or
+   `{"source_namespace"}`. The `?stainless_overload=` query the SDK adds is ignored: the body
+   says what is asked.
 
    Each becomes the native write `{"branch_from_namespace": source}` (M16). That is a
    copy-on-write branch made in one commit: the destination shares the source's segments
@@ -25,15 +25,15 @@ M268's rules hold: identity from the credential, the vendor's error envelope, an
    apart, and the branch costs no row writes.
    - The answer is M268's write answer from the native one. `rows_affected` is 0, because
      the branch writes no rows. No copied-row count is invented.
-   - `source_api_key`, `source_region` and `dest_encryption` are refused, naming the key.
-     They name another organization, region or key, which pstore's identity does not
-     reach.
-   - `source_namespace` with no overload, or with an overload the facade does not know, is
-     refused, naming it.
-   - Anything beside the source in a branch or copy is refused natively (M122: a branch
-     comes alone).
+   - `source_api_key`, `source_region` and `dest_encryption` in the source are refused,
+     naming the key. They name another organization, region or key, which pstore's
+     identity does not reach.
+   - Both keys at once, a source without `source_namespace`, or a source holding anything
+     else is refused, naming what is wrong.
+   - Anything beside the source in the write is translated and sent, and refused natively
+     (M122: a branch comes alone).
 2. **The async copy.** `start_copy_from` is `POST /v2/namespaces/{ns}/async` with
-   `{"source_namespace"}`. It becomes the native copy (`POST /v1/indexes/{ns}/copy` with
+   `copy_from_namespace`, as in item 1. It becomes the native copy (`POST /v1/indexes/{ns}/copy` with
    `{"source": {"index"}}`, M166), and the answer is `{"token"}`, the native copy's `run`
    as a string. The same three keys are refused as in item 1.
 3. **Polling.** `poll_copy_from` is `GET /v1/namespaces/{ns}/operations/{token}`. It becomes
@@ -66,8 +66,13 @@ changes.
    - `facade_branch_and_copy_are_the_native_branch`: each of item 1's forms against the
      native branch, rows compared, with the refusals;
    - `facade_async_copy_is_the_native_copy`: items 2 and 3, the token being the native
-     `run`, a running status, a finished one after the replication worker runs, and a
-     failed one for a missing source, each against the native status;
+     `run`, a running status and a finished one after the replication worker runs, each
+     against the native status, and a missing source refused 404 as the native copy refuses
+     it before starting;
+   - `an_operation_is_the_native_copys_state` in `facade.rs`'s own tests: each native state
+     (running, paused, succeeded, failed, cancelled) as the vendor's operation, with the
+     `status_code` each failure gets and a token mismatch. A failed run cannot be reached in
+     process, because the native copy checks its source before it starts;
    - `facade_adds_no_request` extended: a branch, a start and a poll each cost the native
      call's requests.
    - M268's refusal case (`facade_errors_are_the_vendors`) and the SDK's refusal test refuse
@@ -77,21 +82,26 @@ changes.
    observed red.
 
 ## Test plan
-AC1 and AC2 are red against M270: it refuses `copy_from_namespace` and `source_namespace` and
-has no async or operations route.
+AC1 and AC2 are red against M270: it refuses `copy_from_namespace` and
+`branch_from_namespace`, and has no async or operations route.
 
 | AC | Mutation |
 |---|---|
-| 2 | the overload ignored (copy and branch taken from any `source_namespace`); `source_region` passed rather than refused; the token not the native `run`; a token mismatch answered as the copy; `failed` answered `running`; `status_code` 409 for `source_not_found` |
+| 2 | a copy sent as a durable write rather than a branch (`durability` kept beside it); `source_region` passed rather than refused; the token not the native `run`; a token mismatch answered as the copy; `failed` answered `running`; `status_code` 409 for `source_not_found` |
 
 ## RA budget
 None. Each route is the native call it names, and `facade_adds_no_request` holds them.
 
 ## Risks
-- **The overload is the SDK's, not a documented wire field.** `branch_from` and `copy_from`
-  send the same body to the same path and differ only in `?stainless_overload`. The facade
-  keys on it because that is what the pinned SDK sends. A client that sends neither form is
-  refused, never guessed at.
+- **The finished copy's result is untyped in the SDK.** The SDK's `WriteResult` requires
+  `billing`, and the delivery plan forbids inventing vendor billing. So the success carries
+  none, and the SDK hands `result` back as a dict rather than its `Success` model. A caller
+  reading `result.success` gets an `AttributeError`, and `result["success"]` works.
+- **The SDK's request shapes were read from its traffic.** The generated resource methods
+  name a top-level `source_namespace`, but the namespace wrapper the SDK hands callers sends
+  `copy_from_namespace` or `branch_from_namespace` for every form, async included. The
+  facade serves what is sent. That was captured from the pinned SDK's own requests, and the
+  SDK suite runs each form.
 - **A copy is a branch.** Writes to the destination are its own, as the vendor's are. GC
   keeps the shared segments while either index names them (M16). A vendor caller who
   expects copied bytes to be billed sees no row writes.

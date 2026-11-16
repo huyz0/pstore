@@ -1,5 +1,15 @@
 # Native API migration notes
 
+## M271: the turbopuffer facade, part 4
+
+The facade's write now takes `branch_from_namespace` and `copy_from_namespace`, a name or
+`{"source_namespace"}`, as the native branch (M16): `rows_affected` is 0, since a branch
+shares the source's segments. New routes `POST /v2/namespaces/{ns}/async` (the native copy,
+M166, answering `{"token"}`) and `GET /v1/namespaces/{ns}/operations/{token}` (its status).
+`source_api_key`, `source_region` and `dest_encryption` are refused. Every native route, the
+OpenAPI contract and the generated clients are unchanged.
+[M271 verification](milestones/M271/VERIFIED.md).
+
 ## M270: the turbopuffer facade, part 3
 
 New facade routes: `POST /v2/namespaces/{ns}/explain_query`, `GET
