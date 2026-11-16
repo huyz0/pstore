@@ -95,13 +95,62 @@ class Sdk(unittest.TestCase):
         self.assertEqual(ns.delete_all().status, "OK")
         self.assertFalse(ns.exists())
 
+    def test_writes_by_filter_and_by_condition(self):
+        """M269: each applied, each answered with the rows it changed."""
+        tpuf = client()
+        ns = tpuf.namespace("sdk-cond")
+        ns.write(upsert_rows=ROWS, distance_metric="euclidean_squared")
+        w = ns.write(delete_by_filter=("kind", "Eq", "b"))
+        self.assertEqual((w.rows_deleted, w.rows_affected), (1, 1))
+        w = ns.write(patch_by_filter={"filters": ("kind", "Eq", "a"), "patch": {"n": 7}})
+        self.assertEqual(w.rows_patched, 2)
+        w = ns.write(upsert_rows=[{"id": 1, "vector": [1.0, 0.0], "n": 8},
+                                  {"id": 2, "vector": [0.8, 0.6], "n": 8}],
+                     upsert_condition=("id", "Eq", 1), return_affected_ids=True,
+                     distance_metric="euclidean_squared")
+        self.assertEqual((w.rows_upserted, w.upserted_ids), (1, [1]))
+        w = ns.write(patch_rows=[{"id": 1, "n": 9}, {"id": 2, "n": 9}],
+                     patch_condition=("n", "Eq", 7), return_affected_ids=True)
+        self.assertEqual((w.rows_patched, w.patched_ids), (1, [2]))
+        w = ns.write(deletes=[1, 2], delete_condition=("n", "Eq", 8),
+                     return_affected_ids=True)
+        self.assertEqual((w.rows_deleted, w.deleted_ids, w.patched_ids), (1, [1], None))
+        w = ns.write(upsert_rows=[{"id": 5, "vector": [0.5, 0.5]}], return_affected_ids=True,
+                     distance_metric="euclidean_squared")
+        self.assertEqual(w.upserted_ids, [5])
+        native("/v1/admin/fold", {})
+        got = ns.query(rank_by=("id", "asc"), top_k=10, include_attributes=["n"])
+        self.assertEqual([(r.id, getattr(r, "n", None)) for r in got.rows], [(2, 9), (5, None)])
+        ns.delete_all()
+
+    def test_multi_query(self):
+        """M269: one result a sub-query, each the native query's rows."""
+        tpuf = client()
+        ns = tpuf.namespace("sdk-multi")
+        ns.write(upsert_rows=ROWS, distance_metric="euclidean_squared")
+        native("/v1/admin/fold", {})
+        got = ns.multi_query(
+            queries=[{"rank_by": ("vector", "ANN", [1.0, 0.1]), "top_k": 2},
+                     {"rank_by": ("n", "asc"), "top_k": 3, "include_attributes": ["n"]}],
+            consistency={"level": "eventual", "max_staleness_seconds": 5})
+        ann = native("/v1/indexes/sdk-multi/query", {"vector": [1.0, 0.1], "top_k": 2,
+                                                     "consistency": "strong"})
+        self.assertEqual(len(got.results), 2)
+        self.assertEqual([r.id for r in got.results[0].rows], [r["id"] for r in ann["results"]])
+        self.assertEqual([(r.id, r["n"]) for r in got.results[1].rows], [(2, 1), (3, 2), (1, 3)])
+        with self.assertRaises(turbopuffer.BadRequestError) as e:
+            ns.multi_query(queries=[{"rank_by": ("n", "asc"), "top_k": 1}],
+                           rerank_by=["RRF"])
+        self.assertIn("rerank_by", str(e.exception))
+        ns.delete_all()
+
     def test_a_refusal_is_the_sdks_error(self):
         tpuf = client()
         with self.assertRaises(turbopuffer.NotFoundError):
             tpuf.namespace("sdk-nothing").metadata()
         with self.assertRaises(turbopuffer.BadRequestError) as e:
-            tpuf.namespace("sdk-bad").write(delete_by_filter=("id", "Eq", 1))
-        self.assertIn("delete_by_filter", str(e.exception))
+            tpuf.namespace("sdk-bad").write(copy_from_namespace="sdk-docs")
+        self.assertIn("copy_from_namespace", str(e.exception))
 
 
 if __name__ == "__main__":

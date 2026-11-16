@@ -27,12 +27,31 @@ const MAX_ANSWER: usize = 256 << 20;
 const DOCUMENT_FIELDS: [&str; 4] = ["vector", "vectors", "text", crate::SPARSE_FIELD];
 
 /// The write keys passed to the native write unchanged.
-const WRITE_PASSED: [&str; 5] = [
+const WRITE_PASSED: [&str; 11] = [
     "upsert_columns",
     "patch_columns",
     "deletes",
     "distance_metric",
     "schema",
+    // M269: by filter and by condition.
+    "delete_by_filter",
+    "upsert_condition",
+    "patch_condition",
+    "delete_condition",
+    "delete_by_filter_allow_partial",
+    "patch_by_filter_allow_partial",
+];
+
+/// The write keys whose answer is the rows the write changed (M269, Delta 3): a write
+/// carrying one is `applied`, since only an applied write knows them.
+const WRITE_APPLIED: [&str; 7] = [
+    "delete_by_filter",
+    "patch_by_filter",
+    "upsert_condition",
+    "patch_condition",
+    "delete_condition",
+    "delete_by_filter_allow_partial",
+    "patch_by_filter_allow_partial",
 ];
 
 /// The query keys passed to the native query unchanged.
@@ -97,7 +116,7 @@ fn object(body: &[u8]) -> Result<Map<String, Value>, ApiError> {
 pub(crate) fn write_body(body: &[u8]) -> Result<Value, ApiError> {
     let mut o = object(body)?;
     let mut out = Map::new();
-    out.insert("durability".into(), "durable".into());
+    out.insert("durability".into(), durability(&o).into());
     if let Some(rows) = o.remove("upsert_rows") {
         let Value::Array(rows) = rows else {
             return Err(bad("upsert_rows is an array of rows"));
@@ -124,6 +143,17 @@ pub(crate) fn write_body(body: &[u8]) -> Result<Value, ApiError> {
             .collect::<Result<Vec<_>, _>>()?;
         out.insert("patch_rows".into(), patches.into());
     }
+    // M269: the vendor's `patch` is the native `attributes`.
+    if let Some(by) = o.remove("patch_by_filter") {
+        out.insert("patch_by_filter".into(), patch_by_filter(by)?);
+    }
+    match o.remove("return_affected_ids") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            out.insert("affected_ids".into(), true.into());
+        }
+        Some(_) => return Err(bad("return_affected_ids is a boolean")),
+    }
     // A hint with no pstore meaning: pstore bounds buffered rows, not unfolded backlog.
     o.remove("disable_backpressure");
     for (k, v) in o {
@@ -136,6 +166,41 @@ pub(crate) fn write_body(body: &[u8]) -> Result<Value, ApiError> {
         out.insert(k, v);
     }
     Ok(Value::Object(out))
+}
+
+/// The durability a vendor write needs (M269, Delta 3): `applied` when its answer is the rows
+/// it changed -- a condition, a by-filter operation, or its affected ids -- else `durable`.
+fn durability(o: &Map<String, Value>) -> &'static str {
+    let ids = o.get("return_affected_ids") == Some(&Value::Bool(true));
+    if ids
+        || WRITE_APPLIED
+            .iter()
+            .any(|k| o.get(*k).is_some_and(|v| !v.is_null()))
+    {
+        "applied"
+    } else {
+        "durable"
+    }
+}
+
+/// The vendor's `patch_by_filter: {"filters", "patch"}` as the native `{"filters",
+/// "attributes"}`.
+fn patch_by_filter(by: Value) -> Result<Value, ApiError> {
+    let Value::Object(mut by) = by else {
+        return Err(bad("patch_by_filter is {\"filters\", \"patch\"}"));
+    };
+    let filters = by
+        .remove("filters")
+        .ok_or_else(|| bad("patch_by_filter holds filters"))?;
+    let patch = by
+        .remove("patch")
+        .ok_or_else(|| bad("patch_by_filter holds patch"))?;
+    if let Some(k) = by.keys().next() {
+        return Err(bad(format!(
+            "patch_by_filter holds filters and patch, not {k:?}"
+        )));
+    }
+    Ok(json!({"filters": filters, "attributes": patch}))
 }
 
 /// A vendor row as a native document: `id` and the document fields at the top, every other
@@ -172,8 +237,57 @@ fn patch(row: Map<String, Value>) -> Value {
 }
 
 /// A vendor query as the native query's body (M268, Delta 4).
+///
+/// A body holding `queries` is a multi-query (M269, Delta 5), as the SDK's `multi_query`
+/// sends it to the same path.
 pub(crate) fn query_body(body: &[u8]) -> Result<Value, ApiError> {
-    let mut o = object(body)?;
+    let o = object(body)?;
+    if o.contains_key("queries") {
+        multi_body(o)
+    } else {
+        query_of(o)
+    }
+}
+
+/// A vendor multi-query as the native `{"queries"}` (M269, Delta 5): each sub-query
+/// translated as one query is, under the root's `consistency` and `vector_encoding`.
+fn multi_body(mut o: Map<String, Value>) -> Result<Value, ApiError> {
+    let Some(Value::Array(subs)) = o.remove("queries") else {
+        return Err(bad("queries is an array of queries"));
+    };
+    let shared: Vec<(String, Value)> = ["consistency", "vector_encoding"]
+        .into_iter()
+        .filter_map(|k| o.remove(k).map(|v| (k.to_owned(), v)))
+        .collect();
+    if let Some(k) = o.keys().next() {
+        return Err(bad(format!(
+            "{k:?} is not translated by this facade yet: a multi-query holds queries, \
+             consistency and vector_encoding"
+        )));
+    }
+    let queries = subs
+        .into_iter()
+        .map(|q| {
+            let Value::Object(mut q) = q else {
+                return Err(bad("each of queries is an object"));
+            };
+            if q.contains_key("consistency") {
+                return Err(bad(
+                    "a multi-query's consistency is its root's: a query inside queries \
+                     does not carry one",
+                ));
+            }
+            for (k, v) in &shared {
+                q.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            query_of(q)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({"queries": queries}))
+}
+
+/// One vendor query, parsed, as the native query's body (M268, Delta 4).
+fn query_of(mut o: Map<String, Value>) -> Result<Value, ApiError> {
     let mut out = Map::new();
     if let Some(rank) = o.remove("rank_by") {
         match rank.as_array().map(Vec::as_slice) {
@@ -268,16 +382,50 @@ pub(crate) fn query_answer(native: Value) -> Value {
             out.insert(k.into(), v.clone());
         }
     }
+    out.insert("performance".into(), performance(&native));
+    Value::Object(out)
+}
+
+/// A native multi-query's answer as the vendor's (M269, Delta 5): each query's rows and
+/// aggregations, in order.
+pub(crate) fn multi_answer(native: &Value) -> Value {
+    let results: Vec<Value> = native["results"]
+        .as_array()
+        .map(|rs| {
+            rs.iter()
+                .enumerate()
+                .map(|(i, ranked)| {
+                    let mut r = Map::new();
+                    let rows: Vec<Value> = ranked
+                        .as_array()
+                        .map(|rows| rows.iter().map(row).collect())
+                        .unwrap_or_default();
+                    r.insert("rows".into(), rows.into());
+                    for k in ["aggregations", "aggregation_groups"] {
+                        if let Some(v) = native
+                            .get(k)
+                            .and_then(|a| a.get(i))
+                            .filter(|v| !v.is_null())
+                        {
+                            r.insert(k.into(), v.clone());
+                        }
+                    }
+                    Value::Object(r)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({"results": results, "performance": performance(native)})
+}
+
+/// The native M264 performance block as the vendor's.
+fn performance(native: &Value) -> Value {
     let p = native.pointer("/meta/performance").unwrap_or(&Value::Null);
-    out.insert(
-        "performance".into(),
-        json!({
+    json!({
             "server_total_ms": p["server_total_ms"].as_f64().map_or(0, |ms| ms.round() as u64),
             "query_execution_ms": p["query_execution_ms"].as_f64().map_or(0, |ms| ms.round() as u64),
             "cache_hit_ratio": p["cache_hit_ratio"].as_f64().unwrap_or(0.0),
-        }),
-    );
-    Value::Object(out)
+    })
 }
 
 /// A native result row as a vendor row: its attributes flattened beside `id`, and `$dist`
@@ -300,21 +448,62 @@ fn row(r: &Value) -> Value {
 }
 
 /// A native write's answer as the vendor's (M268, Delta 3).
-pub(crate) fn write_answer(native: &Value) -> Value {
+///
+/// An applied write (M269, Delta 4) answers its outcome: the rows changed, `rows_remaining`,
+/// and each non-empty list of affected ids.
+pub(crate) fn write_answer(native: &Value) -> Result<Value, (StatusCode, Value)> {
+    let applied = native.get("applied");
+    if applied.is_some_and(Value::is_null) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"status": "error", "error": "outcome_unavailable: the write applied, and \
+                what it changed can no longer be read"}),
+        ));
+    }
     let n = |k: &str| native[k].as_u64().unwrap_or(0);
-    let (up, patched, deleted) = (
-        n("documents_written"),
-        n("documents_patched"),
-        n("documents_deleted"),
-    );
-    json!({
-        "status": "OK",
-        "message": format!("{} rows affected", up + patched + deleted),
-        "rows_affected": up + patched + deleted,
-        "rows_upserted": up,
-        "rows_patched": patched,
-        "rows_deleted": deleted,
-    })
+    let (up, patched, deleted) = match applied {
+        Some(a) => {
+            let c = |k: &str| a[k].as_u64().unwrap_or(0);
+            (c("upserted"), c("patched"), c("deleted"))
+        }
+        None => (
+            n("documents_written"),
+            n("documents_patched"),
+            n("documents_deleted"),
+        ),
+    };
+    let mut out = Map::new();
+    for (k, v) in [
+        ("status", json!("OK")),
+        (
+            "message",
+            json!(format!("{} rows affected", up + patched + deleted)),
+        ),
+        ("rows_affected", json!(up + patched + deleted)),
+        ("rows_upserted", json!(up)),
+        ("rows_patched", json!(patched)),
+        ("rows_deleted", json!(deleted)),
+    ] {
+        out.insert(k.to_owned(), v);
+    }
+    if let Some(a) = applied {
+        if let Some(r) = a.get("rows_remaining") {
+            out.insert("rows_remaining".to_owned(), r.clone());
+        }
+        for (native_key, vendor_key) in [
+            ("upserted", "upserted_ids"),
+            ("patched", "patched_ids"),
+            ("deleted", "deleted_ids"),
+        ] {
+            if let Some(ids) = a
+                .pointer(&format!("/ids/{native_key}"))
+                .filter(|v| v.as_array().is_some_and(|l| !l.is_empty()))
+            {
+                out.insert(vendor_key.to_owned(), ids.clone());
+            }
+        }
+    }
+    Ok(Value::Object(out))
 }
 
 /// A native summary as the vendor's namespace metadata (M268, Delta 5).
@@ -364,6 +553,15 @@ async fn translate(
     answer: Result<Response, ApiError>,
     ok: impl FnOnce(Value) -> Value,
 ) -> Response {
+    translate_or(answer, |v| Ok(ok(v))).await
+}
+
+/// [`translate`], with a success the facade may still refuse (M269: an outcome that can no
+/// longer be read).
+async fn translate_or(
+    answer: Result<Response, ApiError>,
+    ok: impl FnOnce(Value) -> Result<Value, (StatusCode, Value)>,
+) -> Response {
     let res = answer.unwrap_or_else(IntoResponse::into_response);
     let status = res.status();
     let (parts, body) = res.into_parts();
@@ -376,7 +574,7 @@ async fn translate(
     };
     let native: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let (status, out) = if status.is_success() {
-        (status, ok(native))
+        ok(native).map_or_else(|refused| refused, |out| (status, out))
     } else {
         error_answer(status, &native)
     };
@@ -427,7 +625,7 @@ pub(crate) async fn write<S: BlobStore + 'static>(
         }
         Err(e) => Err(e),
     };
-    translate(answer, |v| write_answer(&v)).await
+    translate_or(answer, |v| write_answer(&v)).await
 }
 
 /// `DELETE /v2/namespaces/{ns}`.
@@ -446,7 +644,7 @@ pub(crate) async fn delete_all<S: BlobStore + 'static>(
     translate(answer, |_| json!({"status": "OK"})).await
 }
 
-/// `POST /v2/namespaces/{ns}/query`: one query.
+/// `POST /v2/namespaces/{ns}/query`: one query, or a multi-query (M269).
 pub(crate) async fn query<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
     Path(ns): Path<String>,
@@ -455,6 +653,9 @@ pub(crate) async fn query<S: BlobStore + 'static>(
     body: Bytes,
 ) -> Response {
     let prepared = identity(&principal, headers).and_then(|h| query_body(&body).map(|b| (h, b)));
+    let multi = prepared
+        .as_ref()
+        .is_ok_and(|(_, native)| native.get("queries").is_some());
     let answer = match prepared {
         Ok((headers, native)) => {
             crate::query_index(
@@ -467,7 +668,11 @@ pub(crate) async fn query<S: BlobStore + 'static>(
         }
         Err(e) => Err(e),
     };
-    translate(answer, query_answer).await
+    if multi {
+        translate(answer, |v| multi_answer(&v)).await
+    } else {
+        translate(answer, query_answer).await
+    }
 }
 
 /// `GET /v1/namespaces/{ns}/schema`: the attributes' declarations, as metadata's `schema`.
@@ -534,6 +739,65 @@ mod tests {
         assert!(ann.get("field").is_none(), "{ann}");
         let named = query(&json!({"rank_by": ["title_v", "ANN", [1.0, 0.0]], "top_k": 2}));
         assert_eq!(named["field"], "title_v", "{named}");
+    }
+
+    /// M269, Delta 3: a write is applied exactly when its answer is the rows it changed.
+    #[test]
+    fn a_write_is_applied_only_when_its_answer_needs_it() {
+        let durability =
+            |w: Value| write_body(w.to_string().as_bytes()).unwrap()["durability"].clone();
+        let rows = json!([{"id": 1, "vector": [1.0, 0.0]}]);
+        for plain in [
+            json!({"upsert_rows": rows}),
+            json!({"deletes": [1], "patch_rows": [{"id": 1, "n": 2}]}),
+            json!({"upsert_rows": rows, "return_affected_ids": false}),
+            json!({"upsert_rows": rows, "upsert_condition": null}),
+        ] {
+            assert_eq!(durability(plain.clone()), "durable", "{plain}");
+        }
+        for applied in [
+            json!({"upsert_rows": rows, "return_affected_ids": true}),
+            json!({"upsert_rows": rows, "upsert_condition": ["n", "Eq", 1]}),
+            json!({"patch_rows": [{"id": 1, "n": 2}], "patch_condition": ["n", "Eq", 1]}),
+            json!({"deletes": [1], "delete_condition": ["n", "Eq", 1]}),
+            json!({"delete_by_filter": ["n", "Eq", 1]}),
+            json!({"patch_by_filter": {"filters": ["n", "Eq", 1], "patch": {"n": 2}}}),
+            json!({"delete_by_filter": ["n", "Eq", 1], "delete_by_filter_allow_partial": true}),
+            json!({"patch_by_filter": {"filters": ["n", "Eq", 1], "patch": {"n": 2}},
+                "patch_by_filter_allow_partial": true}),
+        ] {
+            assert_eq!(durability(applied.clone()), "applied", "{applied}");
+        }
+    }
+
+    #[test]
+    fn each_sub_query_takes_the_roots_consistency() {
+        let multi = query_body(
+            json!({"queries": [{"rank_by": ["id", "asc"], "top_k": 1},
+                               {"rank_by": ["n", "desc"], "top_k": 2}],
+                   "consistency": {"level": "eventual"}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let subs = multi["queries"].as_array().unwrap();
+        assert_eq!(subs.len(), 2, "{multi}");
+        for q in subs {
+            assert_eq!(q["consistency"], "bounded", "{multi}");
+        }
+    }
+
+    #[test]
+    fn an_applied_write_answers_what_changed_not_what_was_sent() {
+        let native = json!({"documents_written": 2, "documents_patched": 0,
+            "documents_deleted": 2,
+            "applied": {"upserted": 1, "patched": 0, "deleted": 1, "skipped": 2, "rejected": 0}});
+        let a = write_answer(&native).unwrap();
+        assert_eq!(
+            (&a["rows_upserted"], &a["rows_deleted"], &a["rows_affected"]),
+            (&json!(1), &json!(1), &json!(2)),
+            "{a}"
+        );
     }
 
     /// Delta 6: only a permanent 409 becomes 400; a retryable 409 and a 503 keep their
