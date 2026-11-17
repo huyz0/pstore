@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import unittest
 import urllib.request
 
@@ -80,6 +81,10 @@ class Sdk(unittest.TestCase):
         meta = ns.metadata()
         self.assertEqual(meta.approx_row_count, 3)
         self.assertTrue(ns.exists())
+        # The native schema records a type only for datetime, uuid, bytes and uint64
+        # attributes (M173), so schema() is exactly its attributes, empty here.
+        summary = native("/v1/indexes/sdk-docs")
+        self.assertEqual(ns.schema(), summary["schema"]["attributes"])
 
         tpuf.namespace("sdk-more").write(upsert_rows=[{"id": 1, "vector": [1.0, 0.0]}],
                                          distance_metric="cosine_distance")
@@ -179,13 +184,84 @@ class Sdk(unittest.TestCase):
         self.assertIn("pinning", str(e.exception))
         ns.delete_all()
 
+    def test_copy_branch_and_the_async_copy(self):
+        """M271: each the native branch or copy. Its namespaces are cp-, not sdk-: another
+        test lists the sdk- prefix."""
+        tpuf = client()
+        src = tpuf.namespace("cp-src")
+        src.write(upsert_rows=ROWS, distance_metric="euclidean_squared")
+        native("/v1/admin/fold", {})
+
+        def ids_and_n(ns):
+            got = ns.query(rank_by=("id", "asc"), top_k=10, include_attributes=["n"])
+            return [(r.id, getattr(r, "n", None)) for r in got.rows]
+
+        source = ids_and_n(src)
+        self.assertEqual(len(source), 3)
+        branch = tpuf.namespace("cp-branch")
+        self.assertEqual(branch.branch_from(source_namespace="cp-src").rows_affected, 0)
+        self.assertEqual(ids_and_n(branch), source)
+        copy = tpuf.namespace("cp-copy")
+        copy.copy_from(source_namespace="cp-src")
+        self.assertEqual(ids_and_n(copy), source)
+        copy.write(patch_rows=[{"id": 1, "n": 99}])
+        native("/v1/admin/fold", {})
+        self.assertEqual(ids_and_n(src), source)
+        self.assertNotEqual(ids_and_n(copy), source)
+        by_write = tpuf.namespace("cp-by-write")
+        by_write.write(copy_from_namespace="cp-src")
+        self.assertEqual(ids_and_n(by_write), source)
+
+        later = tpuf.namespace("cp-later")
+        token = later.start_copy_from(source_namespace="cp-src").token
+        deadline = time.monotonic() + 60
+        while True:
+            op = later.poll_copy_from(token=token)
+            if op.status == "finished" or time.monotonic() > deadline:
+                break
+            time.sleep(0.5)
+        self.assertEqual(op.status, "finished")
+        # No billing is invented, so the SDK cannot type the result and hands back its dict.
+        result = op.result if isinstance(op.result, dict) else op.result.model_dump()
+        self.assertEqual(result["success"]["status"], "OK")
+        self.assertEqual(ids_and_n(later), source)
+        with self.assertRaises(turbopuffer.NotFoundError):
+            later.poll_copy_from(token="999999")
+        with self.assertRaises(turbopuffer.BadRequestError) as e:
+            tpuf.namespace("cp-far").copy_from(source_namespace="cp-src",
+                                                source_region="aws-us-east-1")
+        self.assertIn("source_region", str(e.exception))
+        for ns in (src, branch, copy, by_write, later):
+            ns.delete_all()
+
+    def test_the_manifest_names_everything_the_sdk_sends(self):
+        """M272: every namespace method, write key and query key of the pinned SDK."""
+        import inspect
+        from pathlib import Path
+
+        from turbopuffer.resources.namespaces import NamespacesResource
+        from turbopuffer.types import namespace_query_params, namespace_write_params
+
+        manifest = json.loads(
+            (Path(__file__).resolve().parents[2] / "api/compat/turbopuffer.json").read_text())
+        self.assertEqual(manifest["sdk"]["version"], turbopuffer.__version__)
+        methods = {m for m, v in inspect.getmembers(NamespacesResource)
+                   if not m.startswith("_") and inspect.isfunction(v)}
+        self.assertEqual(methods | {"namespaces"}, set(manifest["operations"]))
+        for params, keys in [
+            (namespace_write_params.NamespaceWriteParams, "write_keys"),
+            (namespace_query_params.NamespaceQueryParams, "query_keys"),
+        ]:
+            sent = set(params.__annotations__) - {"namespace"}
+            self.assertEqual(sent, set(manifest[keys]), keys)
+
     def test_a_refusal_is_the_sdks_error(self):
         tpuf = client()
         with self.assertRaises(turbopuffer.NotFoundError):
             tpuf.namespace("sdk-nothing").metadata()
         with self.assertRaises(turbopuffer.BadRequestError) as e:
-            tpuf.namespace("sdk-bad").write(copy_from_namespace="sdk-docs")
-        self.assertIn("copy_from_namespace", str(e.exception))
+            tpuf.namespace("sdk-bad").write(upsert_rows=[], sharding={"num_shards": 2})
+        self.assertIn("sharding", str(e.exception))
 
 
 if __name__ == "__main__":

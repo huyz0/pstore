@@ -112,9 +112,80 @@ fn object(body: &[u8]) -> Result<Map<String, Value>, ApiError> {
     }
 }
 
-/// A vendor write as the native write's body (M268, Delta 3).
+/// The keys that name another organization, region or key for a copy's source (M271): pstore's
+/// identity reaches none of them.
+const REMOTE_SOURCE: [&str; 3] = ["source_api_key", "source_region", "dest_encryption"];
+
+fn refuse_remote(o: &Map<String, Value>) -> Result<(), ApiError> {
+    match REMOTE_SOURCE.iter().find(|k| o.contains_key(**k)) {
+        Some(k) => Err(bad(format!(
+            "{k:?} is not served: a copy reads this tenant's own namespace, in this store"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn source_name(v: Value) -> Result<String, ApiError> {
+    match v {
+        Value::String(s) => Ok(s),
+        _ => Err(bad("source_namespace is a namespace's name")),
+    }
+}
+
+/// The namespace a vendor write branches or copies from (M271, Delta 1), taken out of `o`:
+/// `branch_from_namespace` or `copy_from_namespace`, a name or `{"source_namespace"}`. The
+/// SDK's `branch_from`, `copy_from` and `start_copy_from` all send one of these.
+fn copy_source(o: &mut Map<String, Value>) -> Result<Option<String>, ApiError> {
+    let from = match (
+        o.remove("branch_from_namespace"),
+        o.remove("copy_from_namespace"),
+    ) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err(bad(
+                "branch_from_namespace and copy_from_namespace are one operation: name one",
+            ));
+        }
+        (Some(v), None) | (None, Some(v)) => v,
+    };
+    match from {
+        Value::String(s) => Ok(Some(s)),
+        Value::Object(mut c) => {
+            refuse_remote(&c)?;
+            let src = c
+                .remove("source_namespace")
+                .ok_or_else(|| bad("a copy's source holds source_namespace"))?;
+            if let Some(k) = c.keys().next() {
+                return Err(bad(format!(
+                    "a copy's source holds source_namespace, not {k:?}"
+                )));
+            }
+            source_name(src).map(Some)
+        }
+        _ => Err(bad(
+            "a copy's source is a namespace's name or {\"source_namespace\"}",
+        )),
+    }
+}
+
+/// A vendor write as the native write's body (M268, Delta 3). A branch or copy (M271) is the
+/// native branch; anything beside it is translated and sent too, for the native write to
+/// refuse, since a branch comes alone (M122).
 pub(crate) fn write_body(body: &[u8]) -> Result<Value, ApiError> {
     let mut o = object(body)?;
+    let source = copy_source(&mut o)?;
+    let mut out = translated_write(o)?;
+    if let Some(src) = source
+        && let Value::Object(m) = &mut out
+    {
+        m.remove("durability");
+        m.insert("branch_from_namespace".into(), src.into());
+    }
+    Ok(out)
+}
+
+/// The vendor write's keys as the native write's.
+fn translated_write(mut o: Map<String, Value>) -> Result<Value, ApiError> {
     let mut out = Map::new();
     out.insert("durability".into(), durability(&o).into());
     if let Some(rows) = o.remove("upsert_rows") {
@@ -631,6 +702,60 @@ pub(crate) fn metadata_patch(body: &[u8]) -> Result<Option<Value>, ApiError> {
     Ok(read_only.map(|r| json!({ "read_only": r })))
 }
 
+/// The vendor's `start_copy_from` body as the native copy's (M271, Delta 2).
+pub(crate) fn copy_body(body: &[u8]) -> Result<Value, ApiError> {
+    let mut o = object(body)?;
+    let src = copy_source(&mut o)?
+        .ok_or_else(|| bad("start_copy_from names its source in copy_from_namespace"))?;
+    if let Some(k) = o.keys().next() {
+        return Err(bad(format!(
+            "{k:?} is not translated by this facade: start_copy_from takes copy_from_namespace"
+        )));
+    }
+    Ok(json!({"source": {"index": src}}))
+}
+
+/// The native copy's run, as the vendor's operation token (M271, Delta 2).
+pub(crate) fn copy_token(native: &Value) -> Value {
+    json!({"token": native["run"].to_string()})
+}
+
+/// The native copy's status as the vendor's operation (M271, Delta 3), or 404 when `token`
+/// is not its run.
+pub(crate) fn operation_answer(native: &Value, token: &str) -> Result<Value, (StatusCode, Value)> {
+    if native["run"].as_u64().is_none() || native["run"].as_u64() != token.parse().ok() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            json!({"status": "error", "error": format!(
+                "operation_not_found: {token:?} is not this namespace's copy"
+            )}),
+        ));
+    }
+    let start = native["created_at"].clone();
+    let state = native["state"].as_str().unwrap_or_default();
+    if matches!(state, "running" | "paused") {
+        let progress = native
+            .get("progress")
+            .filter(|p| !p.is_null())
+            .map(|p| format!("{} of {} segments", p["segments_done"], p["segments_total"]));
+        return Ok(json!({"status": "running", "start_time": start, "progress": progress}));
+    }
+    let result = if state == "succeeded" {
+        json!({"success": {"status": "OK", "message": "copied", "rows_affected": 0}})
+    } else {
+        let code = native["code"].as_str().unwrap_or(state);
+        let status_code = if code == "source_not_found" { 404 } else { 409 };
+        let error = match native["last_error"].as_str() {
+            Some(last) => format!("{code}: {last}"),
+            None => code.to_owned(),
+        };
+        json!({"error": {"status_code": status_code,
+            "detail": {"status": "error", "error": error}}})
+    };
+    Ok(json!({"status": "finished", "start_time": start,
+        "finish_time": native["ended_at"], "result": result}))
+}
+
 /// A native refusal as the vendor's envelope: `{"status": "error", "error"}`. ⚠️ A 409 that
 /// is not `retryable` answers 400: the SDK resends a 409 four times, and pstore's permanent
 /// 409s (`index_exists`, `index_read_only`, `index_limit`) would cost five requests each.
@@ -933,6 +1058,52 @@ pub(crate) async fn update_metadata<S: BlobStore + 'static>(
     translate(answer, |v| metadata_answer(&v)).await
 }
 
+/// `POST /v2/namespaces/{ns}/async`: `start_copy_from` (M271, Delta 2).
+pub(crate) async fn start_copy<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(ns): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<Principal>,
+    body: Bytes,
+) -> Response {
+    let prepared = identity(&principal, headers).and_then(|h| copy_body(&body).map(|b| (h, b)));
+    let answer = match prepared {
+        Ok((headers, native)) => {
+            crate::replication::copy(
+                State(api),
+                Path(ns),
+                headers,
+                axum::Extension(principal),
+                Bytes::from(native.to_string()),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    let mut res = translate(answer, |v| copy_token(&v)).await;
+    // The vendor answers a started copy 200; the native copy answers 202.
+    if res.status() == StatusCode::ACCEPTED {
+        *res.status_mut() = StatusCode::OK;
+    }
+    res
+}
+
+/// `GET /v1/namespaces/{ns}/operations/{token}`: `poll_copy_from` (M271, Delta 3).
+pub(crate) async fn poll_copy<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path((ns, token)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<Principal>,
+) -> Response {
+    let answer = match identity(&principal, headers) {
+        Ok(headers) => crate::replication::copy_status(State(api), Path(ns), headers)
+            .await
+            .map(IntoResponse::into_response),
+        Err(e) => Err(e),
+    };
+    translate_or(answer, |v| operation_answer(&v, &token)).await
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -986,6 +1157,89 @@ mod tests {
                 "patch_by_filter_allow_partial": true}),
         ] {
             assert_eq!(durability(applied.clone()), "applied", "{applied}");
+        }
+    }
+
+    #[test]
+    fn an_operation_is_the_native_copys_state() {
+        let status = |state: &str, code: Value, last: Value| {
+            json!({"run": 3, "state": state, "code": code, "last_error": last,
+                "created_at": "2026-11-16T00:00:00.000Z", "ended_at": "2026-11-16T00:00:09.000Z",
+                "progress": {"segments_done": 1, "segments_total": 4}})
+        };
+        let running = operation_answer(&status("running", Value::Null, Value::Null), "3").unwrap();
+        assert_eq!(
+            running,
+            json!({"status": "running", "start_time": "2026-11-16T00:00:00.000Z",
+                "progress": "1 of 4 segments"})
+        );
+        let paused = operation_answer(&status("paused", Value::Null, Value::Null), "3").unwrap();
+        assert_eq!(paused["status"], "running", "{paused}");
+        let done = operation_answer(&status("succeeded", Value::Null, Value::Null), "3").unwrap();
+        assert_eq!(done["status"], "finished", "{done}");
+        assert_eq!(done["finish_time"], "2026-11-16T00:00:09.000Z", "{done}");
+        assert_eq!(done["result"]["success"]["status"], "OK", "{done}");
+        for (state, code, last, status_code, error) in [
+            (
+                "failed",
+                json!("source_not_found"),
+                json!("gone"),
+                404,
+                "source_not_found: gone",
+            ),
+            (
+                "failed",
+                json!("rebuild_refused"),
+                Value::Null,
+                409,
+                "rebuild_refused",
+            ),
+            ("cancelled", Value::Null, Value::Null, 409, "cancelled"),
+        ] {
+            let a = operation_answer(&status(state, code, last), "3").unwrap();
+            assert_eq!(a["status"], "finished", "{a}");
+            assert_eq!(
+                a["result"]["error"],
+                json!({"status_code": status_code, "detail": {"status": "error", "error": error}}),
+                "{a}"
+            );
+        }
+        let (code, other) =
+            operation_answer(&status("running", Value::Null, Value::Null), "4").unwrap_err();
+        assert_eq!(code, StatusCode::NOT_FOUND, "{other}");
+    }
+
+    /// M272: each manifest key's status is what the translation does with it.
+    #[test]
+    fn the_manifest_keys_are_the_translation() {
+        let m: Value =
+            serde_json::from_str(include_str!("../../../api/compat/turbopuffer.json")).unwrap();
+        let untranslated = |r: Result<Value, ApiError>, k: &str| match r {
+            Err(e) => e.message.contains(&format!("{k:?} is not translated")),
+            Ok(_) => false,
+        };
+        for (keys, translate) in [
+            (
+                "write_keys",
+                write_body as fn(&[u8]) -> Result<Value, ApiError>,
+            ),
+            ("query_keys", query_body),
+        ] {
+            let keys = m[keys].as_object().unwrap();
+            assert!(keys.len() >= 14, "{keys:?}");
+            for (k, entry) in keys {
+                let refused = untranslated(translate(json!({ k: 1 }).to_string().as_bytes()), k);
+                let status = entry["status"].as_str().unwrap();
+                assert!(
+                    matches!(status, "refused" | "served" | "hint"),
+                    "{k}: {status}"
+                );
+                if status == "refused" {
+                    assert!(refused, "{k} is marked refused and is translated");
+                } else {
+                    assert!(!refused, "{k} is marked {status} and is refused");
+                }
+            }
         }
     }
 

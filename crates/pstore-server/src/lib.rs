@@ -874,6 +874,15 @@ impl<S: BlobStore + 'static> Api<S> {
                 "/v1/namespaces/{index}/metadata",
                 Write.on(axum::routing::patch(facade::update_metadata::<S>)),
             )
+            // M271: the async copy and its operation.
+            .facade(
+                "/v2/namespaces/{index}/async",
+                Write.on(post(facade::start_copy::<S>)),
+            )
+            .facade(
+                "/v1/namespaces/{index}/operations/{token}",
+                Read.on(get(facade::poll_copy::<S>)),
+            )
     }
 
     /// The routes. `api-design.md`'s surface, minus everything M7c defers.
