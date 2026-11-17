@@ -89,6 +89,7 @@ mod replication_lag;
 mod replication_races;
 mod rerank;
 mod restart;
+mod s3_retry;
 mod scheduled_fold;
 mod scheduled_reap;
 mod schema;

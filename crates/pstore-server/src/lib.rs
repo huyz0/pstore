@@ -8013,6 +8013,71 @@ pub fn s3_capabilities(endpoint: &str, profile: Profile) -> pstore_blob::Capabil
     }
 }
 
+/// One S3-compatible bucket, with `profile`'s capabilities (M282: moved from `main.rs`, so its
+/// retry policy is reachable from a test).
+///
+/// ⚠️ The credentials are applied only when the operator gave both. Unset, `AmazonS3Builder`
+/// uses its own provider chain -- which is how an instance profile or a service-account role
+/// works, and the only way this image is usable on EC2 or EKS. `Config` decides; this applies.
+///
+/// # Errors
+/// The client's refusal to build.
+pub fn s3_store(
+    endpoint: &str,
+    name: &str,
+    credentials: Option<&(String, String)>,
+    region: &str,
+    profile: Profile,
+) -> Result<pstore_blob::ObjectStoreBackend, object_store::Error> {
+    let mut builder = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(name)
+        .with_allow_http(true)
+        .with_region(region);
+    if let Some((key, secret)) = credentials {
+        builder = builder
+            .with_access_key_id(key)
+            .with_secret_access_key(secret);
+    }
+    let conditional = builder.clone().with_retry(conditional_retries()).build()?;
+    Ok(pstore_blob::ObjectStoreBackend::new(
+        std::sync::Arc::new(builder.with_retry(retries()).build()?),
+        s3_capabilities(endpoint, profile),
+    )
+    .with_conditional(std::sync::Arc::new(conditional)))
+}
+
+/// The retry policy of every request but a conditional write (M282), set here rather than
+/// inherited: `object_store` 0.14's own defaults, written down so a dependency bump cannot
+/// change them unseen. Ten retries with backoff from 100 ms to 15 s, within 3 minutes, of
+/// a `5xx`, a `429`, a `408` or a connection error. Reads, unconditional PUTs (a segment, a
+/// sidecar: written once at a derived key) and deletes are idempotent, so a repeat is safe.
+#[must_use]
+pub fn retries() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        backoff: object_store::BackoffConfig {
+            init_backoff: std::time::Duration::from_millis(100),
+            max_backoff: std::time::Duration::from_secs(15),
+            base: 2.0,
+        },
+        max_retries: 10,
+        retry_timeout: std::time::Duration::from_secs(180),
+    }
+}
+
+/// The retry policy of a conditional write (M282): **none**. A `5xx` does not say the write
+/// did not land, and a repeat of one that did fails its own precondition. hsearch retries a
+/// write only when no connection was made; `object_store` cannot tell that apart per request
+/// once retries are on, so this gives up the connect-error retry too, and the engine's own
+/// protocol (M17's read-back, a fold's next tick, a client's retry) takes its place.
+#[must_use]
+pub fn conditional_retries() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        max_retries: 0,
+        ..retries()
+    }
+}
+
 /// The capabilities an Azure account's profile claims (M46): S3's rule, under an
 /// `azure(account)` name. What the Azure client itself does -- no suffix reads, batches of
 /// 256 -- is [`pstore_blob::ObjectStoreBackend::azure`]'s, whatever the profile.
@@ -8043,10 +8108,12 @@ pub fn azure_store(
             .with_endpoint(endpoint.clone())
             .with_allow_http(true);
     }
+    let conditional = builder.clone().with_retry(conditional_retries()).build()?;
     Ok(pstore_blob::ObjectStoreBackend::azure(
-        std::sync::Arc::new(builder.build()?),
+        std::sync::Arc::new(builder.with_retry(retries()).build()?),
         azure_capabilities(&config.account, profile),
-    ))
+    )
+    .with_conditional(std::sync::Arc::new(conditional)))
 }
 
 /// Why a process could not read its configuration.

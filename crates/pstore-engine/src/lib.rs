@@ -161,14 +161,10 @@ type Sidecar = (fn(&Key) -> Key, bytes::Bytes);
 /// ⚠️ **Never a key `next` names**: a HEAD CAS answered `Contended` or `Io` may have landed,
 /// and then a name a call thinks it abandoned is live.
 fn bury_into<'k>(next: &mut Head, keys: impl IntoIterator<Item = &'k String>) -> usize {
-    let live: std::collections::HashSet<String> = next
-        .indexes
-        .values()
-        .flatten()
-        .map(|r| r.key.clone())
-        .chain(next.deletes.values().map(|(k, _)| k.clone()))
-        .chain(next.quarantine.values().flatten().map(|(k, _)| k.clone()))
-        .chain(next.outcomes.iter().map(|(_, k)| k.clone()))
+    // The same live set GC checks (M282): until then a copy of it that lacked an external
+    // index's codes, so a registration that landed and then erred buried them.
+    let live: std::collections::HashSet<String> = head_keys(next)
+        .map(str::to_owned)
         .chain(next.graveyard.values().flatten().cloned())
         .collect();
     // A set: a branch's retry can derive, and record, the same copy key twice.

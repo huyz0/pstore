@@ -13,6 +13,7 @@ an in-memory store, relative only.
 | 3 | Concurrent one-winner probes on every backend | Built (M279): three conformance probes; RustFS and Azurite pass |
 | 4 | Weighted admission with a reserve, per-tenant cache floors | Built as two settings (M280): borrowing **on** by default, a cache share **off**; the floor not built, see below |
 | 5 | One GC test across every pin kind | Built (M281): nine pins in one table; it found an external index's codes missing from GC's live set, fixed |
+| 6 | Pin the S3 client's retry policy | Built (M282): conditional writes never retried, everything else pinned at 10 retries; no setting, see below |
 
 ## Lesson 1: cross-tenant WAL bundling
 
@@ -112,3 +113,22 @@ codes, replica). Its first run found one gap: an external index's codes blob was
 live set, so a codes blob buried by a commit that failed after its write landed would have
 been deleted while HEAD still named it. Snapshots need no row: a snapshot (M236) is a HEAD
 read, and its `as_of` is the window row.
+
+## Lesson 6: the client's retry policy
+
+Built in M282, and the hazard was real. Against a fake S3 that stores a conditional PUT and
+then answers `503`, `object_store`'s own retry repeated the PUT, the repeat failed its own
+`If-None-Match`, and pstore got `Lost`: for a bundle, "another writer took this lane"; for a
+HEAD commit, a lost race. Azure's client did the same. Conditional writes now go through a
+second client of the same bucket with no retries, so the answer is an I/O error, which M17
+resolves by reading the bundle back, and which a fold or a request already retries at its
+own level. Every other request keeps `object_store`'s 0.14 defaults, now written in
+`retries()` rather than inherited.
+
+**No setting**: the repeat is wrong whenever the first attempt landed, and nothing can tell
+the client whether it did. The measured cost is that a `5xx` on a conditional write is no
+longer hidden by up to ten retries; it reaches paths built to handle exactly that.
+
+The same work found a second copy of the live set, in `bury_into`, missing an external
+index's codes, so a registration that landed and then erred buried its own codes. It now
+uses M281's `head_keys`.
