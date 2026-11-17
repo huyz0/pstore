@@ -185,6 +185,8 @@ pub struct Api<S> {
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
     external_prefixes: Mutex<Option<Vec<String>>>,
+    /// The facade's first attempts of conditional and by-filter writes (M274).
+    attempts: facade::Attempts,
 }
 
 /// One tenant's engine in the registry (M26).
@@ -505,6 +507,7 @@ impl<S: BlobStore + 'static> Api<S> {
             // binary sets `Config::filter_cache_bytes`, the cluster default.
             masks: Mutex::new(None),
             external_prefixes: Mutex::new(None),
+            attempts: facade::Attempts::default(),
         }))
     }
 

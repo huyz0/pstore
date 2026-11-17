@@ -28,9 +28,12 @@
         "sdk:test_the_sdk_against_the_facade",
         "sdk:test_writes_by_filter_and_by_condition",
         "rust:facade_write_and_query_are_native_calls",
-        "rust:facade_filters_and_conditions_are_native_calls"
+        "rust:facade_filters_and_conditions_are_native_calls",
+        "sdk:test_a_resend_after_a_lost_answer_applies_once",
+        "rust:a_resent_conditional_write_applies_once",
+        "rust:an_unmatched_resend_is_refused"
       ],
-      "note": "durable, or applied when its answer is the rows it changed (M269)"
+      "note": "durable, or applied when its answer is the rows it changed (M269); a conditional or by-filter write is keyed, so a resend applies at most once (M274)"
     },
     "branch_from": {
       "route": "POST /v2/namespaces/{namespace}",
@@ -309,5 +312,5 @@
       "status": "served"
     }
   },
-  "retries": "The SDK resends a 408, 409, 429 or 5xx. The facade answers a permanent 409 as 400, so it is not resent. A plain upsert, patch or delete resent after a 5xx writes the same rows again. A conditional or by-filter write resent after a 5xx is evaluated again against the rows as they are then, and may apply a second time: the SDK sends no idempotency key, and the native one (M132) is not reachable through the facade."
+  "retries": "The SDK resends a 408, 409, 429 or 5xx. The facade answers a permanent 409 as 400, so it is not resent. A plain upsert, patch or delete resent after a 5xx writes the same rows again. A conditional or by-filter write is keyed (M274): its first attempt gets a native idempotency key (M132), remembered by this server for the same body, and a resend (x-stainless-retry-count above 0) sends that key, so it applies at most once and answers the first attempt's outcome. A resend this server cannot match (another server, a restart, more than 4,096 bodies since, or keys off below PSTORE_APPLIED_WRITES=3) is refused 400 retry_outcome_unknown, never evaluated again."
 }

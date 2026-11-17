@@ -1,5 +1,19 @@
 # Native API migration notes
 
+## M274: a resent conditional or by-filter facade write applies at most once
+
+⚠️ **Behaviour change, facade only.** A facade write holding a condition or a by-filter
+operation now carries a native idempotency key (M132) when the server has them
+(`PSTORE_APPLIED_WRITES=3` or more). Its first attempt (`x-stainless-retry-count` absent or
+`0`) gets a fresh key, which the server remembers for the same tenant, namespace and body
+(4,096 bodies at most); the SDK's resend of it (count above `0`) sends the same key, so it
+applies at most once and answers the first attempt's counts. A resend the server cannot
+match, or any resend with keys off, is refused `400 retry_outcome_unknown`, a new error code
+in the OpenAPI contract (the generated clients regenerated for it): it may have applied, so
+read the rows and call again. Behind a balancer, send one client's attempts to one server.
+Writes with no condition or by-filter operation, and every native route, are unchanged.
+[M274 verification](milestones/M274/VERIFIED.md).
+
 ## M272: the turbopuffer compatibility manifest
 
 `api/compat/turbopuffer.json` names, for the pinned SDK, every operation with its route,

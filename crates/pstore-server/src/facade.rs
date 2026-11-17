@@ -7,6 +7,9 @@
 //!
 //! The shapes are the pinned SDK's, `turbopuffer` 3.1.0 (`types/namespace_*`). What the
 //! facade does not translate yet is refused naming the key, never ignored.
+//!
+//! M274: a conditional or by-filter write is two native calls, as a native client keying it
+//! makes them: the idempotency key's issue (M132), then the keyed write.
 
 use crate::auth::Principal;
 use crate::{Api, ApiError, ListParams};
@@ -831,6 +834,144 @@ pub(crate) async fn list<S: BlobStore + 'static>(
     translate(answer, |v| list_answer(&v)).await
 }
 
+/// The SDK's attempt number (M274): `x-stainless-retry-count`, `0` on a first attempt. A
+/// request without it, or with one that is not a number, is a first attempt.
+fn attempt_of(headers: &HeaderMap) -> u64 {
+    headers
+        .get("x-stainless-retry-count")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The most first attempts a server remembers (M274).
+pub(crate) const ATTEMPTS_MAX: usize = 4096;
+
+/// The idempotency keys this server gave first attempts of conditional and by-filter writes
+/// (M274), by a 128-bit keyed hash of tenant, namespace and body; oldest evicted first.
+pub(crate) struct Attempts {
+    hashers: [std::hash::RandomState; 2],
+    inner: std::sync::Mutex<AttemptsInner>,
+}
+
+#[derive(Default)]
+struct AttemptsInner {
+    keys: HashMap<u128, String>,
+    order: std::collections::VecDeque<u128>,
+}
+
+impl Default for Attempts {
+    fn default() -> Self {
+        Self {
+            hashers: [std::hash::RandomState::new(), std::hash::RandomState::new()],
+            inner: std::sync::Mutex::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Attempts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attempts")
+            .field("remembered", &self.lock().order.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Attempts {
+    /// The body's hash: two independently keyed 64-bit hashes of tenant, namespace and bytes.
+    fn digest(&self, tenant: u128, ns: &str, body: &[u8]) -> u128 {
+        use std::hash::BuildHasher;
+        let [a, b] = self
+            .hashers
+            .each_ref()
+            .map(|s| s.hash_one((tenant, ns, body)));
+        (u128::from(a) << 64) | u128::from(b)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, AttemptsInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Remembers `key` for `digest`, evicting the oldest past [`ATTEMPTS_MAX`].
+    fn remember(&self, digest: u128, key: String) {
+        let mut m = self.lock();
+        if m.keys.insert(digest, key).is_none() {
+            m.order.push_back(digest);
+        }
+        // One in at most, so one out at most: no loop a mutant can make endless.
+        if m.order.len() > ATTEMPTS_MAX
+            && let Some(old) = m.order.pop_front()
+        {
+            m.keys.remove(&old);
+        }
+    }
+
+    fn key(&self, digest: u128) -> Option<String> {
+        self.lock().keys.get(&digest).cloned()
+    }
+}
+
+/// Whether a native write is evaluated against the rows at its fold (M274): a condition or a
+/// by-filter operation. A resend of any other writes the same rows.
+fn evaluated(native: &Value) -> bool {
+    WRITE_APPLIED
+        .iter()
+        .any(|k| native.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+/// `native` with the idempotency key its attempt needs (M274): a first attempt's fresh key,
+/// remembered; a resend's remembered one; or a refusal when a resend cannot be matched.
+async fn keyed<S: BlobStore + 'static>(
+    api: &Api<S>,
+    ns: &str,
+    headers: &HeaderMap,
+    attempt: u64,
+    body: &[u8],
+    mut native: Value,
+) -> Result<Value, ApiError> {
+    if !evaluated(&native) {
+        return Ok(native);
+    }
+    let tenant = crate::tenant_of(headers)?;
+    let keys = api.registry_mut().idempotency;
+    let digest = api.attempts.digest(tenant.0, ns, body);
+    let key = if attempt == 0 {
+        if !keys {
+            return Ok(native);
+        }
+        let random = crate::operation_id()?.0;
+        let key = api.engine(tenant).await.idempotency_key(random).await?;
+        api.attempts.remember(digest, key.to_string());
+        key.to_string()
+    } else {
+        match api.attempts.key(digest).filter(|_| keys) {
+            Some(key) => key,
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "retry_outcome_unknown",
+                    format!(
+                        "this is resend {attempt} of a conditional or by-filter write whose \
+                         first attempt this server cannot match{}; it may have applied, so \
+                         read the rows, then call again",
+                        if keys {
+                            ""
+                        } else {
+                            " (idempotency keys are off: PSTORE_APPLIED_WRITES=3)"
+                        }
+                    ),
+                ));
+            }
+        }
+    };
+    if let Value::Object(m) = &mut native {
+        m.insert("idempotency_key".into(), key.into());
+    }
+    Ok(native)
+}
+
 /// `POST /v2/namespaces/{ns}`: a write.
 pub(crate) async fn write<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
@@ -839,7 +980,14 @@ pub(crate) async fn write<S: BlobStore + 'static>(
     axum::Extension(principal): axum::Extension<Principal>,
     body: Bytes,
 ) -> Response {
+    let attempt = attempt_of(&headers);
     let prepared = identity(&principal, headers).and_then(|h| write_body(&body).map(|b| (h, b)));
+    let prepared = match prepared {
+        Ok((h, native)) => keyed(&api, &ns, &h, attempt, &body, native)
+            .await
+            .map(|n| (h, n)),
+        Err(e) => Err(e),
+    };
     let answer = match prepared {
         Ok((headers, native)) => {
             crate::write_documents(
@@ -1112,6 +1260,38 @@ pub(crate) async fn poll_copy<S: BlobStore + 'static>(
 )]
 mod tests {
     use super::*;
+
+    /// M274: at most [`ATTEMPTS_MAX`] remembered, the oldest evicted first; a body's digest is
+    /// its tenant's and namespace's too.
+    #[test]
+    fn the_attempt_memory_is_bounded() {
+        let a = Attempts::default();
+        let d = |i: usize| a.digest(7, "docs", i.to_string().as_bytes());
+        for i in 0..ATTEMPTS_MAX {
+            a.remember(d(i), format!("k{i}"));
+        }
+        assert_eq!(a.key(d(0)).as_deref(), Some("k0"));
+        // Remembering a body again replaces its key without taking a second place.
+        a.remember(d(1), "k1'".to_owned());
+        a.remember(d(ATTEMPTS_MAX), "new".to_owned());
+        assert_eq!(a.key(d(0)), None, "the oldest evicted");
+        assert_eq!(a.key(d(1)).as_deref(), Some("k1'"));
+        assert_eq!(
+            a.key(d(ATTEMPTS_MAX)).as_deref(),
+            Some("new"),
+            "the newest kept"
+        );
+        assert_eq!(a.lock().keys.len(), ATTEMPTS_MAX);
+        assert_eq!(a.lock().order.len(), ATTEMPTS_MAX);
+        assert_ne!(d(1), a.digest(8, "docs", b"1"), "another tenant");
+        assert_ne!(d(1), a.digest(7, "other", b"1"), "another namespace");
+        assert_eq!(attempt_of(&HeaderMap::new()), 0);
+        let mut h = HeaderMap::new();
+        h.insert("x-stainless-retry-count", HeaderValue::from_static("3"));
+        assert_eq!(attempt_of(&h), 3);
+        h.insert("x-stainless-retry-count", HeaderValue::from_static("x"));
+        assert_eq!(attempt_of(&h), 0);
+    }
 
     fn query(body: &Value) -> Value {
         query_body(body.to_string().as_bytes()).unwrap()

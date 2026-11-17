@@ -1521,3 +1521,285 @@ fn the_manifest_evidence_resolves() {
         }
     }
 }
+
+// M274: a resent conditional or by-filter write applies at most once.
+
+/// [`key`], with the SDK's attempt number.
+fn attempt(tenant: u128, n: u32) -> Vec<(&'static str, String)> {
+    let mut h = key(tenant);
+    h.push(("x-stainless-retry-count", n.to_string()));
+    h
+}
+
+/// A native durable write of `body` into `index`, folded: another writer.
+async fn natively<S: BlobStore + 'static>(api: &Arc<Api<S>>, index: &str, body: Value) {
+    let (s, b) = call(
+        api,
+        "PUT",
+        &format!("/v1/indexes/{index}/documents"),
+        &native(7),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = call(api, "POST", "/v1/admin/fold", &native(7), Some(&json!({}))).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+}
+
+fn n_of(rows: &[(Value, Value)], id: u64) -> Value {
+    rows.iter()
+        .find(|(i, _)| *i == json!(id))
+        .map_or(Value::Null, |(_, n)| n.clone())
+}
+
+#[tokio::test]
+async fn a_resent_conditional_write_applies_once() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    seeded(&api, "docs").await;
+    let body = json!({"patch_rows": [{"id": 2, "n": 7}], "patch_condition": ["n", "Eq", 1]});
+    let (s, first) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(7, 0),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{first}");
+    assert_eq!(first["rows_patched"], 1, "{first}");
+    assert_eq!(n_of(&ns(&api, "docs").await, 2), json!(7));
+    // Another writer puts the condition back; a second evaluation would apply again.
+    natively(
+        &api,
+        "docs",
+        json!({"durability": "durable", "patch_rows": [{"id": 2, "attributes": {"n": 1}}]}),
+    )
+    .await;
+    // The SDK's resend of the same body, its first answer lost.
+    let (s, again) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(7, 1),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(
+        again["rows_patched"], 1,
+        "the first attempt's counts: {again}"
+    );
+    assert_eq!(
+        n_of(&ns(&api, "docs").await, 2),
+        json!(1),
+        "not applied again"
+    );
+}
+
+#[tokio::test]
+async fn a_resent_by_filter_delete_applies_once() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    seeded(&api, "docs").await;
+    let body = json!({"delete_by_filter": ["kind", "Eq", "a"]});
+    let (s, first) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(7, 0),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{first}");
+    assert_eq!(first["rows_deleted"], 2, "{first}");
+    natively(
+        &api,
+        "docs",
+        json!({"durability": "durable", "distance_metric": "euclidean_squared",
+            "documents": [{"id": 9, "vector": [1.0, 0.0], "attributes": {"n": 9, "kind": "a"}}]}),
+    )
+    .await;
+    for n in [1, 2] {
+        let (s, again) = call(
+            &api,
+            "POST",
+            "/v2/namespaces/docs",
+            &attempt(7, n),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{again}");
+        assert_eq!(again["rows_deleted"], 2, "{again}");
+    }
+    assert_eq!(n_of(&ns(&api, "docs").await, 9), json!(9), "row 9 kept");
+}
+
+#[tokio::test]
+async fn an_unmatched_resend_is_refused() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    seeded(&api, "docs").await;
+    let before = ns(&api, "docs").await;
+    let body = json!({"patch_rows": [{"id": 2, "n": 7}], "patch_condition": ["n", "Eq", 1]});
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(7, 1),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("retry_outcome_unknown: "),
+        "{b}"
+    );
+    assert_eq!(ns(&api, "docs").await, before, "nothing applied");
+    // Another tenant's first attempt of the same bytes is not this tenant's.
+    call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(8, 0),
+        Some(&body),
+    )
+    .await;
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(7, 1),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    // A first attempt is unchanged.
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(7, 0),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["rows_patched"], 1, "{b}");
+}
+
+#[tokio::test]
+async fn a_resend_without_keys_is_refused() {
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    api.set_applied_writes(true);
+    seeded(&api, "docs").await;
+    let body = json!({"patch_rows": [{"id": 2, "n": 7}], "patch_condition": ["n", "Eq", 1]});
+    // A first attempt, unkeyed as before M274.
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(7, 0),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["rows_patched"], 1, "{b}");
+    let before = ns(&api, "docs").await;
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/docs",
+        &attempt(7, 1),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("retry_outcome_unknown: "),
+        "{b}"
+    );
+    assert_eq!(ns(&api, "docs").await, before);
+}
+
+#[tokio::test]
+async fn a_plain_write_is_not_keyed() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    seeded(&api, "docs").await;
+    // Resends this server never saw: no condition, no by-filter operation, so not refused.
+    for body in [
+        json!({"upsert_rows": [{"id": 1, "vector": [1.0, 0.0], "n": 11}],
+            "distance_metric": "euclidean_squared"}),
+        json!({"upsert_rows": [{"id": 2, "vector": [1.0, 0.0], "n": 12}],
+            "distance_metric": "euclidean_squared", "return_affected_ids": true}),
+        json!({"deletes": [3]}),
+    ] {
+        let (s, b) = call(
+            &api,
+            "POST",
+            "/v2/namespaces/docs",
+            &attempt(7, 2),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body} -> {b}");
+    }
+}
+
+#[tokio::test]
+async fn a_keyed_facade_write_costs_the_native_pair() {
+    let body = json!({"patch_rows": [{"id": 2, "n": 7}], "patch_condition": ["n", "Eq", 1]});
+    let measured = async |facade: bool| {
+        let depth = DepthCounting::new(MemoryStore::new());
+        let store = Accounted::new(depth.clone());
+        let api = applied_api(store.clone());
+        seeded(&api, "docs").await;
+        let spent =
+            || [OpClass::Read, OpClass::Write, OpClass::List].map(|c| store.count(TenantId(7), c));
+        let before = spent();
+        depth.reset();
+        if facade {
+            let (s, b) = call(
+                &api,
+                "POST",
+                "/v2/namespaces/docs",
+                &attempt(7, 0),
+                Some(&body),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        } else {
+            let (s, k) = call(
+                &api,
+                "POST",
+                "/v1/indexes/docs/idempotency-keys",
+                &native(7),
+                Some(&json!({})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{k}");
+            let (s, b) = call(
+                &api,
+                "PUT",
+                "/v1/indexes/docs/documents",
+                &native(7),
+                Some(&json!({"durability": "applied",
+                    "idempotency_key": k["idempotency_key"],
+                    "patch_rows": [{"id": 2, "attributes": {"n": 7}}],
+                    "patch_condition": ["n", "Eq", 1]})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        }
+        let after = spent();
+        let used: Vec<_> = before.iter().zip(after).map(|(b, a)| a - b).collect();
+        (used, depth.depth())
+    };
+    assert_eq!(
+        measured(true).await,
+        measured(false).await,
+        "facade, then native"
+    );
+}

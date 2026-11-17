@@ -255,6 +255,55 @@ class Sdk(unittest.TestCase):
             sent = set(params.__annotations__) - {"namespace"}
             self.assertEqual(sent, set(manifest[keys]), keys)
 
+    def test_a_resend_after_a_lost_answer_applies_once(self):
+        """M274: the SDK resends a conditional write whose answer was lost after it applied.
+
+        The SDK's own transport hook forwards the first attempt, lets another writer put the
+        condition back, and answers the SDK 503, so the SDK resends. A second evaluation
+        would apply again; the facade's key makes the resend the first attempt's replay.
+        """
+        import httpx2
+
+        url = os.environ.get("PSTORE_URL")
+        if not url:
+            raise unittest.SkipTest("PSTORE_URL names the server: run scripts/facade.sh")
+        attempts = []
+
+        class LoseFirstAnswer(httpx2.BaseTransport):
+            def __init__(self):
+                self.inner = httpx2.HTTPTransport()
+                self.lost = False
+
+            def handle_request(self, request):
+                res = self.inner.handle_request(request)
+                if b"patch_condition" not in request.content:
+                    return res
+                attempts.append(request.headers.get("x-stainless-retry-count"))
+                if self.lost:
+                    return res
+                res.read()
+                res.close()
+                self.lost = True
+                native("/v1/indexes/sdk-resend/documents",
+                       {"durability": "durable",
+                        "patch_rows": [{"id": 2, "attributes": {"n": 1}}]})
+                native("/v1/admin/fold", {})
+                return httpx2.Response(503, json={"status": "error", "error": "lost"})
+
+        tpuf = turbopuffer.Turbopuffer(api_key=TENANT, base_url=url, telemetry=False,
+                                       max_retries=2,
+                                       http_client=httpx2.Client(transport=LoseFirstAnswer()))
+        ns = tpuf.namespace("sdk-resend")
+        ns.write(upsert_rows=ROWS, distance_metric="euclidean_squared")
+        self.addCleanup(ns.delete_all)
+        native("/v1/admin/fold", {})
+        w = ns.write(patch_rows=[{"id": 2, "n": 7}], patch_condition=("n", "Eq", 1))
+        self.assertEqual(attempts, ["0", "1"])
+        self.assertEqual(w.rows_patched, 1)
+        got = ns.query(rank_by=("id", "asc"), top_k=10, include_attributes=["n"])
+        self.assertEqual([(r.id, r["n"]) for r in got.rows], [(1, 3), (2, 1), (3, 2)],
+                         "the resend did not apply again")
+
     def test_a_refusal_is_the_sdks_error(self):
         tpuf = client()
         with self.assertRaises(turbopuffer.NotFoundError):
