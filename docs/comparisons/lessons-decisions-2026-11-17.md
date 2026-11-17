@@ -12,6 +12,7 @@ an in-memory store, relative only.
 | 2 | Request budgets that ratchet both ways | Built (M278): `docs/research/11-design/request-budgets.md`, `scripts/check-budgets.py` |
 | 3 | Concurrent one-winner probes on every backend | Built (M279): three conformance probes; RustFS and Azurite pass |
 | 4 | Weighted admission with a reserve, per-tenant cache floors | Built as two settings (M280): borrowing **on** by default, a cache share **off**; the floor not built, see below |
+| 5 | One GC test across every pin kind | Built (M281): nine pins in one table; it found an external index's codes missing from GC's live set, fixed |
 
 ## Lesson 1: cross-tenant WAL bundling
 
@@ -100,3 +101,14 @@ is read, and the cache sits beneath the engine and keys by object. Reading an in
 tenant's) setting at either place is a blob request per request, which the cost model
 forbids. Both stay cluster settings; a per-tenant weight can be carried in the signed
 credential (M127) when one is needed, at no request.
+
+## Lesson 5: one GC test across every pin kind
+
+Built in M281. The live set GC checks before deleting is now one function that destructures
+every field of HEAD, so a new field cannot be added without deciding whether it names an
+object, and one table test buries a key under each of nine pins (live segment, branch,
+borrowed segment buried again, `as_of` window, delete vector, quarantine, outcome, external
+codes, replica). Its first run found one gap: an external index's codes blob was not in the
+live set, so a codes blob buried by a commit that failed after its write landed would have
+been deleted while HEAD still named it. Snapshots need no row: a snapshot (M236) is a HEAD
+read, and its `as_of` is the window row.

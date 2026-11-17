@@ -525,6 +525,59 @@ struct ReapPlan {
     doomed: Vec<Key>,
 }
 
+/// Every object key `h` names, which GC must never reap (M281).
+///
+/// ⚠️ **Destructures every field of HEAD**, so a field added later fails to compile here
+/// until someone decides whether it names an object. The pins are tested together in
+/// `reap_tests`.
+fn head_keys(h: &Head) -> impl Iterator<Item = &str> {
+    let Head {
+        // Per index, its segments (a branch's and a replica's included).
+        indexes,
+        // Every delete vector HEAD names (M9c.2).
+        deletes,
+        // Every quarantine (M25): acknowledged rows, kept until discarded.
+        quarantine,
+        // Every listed outcome object (M129).
+        outcomes,
+        // An external index's codes blob (M86). ⚠️ Missing until M281: a commit that failed
+        // after its write landed buries the codes HEAD now names.
+        externals,
+        // No object key: numbers, names, schemas, settings and records.
+        epoch: _,
+        nonce: _,
+        watermarks: _,
+        schemas: _,
+        schema_rejects: _,
+        reaped_before: _,
+        // What is buried, not what is live.
+        graveyard: _,
+        dropped: _,
+        branched: _,
+        replications: _,
+        keys_since: _,
+        times: _,
+        read_only: _,
+        once: _,
+        copies: _,
+        exports: _,
+        reindexes: _,
+        copy_times: _,
+        copy_as_of: _,
+        copy_progress: _,
+        storage: _,
+    } = h;
+    indexes
+        .values()
+        .flatten()
+        .map(|r| r.key.as_str())
+        .chain(deletes.values().map(|(k, _)| k.as_str()))
+        .chain(quarantine.values().flatten().map(|(k, _)| k.as_str()))
+        .chain(outcomes.iter().map(|(_, k)| k.as_str()))
+        // Its `source` is the customer's object, which pstore never buries or deletes.
+        .chain(externals.values().map(|e| e.codes.as_str()))
+}
+
 /// Plans a GC pass over `head` through `floor`: the larger of its horizon and `reaped_before`,
 /// so entries an earlier pass announced and never pruned are reaped too.
 fn reap_plan(h: &Head, floor: u64) -> ReapPlan {
@@ -534,18 +587,7 @@ fn reap_plan(h: &Head, floor: u64) -> ReapPlan {
         .filter_map(|e| h.graveyard.get(e).map(|keys| (*e, keys)))
         .flat_map(|(e, keys)| keys.iter().map(move |k| (e, k.clone())))
         .collect();
-    let live: std::collections::BTreeSet<&str> = h
-        .indexes
-        .values()
-        .flatten()
-        .map(|r| r.key.as_str())
-        // And every delete vector HEAD names (M9c.2).
-        .chain(h.deletes.values().map(|(k, _)| k.as_str()))
-        // And every quarantine (M25): acknowledged rows, kept until discarded.
-        .chain(h.quarantine.values().flatten().map(|(k, _)| k.as_str()))
-        // And every listed outcome object (M129).
-        .chain(h.outcomes.iter().map(|(_, k)| k.as_str()))
-        .collect();
+    let live: std::collections::BTreeSet<&str> = head_keys(h).collect();
     // M16: a marker -- a branch letting go of a borrowed segment -- names no object;
     // it is a burial of the segment.
     let object = |k: &String| -> String {
@@ -2169,6 +2211,9 @@ fn newest(ops: Vec<Document>) -> Vec<Document> {
         .map(|(_, d)| d)
         .collect()
 }
+
+#[cfg(test)]
+mod reap_tests;
 
 #[cfg(test)]
 #[allow(
