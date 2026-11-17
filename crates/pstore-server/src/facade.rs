@@ -1638,4 +1638,23 @@ mod tests {
         );
         assert!(refused.is_err(), "{refused:?}");
     }
+
+    /// M275: only `ann: true` is dropped, as asking for nothing; any other `ann` reaches the
+    /// native write, which refuses it.
+    #[test]
+    fn only_a_true_ann_is_dropped() {
+        let out = schema_declarations(json!({
+            "v": {"type": "[3]f32", "ann": true},
+            "w": {"type": "[3]f32", "ann": false},
+            "n": {"type": "uint", "ann": {"distance_metric": "cosine_distance"}},
+        }));
+        assert_eq!(
+            out,
+            json!({
+                "v": "[3]f32",
+                "w": {"type": "[3]f32", "ann": false},
+                "n": {"type": "uint64", "ann": {"distance_metric": "cosine_distance"}},
+            })
+        );
+    }
 }
