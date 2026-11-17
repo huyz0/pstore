@@ -175,17 +175,11 @@ fn params() -> pstore_index::cluster::Params {
 /// A peer's TCP listener and the UDP socket HTTP/3 shares its port with.
 type Sockets = (tokio::net::TcpListener, std::net::UdpSocket);
 
-/// Both peer sockets on one free port. ⚠️ Binding UDP to whatever port TCP was given raced
-/// `udp_port`: a gossip socket another test held on that number refused the bind with
-/// `AddrInUse`, so a port whose UDP half is taken is skipped rather than unwrapped.
+/// Both peer sockets on one free port, by the shared search (M273). ⚠️ A gossip socket
+/// another test holds can take a port's UDP half, so the search skips such a port and holds it
+/// rather than unwrapping the bind.
 async fn sockets() -> Sockets {
-    for _ in 0..64 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        if let Ok(udp) = std::net::UdpSocket::bind(listener.local_addr().unwrap()) {
-            return (listener, udp);
-        }
-    }
-    panic!("no port free for both TCP and UDP in 64 tries");
+    pstore_testkit::ports::same_port_tokio()
 }
 
 /// A server over `store`, listening on a port of its own.

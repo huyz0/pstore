@@ -20,7 +20,7 @@ workspace = true
 pstore-blob  = { path = "../pstore-blob" }
 pstore-types = { path = "../pstore-types" }
 bytes        = "1"
-tokio        = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio        = { version = "1", features = ["sync", "time", "rt", "macros", "net"] }
 async-trait = "0.1.92"
 thiserror    = "2"
 
