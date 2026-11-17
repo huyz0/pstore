@@ -15,6 +15,11 @@ an in-memory store, relative only.
 | 5 | One GC test across every pin kind | Built (M281): nine pins in one table; it found an external index's codes missing from GC's live set, fixed |
 | 6 | Pin the S3 client's retry policy | Built (M282): conditional writes never retried, everything else pinned at 10 retries; no setting, see below |
 | 7 | IVF tuning from lucene-rust | Measured (M283). **None built**; the exact scan of a filter's admitted rows is the one worth building next, see below |
+| 8 | An open-loop write-throughput ladder | Built (M284): `scripts/write-ladder.sh`, see below |
+| 9 | Warm a joining node from its peers | **Not built**: no multi-node deployment to measure the dip it is for, see below |
+| 10 | Avoid a consensus journal | Confirmed: nothing built, the Never list already excludes it |
+| 11 | Avoid inferring "latest" from a listing in GC | Confirmed: GC reaps from HEAD's own plan (M281's table pins it) |
+| 12 | BYOK decides lane sharing | Recorded as an input for workstream I, below |
 
 ## Lesson 1: cross-tenant WAL bundling
 
@@ -85,7 +90,10 @@ Both built in M280 as cluster settings, each default chosen from a deterministic
   and small tenants arriving one a step, or in bursts the reserve holds, are refused no more
   than under the fixed cap. It loses one workload: a burst of 24 new tenants while the hot
   tenant holds every slot it may is refused past the reserve, 160 of 240, where the fixed cap
-  refused none. Three wins of five.
+  refused none. Three wins of five. And one found later by CI: with more than 32 `applied`
+  writes of one tenant in flight across its servers, an outcome can fall off HEAD's list
+  before its writer reads it, so the write answers `outcome_unavailable`; the fixed cap held
+  four servers to exactly 32.
 - **A per-tenant cache share, default off.** At a quarter share, a cold scan beside four small
   tenants left them every hit, where one shared LRU left them none. But a tenant alone on a
   node with a working set of half the quota went from every hit to none, and so did two
@@ -162,3 +170,30 @@ Measured in M283 (`crates/pstore-index/examples/ivf_tuning.rs`, numbers in
   sized M, with recall and bytes both measured against today's, as a setting.
 - **SOAR spilling: not built**, as lucene-rust found and the lesson says. pstore's own
   boundary replication is the same idea and the engine already builds without it (M5g).
+
+## Lesson 9: warming a joining node from its peers
+
+**Not built.** The lesson asks for the post-scale-out dip measured both ways before a
+default is chosen, and that needs a multi-node deployment against a real bucket, which this
+project does not have (workstream J). The cache tier that would be warmed already survives a
+restart on its own disk (D-23, M20), and a rolling deploy, the common case, loses
+nothing. A scale-out is the case left: the new node's first queries are cold (30 to 60 times
+warm, `affinity-and-coldstart.md`). When a deployment's meter shows that dip, the design is
+the lesson's: `warm_from_peers`, cluster default off, over the existing peer transport,
+capped in bandwidth and in time before the node turns ready.
+
+## Lessons 10 and 11: confirmations
+
+Nothing built, on purpose. A consensus journal is a leader by another name, which the Never
+list forbids; the first dial for faster acknowledgement remains the flush window
+(`batched` and `durable` already are that dial). GC reads HEAD and reaps from its graveyard,
+never from a listing; M281 put every pin HEAD holds in one table so a change that weakens
+that fails a test.
+
+## Lesson 12: BYOK and lane sharing
+
+An input for workstream I, kept here so it is not rediscovered. hsearch's model at 10M
+indexes, 10% active: per-index payload keys on a shared lane cost 0.455 to 0.905 requests a
+write at 5% to 50% BYOK, against 0.487 to 1.212 with an own lane for BYOK tenants. pstore's
+lanes are per tenant today (lesson 1 kept them so), so BYOK is per tenant and costs nothing
+in lane sharing; if cohort lanes are built, a BYOK tenant takes the `tenant` setting.

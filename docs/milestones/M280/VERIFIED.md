@@ -47,3 +47,13 @@ The spec was not sent to a separate reviewer before code; the PR's review covers
      --no-fail-fast` skipping the two IPv6 tests a container cannot run: 733 integration tests
      and 134 unit tests passed, none failed. Its M128 tests in `tests/it/ingress.rs` pin the
      fixed cap through their `limits` helper.
+
+**A downside found after the merge request was opened** (CI's coverage run on #72):
+`ref_new::adversarial_writers_never_both_win` failed once with borrowing on. Four servers race
+100 `applied` writes of one tenant; under the fixed cap each holds at most 8 at once, 32 in
+all, which is exactly HEAD's list of outcomes (`OUTCOMES_KEPT`). Borrowing lets each hold up
+to 56, so an outcome can fall off the list before its writer reads it, and the write answers
+`outcome_unavailable` (applied, outcome not readable) instead of its counts. Nothing is wrong
+in the data; the report is lost. The test is pinned to the fixed cap, as the rule for existing
+tests says. ⚠️ Under borrowing, a tenant with more than 32 applied writes in flight across
+its servers can see `outcome_unavailable`; under the fixed cap only past four servers.
