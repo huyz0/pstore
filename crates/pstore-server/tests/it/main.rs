@@ -75,6 +75,7 @@ mod performance;
 mod persistent_types;
 mod pre_tokenized;
 mod progress;
+mod puts_per_write;
 mod quarantine;
 mod query_reservation;
 mod read_cache;

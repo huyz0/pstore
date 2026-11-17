@@ -20,6 +20,9 @@ Every number below is quoted from those repositories. All of them were measured 
 cloud VMs, RustFS or a filesystem stand-in, so they are **`provisional`** and relative, as
 pstore's own rules require. Links point at the branch that holds each file.
 
+**What was built from this**, lesson by lesson, and what was decided against with its numbers:
+[lessons-decisions-2026-11-17.md](lessons-decisions-2026-11-17.md).
+
 ## Summary, ranked by value
 
 | # | Lesson | Kind | Size | pstore today |
