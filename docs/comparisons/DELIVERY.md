@@ -42,7 +42,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | I | Deployment isolation, audit retention, rolling upgrades and measured recovery | Pending |
 | J | Optional embedding/reranking adapters, model versions and token accounting | Pending |
 | Evaluation | Comparable cloud architecture experiments and complete TCO model | Pending |
-| Evaluation | Reproducible per-feature CPU/allocation/quality microbenchmarks | Parser CPU/allocation campaign verified in M126; broader campaign pending |
+| Evaluation | Reproducible per-feature CPU/allocation/quality microbenchmarks | Done: the parser CPU/allocation campaign in M126; every feature the plan lists (row, column, base64 and text-only writes; BM25, filters, sparse, MaxSim, ANN, RRF, computed distance and highlights), each with dispersion, allocations and an answer digest, in [M276](../milestones/M276/VERIFIED.md): digests and allocations repeat exactly, times spread up to 43% between runs, so it is not a gate |
 
 Cloud eligibility, model credentials and operational/compliance evidence cannot be
 substituted by local tests. Each affected workstream retains its acceptance targets
