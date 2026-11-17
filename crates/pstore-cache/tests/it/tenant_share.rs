@@ -154,3 +154,13 @@ async fn a_key_of_no_tenant_is_never_capped() {
     }
     assert_eq!(view.resident_in(Class::Bulk), 32 * ENTRY as usize);
 }
+
+#[tokio::test]
+async fn a_working_set_of_exactly_the_share_stays_resident() {
+    // A quarter of 64 entries is 16: a tenant re-reading exactly 16 is at its ceiling, not
+    // past it, and every later read is a hit. One more entry and it thrashes (`rows[1]`).
+    let exact = u64::from(SHARE) * (QUOTA as u64 / ENTRY) / 1000;
+    assert_eq!(exact, 16);
+    assert_eq!(run(Some(SHARE), 1, |_| 16, 0).await, [1000]);
+    assert_eq!(run(Some(SHARE), 1, |_| 17, 0).await, [0]);
+}
