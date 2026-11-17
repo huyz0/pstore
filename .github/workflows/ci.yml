@@ -284,6 +284,8 @@ jobs:
       - run: ./scripts/check-verified.py
       - run: ./scripts/selftest-check-verified.sh
       - run: ./scripts/check-slos.py
+      - run: ./scripts/check-budgets.py
+      - run: ./scripts/check-budgets.py --self-test
       - run: ./scripts/selftest-check-slos.sh
       - run: ./scripts/selftest-coverage-scope.sh
       - run: ./scripts/selftest-coverage-mismatch.sh

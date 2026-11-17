@@ -24,6 +24,8 @@ run "scripts/check-links.sh"       ./scripts/check-links.sh
 run "scripts/build-index.py --check" py ./scripts/build-index.py --check
 run "scripts/check-verified.py"    py ./scripts/check-verified.py
 run "scripts/check-slos.py"        py ./scripts/check-slos.py
+run "scripts/check-budgets.py"     py ./scripts/check-budgets.py
+run "scripts/check-budgets.py --self-test" py ./scripts/check-budgets.py --self-test
 run "scripts/check-milestone-ids.py" py ./scripts/check-milestone-ids.py
 run "scripts/check-milestone-ids.py --self-test" py ./scripts/check-milestone-ids.py --self-test
 run "scripts/ci-changes.py --self-test" py ./scripts/ci-changes.py --self-test

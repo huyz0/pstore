@@ -17,6 +17,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use pstore_blob::{Accounted, BlobStore, Faults, Faulty, MemoryStore, OpClass};
 use pstore_server::{Api, FoldPolicy};
+use pstore_testkit::budget::{spend, spend_per};
 use pstore_types::LaneId;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -86,7 +87,7 @@ fn puts<S: BlobStore>(store: &Accounted<S>) -> u64 {
 }
 
 /// What one workload cost, in PUTs (CAS included: S3 prices a conditional PUT as a PUT).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct Cost {
     /// The first write of each tenant on this process.
     first: u64,
@@ -125,28 +126,18 @@ async fn sparse(durability: &str) -> Cost {
 async fn a_sparse_durable_write_costs_one_put_per_tenant_and_a_fold_two() {
     let cost = sparse("durable").await;
     println!("sparse durable, {TENANTS} tenants: {cost:?}");
-    assert_eq!(
-        cost,
-        Cost {
-            first: 2 * TENANTS as u64,
-            steady: TENANTS as u64,
-            fold: 2 * TENANTS as u64,
-        }
-    );
+    spend_per("durable_write_first_puts", cost.first, TENANTS as u64);
+    spend_per("durable_write_puts", cost.steady, TENANTS as u64);
+    spend_per("fold_puts", cost.fold, TENANTS as u64);
 }
 
 #[tokio::test]
 async fn a_sparse_batched_write_costs_nothing_until_its_fold() {
     let cost = sparse("batched").await;
     println!("sparse batched, {TENANTS} tenants: {cost:?}");
-    assert_eq!(
-        cost,
-        Cost {
-            first: 0,
-            steady: 0,
-            fold: 0,
-        }
-    );
+    for puts in [cost.first, cost.steady, cost.fold] {
+        spend("batched_write_requests", puts);
+    }
 }
 
 /// `n` durable writes in flight at once, each to the tenant `tenant(i)` names: the PUTs
@@ -186,7 +177,7 @@ async fn concurrent_durable_writes_to_one_tenant_share_bundles() {
     let cost = concurrent(slow(PUT), n, |_| 1).await;
     println!("{n} concurrent durable writes, one tenant, 20 ms a request: {cost} PUTs");
     // One flush in flight, every write that arrived meanwhile in the next.
-    assert!(cost <= 3, "{cost}");
+    spend("concurrent_durable_puts_one_tenant", cost);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -197,5 +188,5 @@ async fn concurrent_durable_writes_to_many_tenants_cost_one_put_each() {
     );
     // ⚠️ **The figure a cross-tenant bundle would cut**: one lane per tenant, so one PUT per
     // tenant per flush however close together they arrive.
-    assert_eq!(cost, IN_FLIGHT as u64);
+    spend_per("durable_write_puts", cost, IN_FLIGHT as u64);
 }

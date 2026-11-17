@@ -18,9 +18,15 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use pstore_blob::{Accounted, MemoryStore};
 use pstore_server::Api;
+use pstore_testkit::budget::spend;
 use pstore_types::LaneId;
 use std::sync::Arc;
 use tower::ServiceExt;
+
+/// A cost the handler reported: a count, or the test fails.
+fn n(v: &serde_json::Value) -> u64 {
+    v.as_u64().unwrap_or_else(|| panic!("not a count: {v}"))
+}
 
 fn api() -> Arc<Api<MemoryStore>> {
     Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).expect("a fencing backend")
@@ -75,19 +81,16 @@ async fn a_batched_write_costs_nothing() {
     assert_eq!(body["durable"], false);
     // ⚠️ M35: a process's FIRST write reads HEAD once, for the recorded schema, so a wrong
     // width is refused at the door rather than blocking its index until a restart.
-    assert_eq!(
-        body["cost"]["blob_reads"], 1,
-        "a first write reads HEAD once"
-    );
+    spend("batched_write_first_reads", n(&body["cost"]["blob_reads"]));
     for class in ["blob_writes", "blob_lists"] {
-        assert_eq!(body["cost"][class], 0, "a batched write issued a {class}");
+        spend("batched_write_requests", n(&body["cost"][class]));
     }
     // ⚠️ Every class, not just writes, on every write after it: a batched write that reads
     // HEAD "just to be sure" would put a blob request on the hot path of every ingest call.
     let (status, body) = send(&api, write("7", "docs", "batched", 10)).await;
     assert_eq!(status, StatusCode::OK);
     for class in ["blob_reads", "blob_writes", "blob_lists"] {
-        assert_eq!(body["cost"][class], 0, "a batched write issued a {class}");
+        spend("batched_write_requests", n(&body["cost"][class]));
     }
 }
 
@@ -100,10 +103,7 @@ async fn a_durable_write_costs_its_lane_registration_once_then_one_put() {
     // ⚠️ **Two writes on the lane's FIRST flush**: the bundle, plus the one CAS that records
     // the lane exists — one per lane lifetime, not per write. A test that only ever sees the
     // first flush cannot tell those two costs apart, which is why the second half is here.
-    assert_eq!(
-        body["cost"]["blob_writes"], 2,
-        "first flush: bundle + lane registration"
-    );
+    spend("durable_write_first_puts", n(&body["cost"]["blob_writes"]));
     // ⚠️ **2 reads since M7d, and both are once-per-process rather than per-write**: the lane
     // set, and HEAD for the index schemas. The schema read is what lets a row contradicting
     // its index be refused before it is durable -- without it the only remaining guard is the
@@ -116,18 +116,12 @@ async fn a_durable_write_costs_its_lane_registration_once_then_one_put() {
     // ⚠️ **11 since M35**: the write reads HEAD once before it buffers, for the door's schema
     // check, and the flush's resume reads it again afresh (M9j), because a batched write's
     // read may be arbitrarily old by the time it flushes.
-    assert_eq!(
-        body["cost"]["blob_reads"], 11,
-        "the write's HEAD, then the flush's lane set, HEAD, and one window of probes"
-    );
+    spend("durable_write_first_reads", n(&body["cost"]["blob_reads"]));
     assert_eq!(body["cost"]["blob_lists"], 0);
 
     let (_, body) = send(&api, write("7", "docs", "durable", 10)).await;
-    assert_eq!(
-        body["cost"]["blob_writes"], 1,
-        "thereafter: the bundle alone"
-    );
-    assert_eq!(body["cost"]["blob_reads"], 0, "thereafter: nothing is read");
+    spend("durable_write_puts", n(&body["cost"]["blob_writes"]));
+    spend("durable_write_reads", n(&body["cost"]["blob_reads"]));
 }
 
 #[tokio::test]
@@ -163,7 +157,10 @@ async fn a_memtable_query_reads_head_and_nothing_else() {
     // ⚠️ **Exactly one**: HEAD. The fresh segment lives in a private in-memory store that
     // bills nobody, so a query answered entirely from the memtable touches the tenant's
     // store once — and `exists` must not pay a second read for the same HEAD.
-    assert_eq!(body["meta"]["cost"]["blob_reads"], 1, "{body}");
+    spend(
+        "memtable_query_reads",
+        n(&body["meta"]["cost"]["blob_reads"]),
+    );
     assert_eq!(body["meta"]["cost"]["blob_lists"], 0);
 }
 
