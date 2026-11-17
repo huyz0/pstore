@@ -15,7 +15,7 @@ an in-memory store, relative only.
 | 5 | One GC test across every pin kind | Built (M281): nine pins in one table; it found an external index's codes missing from GC's live set, fixed |
 | 6 | Pin the S3 client's retry policy | Built (M282): conditional writes never retried, everything else pinned at 10 retries; no setting, see below |
 | 7 | IVF tuning from lucene-rust | Measured (M283). **None built**; the exact scan of a filter's admitted rows is the one worth building next, see below |
-| 8 | An open-loop write-throughput ladder | Built (M284): `scripts/write-ladder.sh`, see below |
+| 8 | An open-loop write-throughput ladder | Built (M284): `scripts/write-ladder.sh`. It found two ceilings, see below |
 | 9 | Warm a joining node from its peers | **Not built**: no multi-node deployment to measure the dip it is for, see below |
 | 10 | Avoid a consensus journal | Confirmed: nothing built, the Never list already excludes it |
 | 11 | Avoid inferring "latest" from a listing in GC | Confirmed: GC reaps from HEAD's own plan (M281's table pins it) |
@@ -170,6 +170,28 @@ Measured in M283 (`crates/pstore-index/examples/ivf_tuning.rs`, numbers in
   sized M, with recall and bytes both measured against today's, as a setting.
 - **SOAR spilling: not built**, as lucene-rust found and the lesson says. pstore's own
   boundary replication is the same idea and the engine already builds without it (M5g).
+
+## Lesson 8: the write ladder
+
+Built in M284 (`scripts/write-ladder.sh`, numbers in [M284's ledger](../milestones/M284/VERIFIED.md),
+`provisional`: in process, every store request 20 ms). Two ceilings, neither CPU:
+
+- **Many tenants: the server's 64 active requests.** At 2,000 durable writes a second
+  across 64 tenants, every write is acknowledged at 23 ms p50 and 24 ms p99; at 4,000, 42%
+  are refused `429`. Little's law says why: 64 slots over a 22 ms write is about 2,900 a
+  second. Bulks of 10 hit the same knee at ten times the documents. This is OpenSearch's
+  finding exactly: the in-flight cap, not the cores, is the limit, and it should scale with
+  what a request waits on. `PSTORE_REQUEST_LIMITS_CONFIG` can only lower it (M128), so
+  raising it is a decision for the owner, not taken here.
+- **One tenant: about 50 durable writes a second through the server.** At 50 a second the
+  PUTs nearly equal the writes (142 for 150) and p99 is 202 ms; at 100, a third are refused.
+  The engine alone shares bundles as designed: 100 writes 5 ms apart cost 31 PUTs (a probe run once and not kept). Through
+  the HTTP handler the same arrivals share far less, so the write path above the engine adds
+  something serial a request; not found within this milestone, and the next thing to look
+  at. A sparse durable writer is unaffected; a hot one should use `batched`.
+- **The flush does not overlap encoding with the PUT in flight**: `flush_inner` encodes under
+  the `flushing` lock. At these bundle sizes encoding is microseconds beside a 20 ms PUT, so
+  it is not either ceiling; it would matter only for bundles near the 8 MiB flush bound.
 
 ## Lesson 9: warming a joining node from its peers
 
