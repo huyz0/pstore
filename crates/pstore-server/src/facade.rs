@@ -973,16 +973,19 @@ fn attempt_of(headers: &HeaderMap) -> u64 {
 pub(crate) const ATTEMPTS_MAX: usize = 4096;
 
 /// The idempotency keys this server gave first attempts of conditional and by-filter writes
-/// (M274), by a 128-bit keyed hash of tenant, namespace and body; oldest evicted first.
+/// (M274), by two keyed 64-bit hashes of tenant, namespace and body; oldest evicted first.
 pub(crate) struct Attempts {
     hashers: [std::hash::RandomState; 2],
     inner: std::sync::Mutex<AttemptsInner>,
 }
 
+/// Two independently keyed 64-bit hashes: 128 bits, kept apart so no arithmetic packs them.
+type Digest = [u64; 2];
+
 #[derive(Default)]
 struct AttemptsInner {
-    keys: HashMap<u128, String>,
-    order: std::collections::VecDeque<u128>,
+    keys: HashMap<Digest, String>,
+    order: std::collections::VecDeque<Digest>,
 }
 
 impl Default for Attempts {
@@ -1004,13 +1007,11 @@ impl std::fmt::Debug for Attempts {
 
 impl Attempts {
     /// The body's hash: two independently keyed 64-bit hashes of tenant, namespace and bytes.
-    fn digest(&self, tenant: u128, ns: &str, body: &[u8]) -> u128 {
+    fn digest(&self, tenant: u128, ns: &str, body: &[u8]) -> Digest {
         use std::hash::BuildHasher;
-        let [a, b] = self
-            .hashers
+        self.hashers
             .each_ref()
-            .map(|s| s.hash_one((tenant, ns, body)));
-        (u128::from(a) << 64) | u128::from(b)
+            .map(|s| s.hash_one((tenant, ns, body)))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AttemptsInner> {
@@ -1020,7 +1021,7 @@ impl Attempts {
     }
 
     /// Remembers `key` for `digest`, evicting the oldest past [`ATTEMPTS_MAX`].
-    fn remember(&self, digest: u128, key: String) {
+    fn remember(&self, digest: Digest, key: String) {
         let mut m = self.lock();
         if m.keys.insert(digest, key).is_none() {
             m.order.push_back(digest);
@@ -1033,7 +1034,7 @@ impl Attempts {
         }
     }
 
-    fn key(&self, digest: u128) -> Option<String> {
+    fn key(&self, digest: Digest) -> Option<String> {
         self.lock().keys.get(&digest).cloned()
     }
 }
