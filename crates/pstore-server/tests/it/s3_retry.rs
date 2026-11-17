@@ -261,3 +261,20 @@ fn the_retry_policies_are_pinned() {
     assert_eq!(c.max_retries, 0);
     assert_eq!(c.retry_timeout, r.retry_timeout);
 }
+
+/// `retries()` is `object_store`'s own default today, so the mutant that replaces it with
+/// `Default::default()` changes nothing and is excluded in `.cargo/mutants.toml`. This is that
+/// exclusion's premise: a bump that moves the default fails here, and the mutant matters again.
+#[test]
+fn the_retry_policy_is_object_stores_default() {
+    fn default_of<T: Default>(_: &T) -> T {
+        T::default()
+    }
+    let r = pstore_server::retries();
+    let d = default_of(&r);
+    assert_eq!(r.max_retries, d.max_retries);
+    assert_eq!(r.retry_timeout, d.retry_timeout);
+    assert_eq!(r.backoff.init_backoff, d.backoff.init_backoff);
+    assert_eq!(r.backoff.max_backoff, d.backoff.max_backoff);
+    assert!((r.backoff.base - d.backoff.base).abs() < f64::EPSILON);
+}
