@@ -9,6 +9,9 @@ an in-memory store, relative only.
 | # | Lesson | Outcome |
 |---|---|---|
 | 1 | Bundle writes across tenants | Measured (M277). **Not built**: see below |
+| 2 | Request budgets that ratchet both ways | Built (M278): `docs/research/11-design/request-budgets.md`, `scripts/check-budgets.py` |
+| 3 | Concurrent one-winner probes on every backend | Built (M279): three conformance probes; RustFS and Azurite pass |
+| 4 | Weighted admission with a reserve, per-tenant cache floors | Built as two settings (M280): borrowing **on** by default, a cache share **off**; the floor not built, see below |
 
 ## Lesson 1: cross-tenant WAL bundling
 
@@ -69,3 +72,31 @@ the plan when a real deployment's meter (M109) shows `durable` WAL PUTs from spa
 are most of a bill. M277's tests then become the regression baseline, and the design starts
 from D-41 plus the reap and foreign-fold questions above, as a setting
 (`wal_bundling = tenant | cohort`, `tenant` the default) per the project's rule.
+
+## Lesson 4: admission and cache shares
+
+Both built in M280 as cluster settings, each default chosen from a deterministic measurement
+(numbers in [M280's ledger](../milestones/M280/VERIFIED.md)):
+
+- **Borrowing admission, default on.** A hot tenant alone holds 56 of 64 slots instead of 8,
+  and small tenants arriving one a step, or in bursts the reserve holds, are refused no more
+  than under the fixed cap. It loses one workload: a burst of 24 new tenants while the hot
+  tenant holds every slot it may is refused past the reserve, 160 of 240, where the fixed cap
+  refused none. Three wins of five.
+- **A per-tenant cache share, default off.** At a quarter share, a cold scan beside four small
+  tenants left them every hit, where one shared LRU left them none. But a tenant alone on a
+  node with a working set of half the quota went from every hit to none, and so did two
+  tenants of 24 entries each in a 64-entry quota. One win of four.
+
+**Not built: the cache floor.** hsearch paired a floor (16 KiB a tenant) with its ceiling. A
+floor needs eviction to skip protected entries, which is a scan of the LRU per eviction once
+many tenants sit under their floors, where every other step of the memory tier is
+O(log entries) (M28). The ceiling alone already gives the measured protection: the scanner
+cannot hold more than its share, so the rest of the quota is the small tenants'.
+
+**No per-index override, for either.** The project rule asks for a cluster default and a
+per-index override. Admission runs before the request's index is known and before any HEAD
+is read, and the cache sits beneath the engine and keys by object. Reading an index's (or a
+tenant's) setting at either place is a blob request per request, which the cost model
+forbids. Both stay cluster settings; a per-tenant weight can be carried in the signed
+credential (M127) when one is needed, at no request.

@@ -7927,6 +7927,10 @@ pub struct CacheConfig {
     pub ram: usize,
     /// `PSTORE_CACHE_DISK_BYTES`, 4 GiB by default.
     pub disk: usize,
+    /// `PSTORE_CACHE_TENANT_SHARE_PERMILLE` (M280): the most of each memory class one tenant
+    /// may hold, in thousandths; unset, none. Off by default: measured, it thrashed a tenant
+    /// alone on a node whose working set was above its share.
+    pub tenant_share: Option<u16>,
 }
 
 /// Where a server keeps its data.
@@ -8382,11 +8386,24 @@ fn cache_config(
         bytes("PSTORE_CACHE_RAM_BYTES")?,
         bytes("PSTORE_CACHE_DISK_BYTES")?,
     );
+    let share = get("PSTORE_CACHE_TENANT_SHARE_PERMILLE")
+        .map(|v| {
+            v.parse::<u16>()
+                .ok()
+                .filter(|n| (1..1000).contains(n))
+                .ok_or(ConfigError::Cache(
+                    "PSTORE_CACHE_TENANT_SHARE_PERMILLE",
+                    v,
+                    "an integer from 1 to 999",
+                ))
+        })
+        .transpose()?;
     let Some(dir) = get("PSTORE_CACHE_DIR") else {
         // ⚠️ A size with no directory is a setting that does nothing, and says nothing.
         for (var, v) in [
             ("PSTORE_CACHE_RAM_BYTES", ram),
             ("PSTORE_CACHE_DISK_BYTES", disk),
+            ("PSTORE_CACHE_TENANT_SHARE_PERMILLE", share.map(usize::from)),
         ] {
             if let Some(n) = v {
                 return Err(ConfigError::Cache(
@@ -8411,6 +8428,7 @@ fn cache_config(
         dir: dir.into(),
         ram: ram.unwrap_or(256 << 20),
         disk: disk.unwrap_or(4 << 30),
+        tenant_share: share,
     }))
 }
 
@@ -8717,7 +8735,11 @@ pub async fn open_cache<S: BlobStore>(
     };
     let identity = store_identity(store, &config.endpoint, &config.bucket).await?;
     let disk = pstore_cache::DiskConfig::new(&c.dir, config.lane.0, c.disk, identity);
-    Ok(Some(Arc::new(CacheCore::open(c.ram, disk).await)))
+    Ok(Some(Arc::new(
+        CacheCore::open(c.ram, disk)
+            .await
+            .with_tenant_share(c.tenant_share),
+    )))
 }
 
 /// Where a store keeps the id its read caches are validated by (M20).

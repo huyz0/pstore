@@ -748,7 +748,7 @@ Fleet quotas remain incomplete: `pstore-meter` exists and is not wired.
 | `PSTORE_LANE` | — | **Required.** See above. |
 | `PSTORE_BIND` | `127.0.0.1:8080` | ⚠️ The image sets `0.0.0.0:8080`; the library default is loopback, which inside a container is reachable by nothing. |
 | `PSTORE_AUTH_CONFIG` | — | Required signed-credential configuration unless explicit private mode is selected. See the authentication contract above. |
-| `PSTORE_REQUEST_LIMITS_CONFIG` | version 1's defaults | JSON, `{"version": 1, ...}`: the public ingress limits (M128, M141, M143, M212), each only lowerable, and `drain_refused_bodies` (M238, default `false`; set `true` behind a reverse proxy, see `tls` above). |
+| `PSTORE_REQUEST_LIMITS_CONFIG` | version 1's defaults | JSON, `{"version": 1, ...}`: the public ingress limits (M128, M141, M143, M212), each only lowerable, and `drain_refused_bodies` (M238, default `false`; set `true` behind a reverse proxy, see `tls` above). M280: `tenant_borrowing` (default `true`) lets a tenant at its own cap borrow a slot while more than `tenant_borrow_reserve` (default `8`) stay free; `false` is M128's fixed cap. Measured: a hot tenant alone holds 56 of 64 slots instead of 8, but a burst of more new tenants than the reserve, while it holds them, is refused past the reserve (160 of 240 in the simulation, against none fixed); set it `false` where small tenants arrive in bursts. |
 | `PSTORE_ALLOW_UNAUTHENTICATED` | `0` | Exactly `1` selects private/test mode; incompatible with key configuration. |
 | `PSTORE_BACKEND` | `memory` | `memory`, `s3` or `azure`. `memory` is durable for exactly as long as the process. |
 | `PSTORE_PROFILE` | `unprobed` | `unprobed` refuses to serve. |
@@ -770,6 +770,7 @@ Fleet quotas remain incomplete: `pstore-meter` exists and is not wired.
 | `PSTORE_CACHE_DIR` | — | Turns on the read cache (above). Refused with `PSTORE_BACKEND=memory`. |
 | `PSTORE_CACHE_RAM_BYTES` | `268435456` | The memory tier, split by class: a tenth each for centroid tables and segment metadata, the rest bulk. Refused without `PSTORE_CACHE_DIR`. |
 | `PSTORE_CACHE_DISK_BYTES` | `4294967296` | The disk tier, split the same way and preallocated. Refused without `PSTORE_CACHE_DIR`. |
+| `PSTORE_CACHE_TENANT_SHARE_PERMILLE` | unset (no share) | M280: the most of each memory class one tenant may hold, in thousandths (1 to 999); past it a tenant evicts its own entries. Measured: a cold scan beside small tenants left them every hit (none without it), but a tenant whose working set is above its share thrashes even alone on the node, so it is off by default. The disk tier is not capped. Refused without `PSTORE_CACHE_DIR`. |
 | `PSTORE_REPLICATION` | on | Exactly `off` runs no replication worker; this server still serves the job API. |
 | `PSTORE_REPLICATION_SCAN_S` | `10` | How often a worker reads one more register shard. |
 | `PSTORE_REPLICATION_TTL_S` | `120` | How long a claim lasts unrenewed; renewed every third of it. |

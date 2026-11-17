@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use pstore_blob::{BlobError, BlobStore, Capabilities, Class, Key, Precondition, PutOutcome};
 use pstore_types::CasTag;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -56,6 +56,9 @@ pub struct CacheCore {
     gates: [std::sync::Mutex<Gates>; 3],
     disk: Option<crate::disk::Tiers>,
     state: DiskState,
+    /// M280: the most of each class's memory quota one tenant may hold, in thousandths, or
+    /// `None` for no ceiling. Set once, before the core serves anything.
+    tenant_share: Option<u16>,
 }
 
 type Gates = HashMap<Id, Arc<tokio::sync::Semaphore>>;
@@ -164,7 +167,36 @@ impl CacheCore {
             gates: Default::default(),
             disk: None,
             state: DiskState::Off,
+            tenant_share: None,
         }
+    }
+
+    /// M280: caps what one tenant may hold of each class's **memory** quota at `permille`
+    /// thousandths, or lifts the cap with `None`. Past it, a tenant's admission evicts its own
+    /// least recently used entries, never another tenant's. The disk tier has no such cap.
+    ///
+    /// ⚠️ A core is shared by every tenant's view, so this is a cluster setting; a share of
+    /// 1000 or more is no cap.
+    #[must_use]
+    pub fn with_tenant_share(mut self, permille: Option<u16>) -> Self {
+        let share = permille.filter(|p| *p < 1000);
+        self.tenant_share = share;
+        for arena in [&self.pinned, &self.meta, &self.bulk] {
+            locked(arena).track = share.is_some();
+        }
+        self
+    }
+
+    /// The share [`Self::with_tenant_share`] set.
+    #[must_use]
+    pub fn tenant_share(&self) -> Option<u16> {
+        self.tenant_share
+    }
+
+    /// One tenant's ceiling in an arena of `quota` bytes, when a share is set.
+    fn ceiling(&self, quota: usize) -> Option<usize> {
+        self.tenant_share
+            .map(|p| quota / 1000 * usize::from(p) + quota % 1000 * usize::from(p) / 1000)
     }
 
     /// A core of `ram` bytes in memory, with a disk tier behind it (M20).
@@ -246,7 +278,7 @@ impl CacheCore {
         let hit = self.disk.as_ref()?.get(id, class).await?;
         if class != Class::Scan {
             let (arena, quota) = self.arena(class);
-            locked(arena).admit(id.clone(), hit.clone(), quota);
+            locked(arena).admit(id.clone(), hit.clone(), quota, self.ceiling(quota));
         }
         Some(hit)
     }
@@ -260,7 +292,7 @@ impl CacheCore {
             d.insert(&id, &bytes, class);
         }
         let (arena, quota) = self.arena(class);
-        locked(arena).admit(id, bytes, quota);
+        locked(arena).admit(id, bytes, quota, self.ceiling(quota));
     }
 
     /// [`Self::admit`] for several, under one lock of the arena (M120): a batched read's misses
@@ -281,10 +313,11 @@ impl CacheCore {
             }
         }
         let (arena, quota) = self.arena(class);
+        let ceiling = self.ceiling(quota);
         let mut state = locked(arena);
         for (id, bytes) in items {
             if bytes.len() <= quota {
-                state.admit(id, Bytes::copy_from_slice(&bytes), quota);
+                state.admit(id, Bytes::copy_from_slice(&bytes), quota, ceiling);
             }
         }
     }
@@ -497,6 +530,26 @@ struct State {
     /// The last tick handed out. A `u64` once per use: at 10^9 a second, 584 years.
     tick: u64,
     resident: usize,
+    /// M280: whether `tenants` is kept, which a tenant share turns on.
+    track: bool,
+    /// M280: each tenant's resident bytes and the ticks of its entries, oldest first. Kept only
+    /// while `track`, so a core with no share pays nothing for it.
+    tenants: HashMap<u128, (usize, BTreeSet<u64>)>,
+}
+
+/// The tenant a cached key belongs to (M280): the third segment of `{shard}/tnt/{tenant}/...`
+/// or `{shard}/wal/{tenant}/...`, every key the engine derives. Anything else is no tenant's,
+/// and no share applies to it.
+fn tenant_of(id: &Id) -> Option<u128> {
+    let key = match id {
+        Id::Range(k, ..) | Id::Whole(k) | Id::Suffix(k, _) => k,
+    };
+    let mut parts = key.split('/');
+    let _shard = parts.next()?;
+    match parts.next()? {
+        "tnt" | "wal" => parts.next()?.parse().ok(),
+        _ => None,
+    }
 }
 
 impl State {
@@ -512,14 +565,58 @@ impl State {
             if let Some(owned) = self.order.remove(&then) {
                 self.order.insert(now, owned);
             }
+            if self.track
+                && let Some((_, ticks)) = tenant_of(id).and_then(|t| self.tenants.get_mut(&t))
+            {
+                ticks.remove(&then);
+                ticks.insert(now);
+            }
         }
     }
 
-    fn admit(&mut self, id: Id, bytes: Bytes, budget: usize) {
+    /// M280: records an entry of `len` bytes at `tick` against its tenant.
+    fn hold(&mut self, id: &Id, len: usize, tick: u64) {
+        if let Some(t) = tenant_of(id).filter(|_| self.track) {
+            let (bytes, ticks) = self.tenants.entry(t).or_default();
+            *bytes = bytes.saturating_add(len);
+            ticks.insert(tick);
+        }
+    }
+
+    /// M280: forgets an entry of `len` bytes at `tick`, and a tenant left holding nothing.
+    fn release(&mut self, id: &Id, len: usize, tick: u64) {
+        if let Some(t) = tenant_of(id).filter(|_| self.track)
+            && let Some((bytes, ticks)) = self.tenants.get_mut(&t)
+        {
+            *bytes = bytes.saturating_sub(len);
+            ticks.remove(&tick);
+            if ticks.is_empty() {
+                self.tenants.remove(&t);
+            }
+        }
+    }
+
+    /// Removes the entry used at `tick`, wherever it is in the order.
+    fn evict_at(&mut self, tick: u64) {
+        if let Some(victim) = self.order.remove(&tick)
+            && let Some((gone, _)) = self.entries.remove(&victim)
+        {
+            self.resident = self.resident.saturating_sub(gone.len());
+            self.release(&victim, gone.len(), tick);
+        }
+    }
+
+    fn admit(&mut self, id: Id, bytes: Bytes, budget: usize, ceiling: Option<usize>) {
         // ⚠️ An entry larger than the whole budget is never admitted. Admitting it would
         // evict everything and then evict itself, which is a cache that holds nothing while
-        // reporting a hit rate.
-        if bytes.len() > budget {
+        // reporting a hit rate. M280: nor one larger than a tenant's ceiling, for the same
+        // reason within the tenant.
+        let tenant = ceiling.and(tenant_of(&id));
+        let limit = match tenant {
+            Some(_) => ceiling.unwrap_or(budget).min(budget),
+            None => budget,
+        };
+        if bytes.len() > limit {
             return;
         }
         let len = bytes.len();
@@ -527,16 +624,25 @@ impl State {
         if let Some((old, then)) = self.entries.insert(id.clone(), (bytes, now)) {
             self.resident = self.resident.saturating_sub(old.len());
             self.order.remove(&then);
+            self.release(&id, old.len(), then);
         }
+        self.hold(&id, len, now);
         self.order.insert(now, id);
         self.resident = self.resident.saturating_add(len);
+        // M280: a tenant past its ceiling makes room from its own entries first.
+        if let (Some(t), Some(cap)) = (tenant, ceiling) {
+            while let Some((held, ticks)) = self.tenants.get(&t)
+                && *held > cap
+                && let Some(oldest) = ticks.first().copied()
+            {
+                self.evict_at(oldest);
+            }
+        }
         while self.resident > budget {
-            let Some((_, victim)) = self.order.pop_first() else {
+            let Some(oldest) = self.order.first_key_value().map(|(tick, _)| *tick) else {
                 break;
             };
-            if let Some((gone, _)) = self.entries.remove(&victim) {
-                self.resident = self.resident.saturating_sub(gone.len());
-            }
+            self.evict_at(oldest);
         }
     }
 }
@@ -822,7 +928,7 @@ mod tests {
         let one = Bytes::from_static(b"x");
         let mut s = State::default();
         for i in 0..N {
-            s.admit(id(i), one.clone(), N);
+            s.admit(id(i), one.clone(), N, None);
             check(i);
         }
         // Touched newest first, so the oldest-touched is the newest admitted.
@@ -831,7 +937,7 @@ mod tests {
             check(i);
         }
         for i in N..2 * N {
-            s.admit(id(i), one.clone(), N);
+            s.admit(id(i), one.clone(), N, None);
             check(i);
         }
         assert_eq!(s.resident, N);
