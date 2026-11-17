@@ -29,6 +29,41 @@ async fn the_memory_store_conforms() {
     assert_eq!(r.observed.create_if_absent, Support::Supported);
 }
 
+/// M279: the probes that went red on `store`.
+async fn diverged<S: BlobStore>(store: &S) -> Vec<&'static str> {
+    let r = conformance::run(store, 279).await;
+    r.divergences().iter().map(|p| p.name).collect()
+}
+
+#[tokio::test]
+async fn a_backend_that_admits_two_racing_winners_does_not_fence() {
+    use pstore_testkit::racy::{Flaw, Racy};
+    let store = Racy::new(MemoryStore::new(), Flaw::CheckThenWrite);
+    // One writer at a time is fenced, so the single-writer probes pass: only the races see it.
+    assert_eq!(
+        diverged(&store).await,
+        ["concurrent_create_one_winner", "concurrent_cas_one_winner"]
+    );
+    let r = conformance::run(&store, 280).await;
+    assert!(
+        matches!(r.observed.cas, Support::Divergent(_)),
+        "{:?}",
+        r.observed.cas
+    );
+    assert!(matches!(r.observed.create_if_absent, Support::Divergent(_)));
+    assert!(!r.observed.admits_durable_writes());
+}
+
+#[tokio::test]
+async fn a_backend_that_errs_on_a_deleted_objects_cas_does_not_fence() {
+    use pstore_testkit::racy::{Flaw, Racy};
+    let store = Racy::new(MemoryStore::new(), Flaw::DeletedCasIsAnError);
+    assert_eq!(diverged(&store).await, ["cas_after_delete_is_lost"]);
+    let r = conformance::run(&store, 281).await;
+    assert!(matches!(r.observed.cas, Support::Divergent(_)));
+    assert_eq!(r.observed.create_if_absent, Support::Supported);
+}
+
 #[tokio::test]
 async fn suffix_read_is_measured_not_declared() {
     // M46: a store that claims suffix reads and fails them is recorded as having none.
@@ -206,7 +241,8 @@ async fn a_report_names_what_diverged() {
     let d = r.divergences();
     assert_eq!(d.len(), 1, "expected exactly one divergence, got {d:?}");
     assert!(!r.backend.is_empty());
-    assert_eq!(r.probes.len(), 10);
+    // M279: ten, and the three race probes.
+    assert_eq!(r.probes.len(), 13);
 }
 
 #[tokio::test]
@@ -218,7 +254,8 @@ async fn conformance_costs_a_bounded_number_of_requests() {
     conformance::run(&acc.as_tenant(t), 8).await;
     let total =
         acc.count(t, OpClass::Read) + acc.count(t, OpClass::Write) + acc.count(t, OpClass::Delete);
-    assert!(total < 40, "the suite issued {total} requests");
+    // M279: an exact budget since the race probes, which made it 48 (`< 40` before them).
+    pstore_testkit::budget::spend("conformance_requests", total);
     assert_eq!(
         acc.count(t, OpClass::List),
         0,
@@ -232,13 +269,28 @@ async fn the_suite_detects_each_defect_a_real_backend_actually_has() {
 
     // Until something is deliberately divergent, the suite's DETECTION is untested: it
     // could report Supported unconditionally and every other test would still pass.
-    let cases = [
-        (Defect::IgnoresCreateIfAbsent, "create_if_absent"),
-        (Defect::ShortReadsPastTheEnd, "range_past_end_is_an_error"),
-        (Defect::SuffixReturnsEverything, "suffix_read"),
-        (Defect::IgnoresDeletes, "batch_delete"),
+    //
+    // ⚠️ M279: a backend that ignores create-if-absent also admits every racer, and one that
+    // ignores deletes lets a CAS on a deleted object land, so those two defects each trip one
+    // M279 probe as well, and only that one.
+    let cases: [(Defect, &[&str]); 4] = [
+        (
+            Defect::IgnoresCreateIfAbsent,
+            &["create_if_absent", "concurrent_create_one_winner"],
+        ),
+        (
+            Defect::ShortReadsPastTheEnd,
+            &["range_past_end_is_an_error"],
+        ),
+        (Defect::SuffixReturnsEverything, &["suffix_read"]),
+        // And one that ignores deletes lets a CAS on the "deleted" object land.
+        (
+            Defect::IgnoresDeletes,
+            &["cas_after_delete_is_lost", "batch_delete"],
+        ),
     ];
-    for (i, (defect, probe)) in cases.into_iter().enumerate() {
+    for (i, (defect, probes)) in cases.into_iter().enumerate() {
+        let probe = probes[0];
         let s = Broken::new(defect);
         let r = conformance::run(&s, 900 + i as u64).await;
         assert!(!r.conforms(), "{defect:?} was reported as conforming");
@@ -250,12 +302,8 @@ async fn the_suite_detects_each_defect_a_real_backend_actually_has() {
         );
         // And exactly one probe should fail: a defect that trips several means the probes
         // are not independent, and the report would not say what is actually wrong.
-        assert_eq!(
-            r.divergences().len(),
-            1,
-            "{defect:?} tripped {:?}",
-            r.divergences()
-        );
+        let tripped: Vec<&str> = r.divergences().iter().map(|p| p.name).collect();
+        assert_eq!(tripped, probes, "{defect:?} tripped {:?}", r.divergences());
     }
 }
 

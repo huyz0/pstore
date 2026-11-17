@@ -32,3 +32,4 @@ not in the test. The service objectives these serve are in [slos.md](slos.md).
 | `engine_flush_depth` | max | 1 | its depth |
 | `cold_query_depth` | exact | 3 | a cold vector query from HEAD: HEAD, footer and centroids, the probes |
 | `api_query_depth` | exact | 4 | a query through the API, ranked and fetched, at 1, 4 or 8 segments (D-34 as M47 restated it) |
+| `conformance_requests` | exact | 48 | one run of the conformance suite, every class but LIST (M279; it was `< 40` before the race probes) |
