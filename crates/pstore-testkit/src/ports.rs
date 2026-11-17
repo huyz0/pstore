@@ -203,14 +203,21 @@ mod tests {
     fn no_pair_names_both_errors() {
         let tcp = Ports::new(1000, |_| false);
         let udp = Ports::new(1000, |_| true);
+        let udp_tries = RefCell::new(0);
         let e = search(
             || tcp.any(),
             |p| udp.on(p),
-            || Err::<(Fake, u16), _>(io::Error::other("udp any refused")),
+            || {
+                *udp_tries.borrow_mut() += 1;
+                Err::<(Fake, u16), _>(io::Error::other("udp any refused"))
+            },
             |p| tcp.on(p),
         )
         .err()
         .expect("no pair");
+        // 64 tries in all: half each way.
+        assert_eq!(tcp.offered.borrow().len(), TRIES / 2);
+        assert_eq!(*udp_tries.borrow(), TRIES / 2);
         assert!(e.contains("in 64 tries"), "{e}");
         assert!(e.contains("TCP first"), "{e}");
         assert!(e.contains("udp any refused"), "{e}");
