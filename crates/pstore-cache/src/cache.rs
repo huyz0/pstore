@@ -945,4 +945,24 @@ mod tests {
         assert!(s.entries.contains_key(&id(2 * N - 1)));
         assert!(!s.entries.contains_key(&id(0)));
     }
+
+    /// M280: a tenant's ceiling is `quota * share / 1000`, rounded down, without the product
+    /// overflowing at a quota near `usize::MAX`.
+    #[test]
+    fn a_ceiling_is_the_share_of_the_quota_rounded_down() {
+        for share in [1u16, 250, 500, 999] {
+            let core = super::CacheCore::with_quotas(0, 0, 0).with_tenant_share(Some(share));
+            for quota in [0usize, 1, 999, 1000, 1999, 65_536, 1_234_567] {
+                let exact = (quota as u128 * u128::from(share) / 1000) as usize;
+                assert_eq!(core.ceiling(quota), Some(exact), "{quota} at {share}");
+            }
+            let huge = (usize::MAX as u128 * u128::from(share) / 1000) as usize;
+            assert_eq!(
+                core.ceiling(usize::MAX),
+                Some(huge),
+                "usize::MAX at {share}"
+            );
+        }
+        assert_eq!(super::CacheCore::with_quotas(0, 0, 0).ceiling(1000), None);
+    }
 }
