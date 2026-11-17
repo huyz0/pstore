@@ -1803,3 +1803,91 @@ async fn a_keyed_facade_write_costs_the_native_pair() {
         "facade, then native"
     );
 }
+
+// M275: the facade's schema in the vendor's names, both ways.
+
+#[tokio::test]
+async fn facade_schema_lists_every_recorded_declaration() {
+    let api = applied_api(Accounted::new(MemoryStore::new()));
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/typed",
+        &key(7),
+        Some(&json!({
+            "upsert_rows": [{"id": 1, "vector": [1.0, 0.0], "title": "red fox",
+                "body": "a quick note", "path": "/a/b",
+                "at": "2026-11-17T00:00:00Z", "big": 18446744073709551615u64,
+                "seen": ["2026-11-17T00:00:00Z"], "n": 3}],
+            "distance_metric": "cosine_distance",
+            "schema": {
+                "id": "uint",
+                "vector": {"type": "[2]f16", "ann": true},
+                "title": {"type": "string", "full_text_search": true},
+                "body": {"type": "string", "full_text_search": {"stemming": true}},
+                "path": {"type": "string", "regex": true},
+                "at": "datetime",
+                "big": {"type": "uint"},
+                "seen": "[]datetime"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = call(&api, "POST", "/v1/admin/fold", &native(7), Some(&json!({}))).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, summary) = call(&api, "GET", "/v1/indexes/typed", &native(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{summary}");
+    let sc = &summary["schema"];
+    let (s, schema) = call(&api, "GET", "/v1/namespaces/typed/schema", &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{schema}");
+    let ann = json!({"distance_metric": "cosine_distance"});
+    assert_eq!(
+        schema,
+        json!({
+            "id": {"type": "uint"},
+            "vector": {"type": "[2]f16", "ann": ann},
+            "title": {"full_text_search": sc["full_text_search"]},
+            "body": {"full_text_search": sc["text_fields"]["body"]},
+            "path": {"regex": true},
+            "at": {"type": "datetime"},
+            "big": {"type": "uint"},
+            "seen": {"type": "datetime"}
+        }),
+        "{summary}"
+    );
+    assert_eq!(sc["full_text_search"]["stemming"], false, "{sc}");
+    assert_eq!(sc["text_fields"]["body"]["stemming"], true, "{sc}");
+    // metadata() answers the same schema.
+    let (s, meta) = call(&api, "GET", "/v2/namespaces/typed/metadata", &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{meta}");
+    assert_eq!(meta["schema"], schema);
+    // A named field, f32: its width and the index's metric.
+    let (s, b) = call(
+        &api,
+        "POST",
+        "/v2/namespaces/named",
+        &key(7),
+        Some(
+            &json!({"upsert_rows": [{"id": "a", "vector": [1.0, 0.0], "text": "red fox",
+            "vectors": {"img": [[0.5, 0.5, 0.5]]}}], "distance_metric": "euclidean_squared"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    call(&api, "POST", "/v1/admin/fold", &native(7), Some(&json!({}))).await;
+    let (_, summary) = call(&api, "GET", "/v1/indexes/named", &native(7), None).await;
+    let sc = &summary["schema"];
+    // The document's `text` is the index's primary text field, not a further one.
+    let text = sc["text_field"].as_str().unwrap();
+    assert!(!text.is_empty(), "{sc}");
+    let (s, schema) = call(&api, "GET", "/v1/namespaces/named/schema", &key(7), None).await;
+    assert_eq!(s, StatusCode::OK, "{schema}");
+    let ann = json!({"distance_metric": "euclidean_squared"});
+    assert_eq!(
+        schema,
+        json!({"id": {"type": "string"}, "vector": {"type": "[2]f32", "ann": ann},
+            "img": {"type": "[3]f32", "ann": ann},
+            text: {"full_text_search": sc["full_text_search"]}})
+    );
+}

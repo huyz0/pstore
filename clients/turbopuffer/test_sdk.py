@@ -81,10 +81,16 @@ class Sdk(unittest.TestCase):
         meta = ns.metadata()
         self.assertEqual(meta.approx_row_count, 3)
         self.assertTrue(ns.exists())
-        # The native schema records a type only for datetime, uuid, bytes and uint64
-        # attributes (M173), so schema() is exactly its attributes, empty here.
-        summary = native("/v1/indexes/sdk-docs")
-        self.assertEqual(ns.schema(), summary["schema"]["attributes"])
+        # M275: schema() is every declaration the native summary records, typed by the SDK.
+        summary = native("/v1/indexes/sdk-docs")["schema"]
+        schema = ns.schema()
+        self.assertEqual(sorted(schema), ["id", "title", "vector"])
+        self.assertEqual(schema["vector"].type, "[2]f32")
+        self.assertEqual(schema["vector"].ann.distance_metric, "euclidean_squared")
+        self.assertIsNone(schema["title"].type, "pstore does not record string or []string")
+        self.assertEqual(schema["title"].full_text_search.tokenizer,
+                         summary["full_text_search"]["tokenizer"])
+        self.assertEqual(schema["id"].type, {"uint64": "uint"}.get(summary["id"], summary["id"]))
 
         tpuf.namespace("sdk-more").write(upsert_rows=[{"id": 1, "vector": [1.0, 0.0]}],
                                          distance_metric="cosine_distance")

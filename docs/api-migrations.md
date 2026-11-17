@@ -1,5 +1,15 @@
 # Native API migration notes
 
+## M275: the facade's schema in the vendor's names
+
+The facade's `schema()` and `metadata()`'s `schema` now answer every declaration the native
+summary records: dense fields typed and with their ANN metric, text fields with their
+analyzer and no type, regex attributes, recorded attribute types (`uint64` as `uint`) and the
+id's kind. Before, they answered only the recorded attribute types. A facade write's
+`schema` now reads `uint`, `[]uint`, `[]uuid`, `[]datetime`, `{"type": t}` and `ann: true`,
+which it refused. Every native route is unchanged.
+[M275 verification](milestones/M275/VERIFIED.md).
+
 ## M274: a resent conditional or by-filter facade write applies at most once
 
 ⚠️ **Behaviour change, facade only.** A facade write holding a condition or a by-filter

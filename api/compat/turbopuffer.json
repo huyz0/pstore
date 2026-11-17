@@ -141,9 +141,10 @@
       "status": "served",
       "native": "GET /v1/indexes/{index}",
       "evidence": [
-        "sdk:test_the_sdk_against_the_facade"
+        "sdk:test_the_sdk_against_the_facade",
+        "rust:facade_schema_lists_every_recorded_declaration"
       ],
-      "note": "the native summary's attribute types, which name only datetime, uuid, bytes and uint64 attributes (M173): text and numeric attributes are not listed"
+      "note": "every declaration the native summary records (M275): each dense field's type and ANN metric, each text field's analyzer (with no type: pstore does not record string or []string), regex attributes, recorded datetime, uuid, bytes and uint attributes (each named as its scalar), and the id's kind. A plain string, int, float or bool attribute is not declared natively, so it is not listed"
     },
     "update_schema": {
       "route": "POST /v1/namespaces/{namespace}/schema",

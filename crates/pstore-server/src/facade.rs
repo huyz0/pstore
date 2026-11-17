@@ -230,6 +230,10 @@ fn translated_write(mut o: Map<String, Value>) -> Result<Value, ApiError> {
     }
     // A hint with no pstore meaning: pstore bounds buffered rows, not unfolded backlog.
     o.remove("disable_backpressure");
+    // M275: the vendor's type names as the native ones.
+    if let Some(schema) = o.remove("schema") {
+        out.insert("schema".into(), schema_declarations(schema));
+    }
     for (k, v) in o {
         if !WRITE_PASSED.contains(&k.as_str()) {
             return Err(bad(format!(
@@ -592,9 +596,130 @@ pub(crate) fn metadata_answer(native: &Value) -> Value {
             .unwrap_or_else(|| json!(0)),
         "created_at": native["created_at"],
         "updated_at": native["updated_at"],
-        "schema": native.pointer("/schema/attributes").cloned().unwrap_or(Value::Null),
+        "schema": schema_answer(native),
         "index": if updating { json!({"status": "updating"}) } else { json!({"status": "up-to-date"}) },
     })
+}
+
+/// A recorded attribute type's vendor name (M275): `uint64` is the vendor's `uint`; the rest
+/// share a name. A recorded type holds scalars and arrays of them alike, so it is answered as
+/// the scalar's name.
+fn vendor_type(native: &str) -> &str {
+    match native {
+        "uint64" => "uint",
+        other => other,
+    }
+}
+
+/// A vendor attribute type as the native declaration (M275): `uint` is `uint64`, and an array
+/// of a recordable kind is that kind, which holds arrays of it (M175). Any other name is
+/// passed as written, for the native write to accept or refuse.
+fn native_type(vendor: &str) -> &str {
+    match vendor.strip_prefix("[]").unwrap_or(vendor) {
+        "uint" => "uint64",
+        k @ ("uuid" | "datetime") => k,
+        _ => vendor,
+    }
+}
+
+/// The vendor's write `schema` with its type names as the native ones (M275): a name's value,
+/// or an object's `type`.
+fn schema_declarations(schema: Value) -> Value {
+    let Value::Object(m) = schema else {
+        return schema;
+    };
+    let named = |v: Value| match v {
+        Value::String(t) => Value::String(native_type(&t).to_owned()),
+        // `ann: true` is what pstore does by rule for every dense field (M198), so it asks for
+        // nothing; any other `ann` is passed, for the native write to refuse.
+        Value::Object(mut o) if o.get("ann") == Some(&Value::Bool(true)) => {
+            o.remove("ann");
+            named_object(o)
+        }
+        Value::Object(o) => named_object(o),
+        v => v,
+    };
+    Value::Object(m.into_iter().map(|(k, v)| (k, named(v))).collect())
+}
+
+/// [`schema_declarations`]' object form: `{"type": t}` alone is the native `t`, which declares
+/// a type only by its name; any other object keeps its keys, its `type` renamed.
+fn named_object(mut o: Map<String, Value>) -> Value {
+    match o.get("type") {
+        Some(Value::String(t)) if o.len() == 1 => Value::String(native_type(t).to_owned()),
+        Some(Value::String(t)) => {
+            let t = native_type(t).to_owned();
+            o.insert("type".into(), t.into());
+            Value::Object(o)
+        }
+        _ => Value::Object(o),
+    }
+}
+
+/// The native summary's `schema` as the vendor's (M275): every declaration pstore records,
+/// with no request of its own. Each dense field is typed `[N]f32`, `[N]f16` or `[N]i8` and
+/// ANN-indexed by rule (M198) under the index's metric; each text field carries its analyzer,
+/// and no `type`, since pstore does not record whether it holds strings or string arrays; a
+/// regex attribute `regex: true`; a recorded attribute its type; and `id` its kind. `null`
+/// before the first fold records a schema.
+pub(crate) fn schema_answer(native: &Value) -> Value {
+    let Some(sc) = native.get("schema").filter(|s| s.is_object()) else {
+        return Value::Null;
+    };
+    let mut out = Map::new();
+    let entry = |out: &mut Map<String, Value>, name: &str, k: &str, v: Value| {
+        if let Value::Object(e) = out
+            .entry(name.to_owned())
+            .or_insert_with(|| Value::Object(Map::new()))
+        {
+            e.insert(k.to_owned(), v);
+        }
+    };
+    let metric = sc["distance_metric"].clone();
+    let vector_type = |name: &str, width: &Value| {
+        sc.pointer(&format!("/vector_types/{name}"))
+            .cloned()
+            .unwrap_or_else(|| format!("[{width}]f32").into())
+    };
+    let dims = &sc["dims"];
+    if dims.as_u64().is_some_and(|d| d > 0) {
+        entry(&mut out, "vector", "type", vector_type("vector", dims));
+        entry(
+            &mut out,
+            "vector",
+            "ann",
+            json!({"distance_metric": metric}),
+        );
+    }
+    for (name, width) in sc["vectors"].as_object().into_iter().flatten() {
+        entry(&mut out, name, "type", vector_type(name, width));
+        entry(&mut out, name, "ann", json!({"distance_metric": metric}));
+    }
+    if let Some(text) = sc["text_field"].as_str().filter(|t| !t.is_empty()) {
+        entry(
+            &mut out,
+            text,
+            "full_text_search",
+            sc["full_text_search"].clone(),
+        );
+    }
+    for (name, fts) in sc["text_fields"].as_object().into_iter().flatten() {
+        entry(&mut out, name, "full_text_search", fts.clone());
+    }
+    for name in sc["regex"].as_array().into_iter().flatten() {
+        if let Some(name) = name.as_str() {
+            entry(&mut out, name, "regex", true.into());
+        }
+    }
+    for (name, ty) in sc["attributes"].as_object().into_iter().flatten() {
+        if let Some(ty) = ty.as_str() {
+            entry(&mut out, name, "type", vendor_type(ty).into());
+        }
+    }
+    if let Some(id) = sc["id"].as_str() {
+        entry(&mut out, "id", "type", vendor_type(id).into());
+    }
+    Value::Object(out)
 }
 
 /// A native list's answer as the vendor's.
