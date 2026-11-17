@@ -14,6 +14,7 @@ an in-memory store, relative only.
 | 4 | Weighted admission with a reserve, per-tenant cache floors | Built as two settings (M280): borrowing **on** by default, a cache share **off**; the floor not built, see below |
 | 5 | One GC test across every pin kind | Built (M281): nine pins in one table; it found an external index's codes missing from GC's live set, fixed |
 | 6 | Pin the S3 client's retry policy | Built (M282): conditional writes never retried, everything else pinned at 10 retries; no setting, see below |
+| 7 | IVF tuning from lucene-rust | Measured (M283). **None built**; the exact scan of a filter's admitted rows is the one worth building next, see below |
 
 ## Lesson 1: cross-tenant WAL bundling
 
@@ -132,3 +133,32 @@ longer hidden by up to ten retries; it reaches paths built to handle exactly tha
 The same work found a second copy of the live set, in `bury_into`, missing an external
 index's codes, so a registration that landed and then erred buried its own codes. It now
 uses M281's `head_keys`.
+
+## Lesson 7: IVF tuning
+
+Measured in M283 (`crates/pstore-index/examples/ivf_tuning.rs`, numbers in
+[M283's ledger](../milestones/M283/VERIFIED.md)), at the recall gate's scale. None built:
+
+- **Centroid ranking: not built.** At the gate's 100 centroids it is 4.7% of a query's CPU
+  with lists of 200 rows and 0.2% with pstore's default of 4,000. lucene-rust's 76% needs
+  6,437 centroids, which at pstore's list size is a 25-million-row segment. And a query's
+  CPU is microseconds beside its three round trips to the blob store. A compressed centroid
+  table already exists for the case that grows (`probe_sq8`, M97).
+- **A final unconstrained Lloyd round: not built.** On the clustered corpus it moved no
+  vector and changed no recall; on the uniform one it moved 0.7% and changed recall by under
+  half a point either way. It costs 30% more build time, and it lifts the capacity bound that
+  D-8 makes a correctness property. lucene-rust's gain (10% moved, 0.949 to 0.955) was on
+  real embeddings; it returns to the plan with a real-embedding corpus in the gate.
+- **Skipping lists with no admitted row: not built.** Below 100 admitted rows of 20,000 it
+  skips about half the lists; above 300 it skips almost none, unless the filter follows the
+  vectors. Wherever it skips much, reading the admitted rows outright is cheaper still.
+- **An exact scan of the admitted rows: not built yet, and the one worth building.** A
+  filtered dense leg reads every list's codes and int8 records, 9.28 MB a 20,000-row
+  segment at 384d. The admitted rows' own vectors are 1.5 KB each, so below about 6,000
+  admitted rows (30%) reading them is fewer bytes, and exact. It needs the mask before the
+  vectors, a fourth round on a cold query, which D-34 forbids; with the mask held by the
+  server's filter cache (M234) it needs none. So it would be: when a segment's mask is cached
+  and admits fewer rows than a byte threshold, score those rows exactly. A new query path,
+  sized M, with recall and bytes both measured against today's, as a setting.
+- **SOAR spilling: not built**, as lucene-rust found and the lesson says. pstore's own
+  boundary replication is the same idea and the engine already builds without it (M5g).
