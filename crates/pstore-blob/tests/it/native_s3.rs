@@ -344,3 +344,20 @@ async fn a_stalled_server_times_out() {
     assert!(t.elapsed() < std::time::Duration::from_secs(5));
     hold.abort();
 }
+
+#[tokio::test]
+async fn a_listing_whose_token_does_not_advance_is_an_error() {
+    let fake = FakeS3::start().await.unwrap();
+    fake.set_page(1);
+    let s = native(&fake);
+    for k in ["p/a", "p/b", "p/c"] {
+        s.put(&Key::new(k), Bytes::from_static(b"x")).await.unwrap();
+    }
+    assert_eq!(s.list_unrestricted(&Key::new("p")).await.unwrap().len(), 3);
+    fake.stuck_listing(true);
+    let r = s.list_unrestricted(&Key::new("p")).await;
+    assert!(
+        matches!(&r, Err(BlobError::Other(m)) if m.contains("did not advance")),
+        "{r:?}"
+    );
+}

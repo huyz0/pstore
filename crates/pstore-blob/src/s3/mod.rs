@@ -486,7 +486,14 @@ impl BlobStore for S3Backend {
                 return Err(status_err(&r, prefix));
             }
             out.extend(xml::list_keys(&r.body).into_iter().map(Key::new));
-            token = xml::text(&r.body, "NextContinuationToken");
+            let next = xml::text(&r.body, "NextContinuationToken");
+            // ⚠️ A token that does not advance is a server looping, not a long listing.
+            if next.is_some() && next == token {
+                return Err(BlobError::Other(
+                    "s3 list: the continuation token did not advance".to_owned(),
+                ));
+            }
+            token = next;
             if token.is_none() {
                 return Ok(out);
             }

@@ -50,6 +50,7 @@ struct State {
     /// Keys a list page holds; `None` is S3's 1000.
     page: Option<std::num::NonZeroUsize>,
     ignore_ranges: bool,
+    stuck_listing: bool,
 }
 
 /// A running fake. Dropping it stops the listener.
@@ -136,6 +137,11 @@ impl FakeS3 {
     /// Answer a ranged GET with `200` and the whole object, as HTTP permits a server to.
     pub fn ignore_ranges(&self, on: bool) {
         lock(&self.state).ignore_ranges = on;
+    }
+
+    /// Ignore `continuation-token`, so every page is the first: a server looping.
+    pub fn stuck_listing(&self, on: bool) {
+        lock(&self.state).stuck_listing = on;
     }
 
     /// The pstore client's configuration for this fake.
@@ -409,9 +415,10 @@ async fn handle(
 fn list(st: &State, uri: &http::Uri) -> Response<Full<Bytes>> {
     let prefix = query_param(uri, "prefix").unwrap_or_default();
     let delimiter = query_param(uri, "delimiter");
-    let after = query_param(uri, "continuation-token").unwrap_or_default();
+    let after = query_param(uri, "continuation-token")
+        .filter(|_| !st.stuck_listing)
+        .unwrap_or_default();
     let mut keys = Vec::new();
-    let mut prefixes = std::collections::BTreeSet::new();
     let mut next = None;
     for k in st.objects.keys() {
         if !k.starts_with(&prefix) || k.as_str() <= after.as_str() {
@@ -421,19 +428,11 @@ fn list(st: &State, uri: &http::Uri) -> Response<Full<Bytes>> {
             next = keys.last().cloned();
             break;
         }
+        // A key past the next delimiter is under a common prefix, which nothing reads:
+        // left out, as S3 leaves it out of `Contents`.
         let tail = k.get(prefix.len()..).unwrap_or_default();
-        match delimiter
-            .as_deref()
-            .and_then(|d| tail.find(d).map(|i| (i, d.len())))
-        {
-            Some((i, dl)) => {
-                prefixes.insert(
-                    k.get(..prefix.len() + i + dl)
-                        .unwrap_or_default()
-                        .to_owned(),
-                );
-            }
-            None => keys.push(k.clone()),
+        if delimiter.as_deref().is_none_or(|d| !tail.contains(d)) {
+            keys.push(k.clone());
         }
     }
     let mut out = String::from("<ListBucketResult>");
@@ -443,12 +442,6 @@ fn list(st: &State, uri: &http::Uri) -> Response<Full<Bytes>> {
             "<Contents><Key>{}</Key><LastModified>2026-11-18T00:00:00.000Z</LastModified>\
              <ETag>&quot;x&quot;</ETag><Size>{len}</Size></Contents>",
             escape(k)
-        ));
-    }
-    for p in &prefixes {
-        out.push_str(&format!(
-            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-            escape(p)
         ));
     }
     out.push_str(&format!("<KeyCount>{}</KeyCount>", keys.len()));
