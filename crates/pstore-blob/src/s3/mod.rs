@@ -51,7 +51,18 @@ impl S3Config {
     /// web-identity providers are not here (M286 scope): their absence is a refusal, never an
     /// anonymous request.
     pub fn credentials_from_env() -> Result<Credentials, BlobError> {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        Self::credentials_from(|k| std::env::var(k).ok())
+    }
+
+    /// [`Self::credentials_from_env`] over any lookup, so it is testable without touching the
+    /// process environment. An empty value counts as unset.
+    ///
+    /// # Errors
+    /// As [`Self::credentials_from_env`].
+    pub fn credentials_from(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Credentials, BlobError> {
+        let var = |k: &str| lookup(k).filter(|v| !v.is_empty());
         match (var("AWS_ACCESS_KEY_ID"), var("AWS_SECRET_ACCESS_KEY")) {
             (Some(key_id), Some(secret)) => Ok(Credentials {
                 key_id,
@@ -539,6 +550,41 @@ mod tests {
         let v = S3Backend::new(config("https://h", true), caps).unwrap();
         assert_eq!((v.host.as_str(), v.base.as_str()), ("b k.h", ""));
         assert_eq!(v.path(&Key::new("x")), "/x");
+    }
+
+    #[test]
+    fn credentials_need_both_halves_and_an_empty_value_is_unset() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        let c = S3Config::credentials_from(env(&[
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_SESSION_TOKEN", "tok"),
+        ]))
+        .unwrap();
+        assert_eq!((c.key_id.as_str(), c.secret.as_str()), ("id", "secret"));
+        assert_eq!(c.token.as_deref(), Some("tok"));
+        let c = S3Config::credentials_from(env(&[
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_SESSION_TOKEN", ""),
+        ]))
+        .unwrap();
+        assert_eq!(c.token, None);
+        assert!(S3Config::credentials_from(env(&[("AWS_ACCESS_KEY_ID", "id")])).is_err());
+        assert!(
+            S3Config::credentials_from(env(&[
+                ("AWS_ACCESS_KEY_ID", ""),
+                ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

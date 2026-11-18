@@ -312,6 +312,8 @@ async fn a_server_that_ignores_range_still_answers_the_range() {
     fake.ignore_ranges(true);
     assert_eq!(&s.get_range(&k, 2..5).await.unwrap()[..], b"234");
     assert_eq!(&s.get_suffix(&k, 3).await.unwrap()[..], b"789");
+    // Up to the last byte is inside the object.
+    assert_eq!(&s.get_range(&k, 8..10).await.unwrap()[..], b"89");
     assert_eq!(&s.get_suffix(&k, 99).await.unwrap()[..], b"0123456789");
     assert_eq!(
         s.get_range(&k, 8..12).await,
