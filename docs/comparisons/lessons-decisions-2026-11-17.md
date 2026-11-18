@@ -72,7 +72,7 @@ workload of `batched` writers, or of few tenants a node, it saves nothing.
 
 ### Decision
 
-**Not built now**, confirmed on the owner's behalf on 2026-11-18 (he delegated the call):
+**Not built now**, confirmed on the owner's behalf on 2026-11-18, the owner having delegated the call:
 record the measurement and revisit if many sparse durable writers appear. The saving is real and large, but only for one workload: many sparse
 tenants a node writing `durable`. Every such tenant can already choose `batched` and pay
 nothing, at the RPO the deploy guide states. Building a cohort lane is a change to the WAL's
