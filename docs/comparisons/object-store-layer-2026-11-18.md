@@ -139,4 +139,5 @@ in its normal dependency tree. With `s3-native` it has 58. A clean debug build o
   one store. Both modes stay tested.
 - **M288**: native Azure (SharedKey + Entra), then `object_store` leaves `pstore-server`.
   Only GCS's probe-only `gcs` feature still uses it, and it can follow. When the server no
-  longer links it, the chrono/humantime ignores match nothing and `cargo deny` says so.
+  longer links it, the humantime ignore matches nothing and `cargo deny` says so. The
+  chrono ignore also needs `parquet` (a dev-dependency, downside 6) dealt with.
