@@ -182,21 +182,21 @@ fn error(status: StatusCode, code: &str) -> Response<Full<Bytes>> {
 fn decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        let hex = b
-            .get(i + 1..i + 3)
+    // An iterator, not an index: every turn consumes a byte, so no mutant of the step can
+    // loop forever pushing into `out` (one did, and took a CI runner down with it).
+    let mut rest = b.iter();
+    while let Some(&c) = rest.next() {
+        let hex = rest
+            .as_slice()
+            .get(..2)
             .and_then(|h| std::str::from_utf8(h).ok())
             .and_then(|h| u8::from_str_radix(h, 16).ok());
         match (c, hex) {
             (b'%', Some(v)) => {
                 out.push(v);
-                i += 3;
+                rest.nth(1);
             }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
+            _ => out.push(c),
         }
     }
     String::from_utf8_lossy(&out).into_owned()
