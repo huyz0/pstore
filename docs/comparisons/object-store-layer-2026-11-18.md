@@ -124,6 +124,12 @@ in its normal dependency tree. With `s3-native` it has 58. A clean debug build o
 5. **More code to keep**: about 720 lines of client, signer and XML outside their tests, and
    440 of fake (test-only, in `pstore-testkit`, `ships = false`).
 
+6. **`parquet` also brings `chrono`**, as a dev-dependency only: M235's Parquet export
+   tests in `pstore-format` and `pstore-server` read their output back with it.
+   `cargo deny` checks dev-dependencies too, so the ignore stays until those tests
+   check their output another way, or `parquet` drops `chrono`. No shipped binary links
+   it.
+
 ## Plan
 
 - **M287**: credential chain (IMDSv2, ECS, web identity), `UNSIGNED-PAYLOAD` over TLS as
