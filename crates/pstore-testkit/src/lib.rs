@@ -7,6 +7,8 @@ pub mod broken;
 pub mod claims;
 pub mod conformance;
 pub mod depth;
+#[cfg(feature = "s3")]
+pub mod fake_s3;
 pub mod flaky;
 pub mod gated;
 pub mod no_suffix;

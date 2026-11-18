@@ -15,6 +15,8 @@ mod gcs_batch;
 mod memory;
 #[cfg(feature = "object_store")]
 mod object_store_backend;
+#[cfg(feature = "s3-native")]
+pub mod s3;
 mod scanning;
 mod store;
 mod types;
