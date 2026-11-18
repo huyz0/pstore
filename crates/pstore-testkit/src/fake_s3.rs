@@ -48,6 +48,7 @@ struct State {
     faults: VecDeque<Fault>,
     bad_signatures: u64,
     page: usize,
+    ignore_ranges: bool,
 }
 
 /// A running fake. Dropping it stops the listener.
@@ -134,6 +135,11 @@ impl FakeS3 {
         lock(&self.state).page = n.max(1);
     }
 
+    /// Answer a ranged GET with `200` and the whole object, as HTTP permits a server to.
+    pub fn ignore_ranges(&self, on: bool) {
+        lock(&self.state).ignore_ranges = on;
+    }
+
     /// The pstore client's configuration for this fake.
     #[must_use]
     pub fn config(&self) -> pstore_blob::s3::S3Config {
@@ -147,6 +153,7 @@ impl FakeS3 {
                 token: None,
             },
             virtual_hosted: false,
+            timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -371,7 +378,8 @@ async fn handle(
                 headers.push(("content-length", len.to_string()));
                 return reply(StatusCode::OK, &headers, Bytes::new());
             }
-            let Some(range) = header("range").and_then(|r| r.strip_prefix("bytes=")) else {
+            let range = header("range").filter(|_| !st.ignore_ranges);
+            let Some(range) = range.and_then(|r| r.strip_prefix("bytes=")) else {
                 return reply(StatusCode::OK, &headers, data);
             };
             let (a, b) = range.split_once('-').unwrap_or((range, ""));

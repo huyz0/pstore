@@ -191,6 +191,7 @@ fn main() {
                 token: None,
             },
             virtual_hosted: false,
+            timeout: std::time::Duration::from_secs(30),
         };
         let native: Arc<dyn BlobStore> =
             Arc::new(S3Backend::new(cfg, S3Backend::unprobed("native")).unwrap());

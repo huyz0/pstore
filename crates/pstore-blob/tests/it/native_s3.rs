@@ -298,3 +298,45 @@ async fn an_unreachable_endpoint_is_an_error_not_a_hang() {
         Err(BlobError::Other(_))
     ));
 }
+
+#[tokio::test]
+async fn a_server_that_ignores_range_still_answers_the_range() {
+    let fake = FakeS3::start().await.unwrap();
+    let s = native(&fake);
+    let k = Key::new("whole");
+    s.put(&k, Bytes::from_static(b"0123456789")).await.unwrap();
+    fake.ignore_ranges(true);
+    assert_eq!(&s.get_range(&k, 2..5).await.unwrap()[..], b"234");
+    assert_eq!(&s.get_suffix(&k, 3).await.unwrap()[..], b"789");
+    assert_eq!(&s.get_suffix(&k, 99).await.unwrap()[..], b"0123456789");
+    assert_eq!(
+        s.get_range(&k, 8..12).await,
+        Err(BlobError::RangeOutOfBounds(8..12, 10))
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_server_times_out() {
+    // Accepts, reads nothing, answers nothing.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((c, _)) = listener.accept().await {
+            held.push(c);
+        }
+    });
+    let fake = FakeS3::start().await.unwrap();
+    let mut cfg = fake.config();
+    cfg.endpoint = format!("http://{addr}");
+    cfg.timeout = std::time::Duration::from_millis(200);
+    let s = S3Backend::new(cfg, S3Backend::unprobed("x")).unwrap();
+    let t = std::time::Instant::now();
+    let r = s.get(&Key::new("k")).await;
+    assert!(
+        matches!(&r, Err(BlobError::Other(m)) if m.contains("no answer within")),
+        "{r:?}"
+    );
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    hold.abort();
+}

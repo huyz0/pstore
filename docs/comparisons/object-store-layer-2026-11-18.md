@@ -2,9 +2,9 @@
 
 **Recommendation: build our own S3 client, and later our own Azure one, and drop
 `object_store` from the server.** The S3 half exists now behind the `s3-native` feature
-(`pstore_blob::s3::S3Backend`). It is tested but not wired into the server yet. On every
-pattern pstore uses, it allocates as little as or less than `object_store`, and it never
-uses more CPU. It removes the two flagged crates and 74 others from `pstore-blob`'s tree.
+(`pstore_blob::s3::S3Backend`). It is tested but not wired into the server yet. On all seven
+patterns pstore uses, it makes 59% to 87% fewer allocations a request and allocates 13% to
+85% fewer bytes. Its CPU is lower or within noise. It removes the two flagged crates and 74 others from `pstore-blob`'s tree.
 It also takes out a retry layer that the congestion controller cannot see.
 
 PR 72's advisory ignore stays as it is: that thread owns the decision. The ignore can be
@@ -63,20 +63,27 @@ measured. It is the only cost that differs between the two clients.
 
 | pattern | requests/s, object_store → native | client CPU µs/request | allocations/request | bytes allocated/request |
 |---|---|---|---|---|
-| WAL bundle, conditional create, 16 KiB | 17,300 → 21,100 | 24.6 → 21.4 (−13%) | 136.5 → 54.8 (−60%) | 38,334 → 16,466 (**−57%**) |
-| ranged GET, 64 KiB | 27,500 → 34,500 | 25.9 → 23.3 (−10%) | 145.1 → 60.1 (−59%) | 162,476 → 140,295 (−14%) |
-| suffix GET, 64 KiB (segment footer) | 27,600 → 38,300 | 26.4 → 22.3 (−16%) | 144.1 → 59.1 (−59%) | 162,227 → 140,166 (−14%) |
-| 256 concurrent 4 KiB GETs (one query round) | 25,400 → 51,400 | 20.2 → 11.3 (**−44%**) | 145.1 → 60.1 (−59%) | 38,993 → 17,112 (**−56%**) |
-| segment PUT, 32 MiB | 18 → 18 | 11,594 → 11,156 (−4%) | 131.2 → 53.2 (−59%) | 36,846 → 16,306 (**−56%**) |
-| HEAD (`stat`) | 31,300 → 55,100 | 17.3 → 12.6 (**−27%**) | 131.0 → 49.0 (−63%) | 36,408 → 16,170 (**−56%**) |
-| delete 1,000 keys | 876 → 2,179 | 70 → 75 (+7%, one 10 ms tick of noise) | 11,649 → 1,526 (−87%) | 735,809 → 113,359 (**−85%**) |
+| WAL bundle, conditional create, 16 KiB | 18,600 → 20,000 | 20.9 → 21.0 (+1%) | 136.6 → 54.8 (−60%) | 38,338 → 16,852 (**−56%**) |
+| ranged GET, 64 KiB | 28,300 → 37,100 | 25.3 → 22.9 (−10%) | 145.1 → 60.1 (−59%) | 162,488 → 140,918 (−13%) |
+| suffix GET, 64 KiB (segment footer) | 29,000 → 39,900 | 24.8 → 20.4 (−18%) | 144.0 → 59.0 (−59%) | 162,216 → 140,534 (−13%) |
+| 256 concurrent 4 KiB GETs (one query round) | 26,600 → 49,700 | 20.0 → 11.9 (**−41%**) | 145.1 → 60.1 (−59%) | 38,990 → 17,512 (**−55%**) |
+| segment PUT, 32 MiB | 18 → 18 | 11,063 → 11,688 (+6%) | 131.1 → 53.2 (−59%) | 36,846 → 16,692 (**−55%**) |
+| HEAD (`stat`) | 32,700 → 54,100 | 17.0 → 11.8 (**−30%**) | 131.0 → 49.0 (−63%) | 36,408 → 16,553 (**−55%**) |
+| delete 1,000 keys | 900 → 2,350 | 77.5 → 62.5 (−19%) | 11,649 → 1,526 (−87%) | 735,809 → 113,742 (**−85%**) |
+
+⚠️ **The CPU column is noisy; the allocation columns are not.** CPU comes from
+`/proc/self/stat` in 10 ms ticks, on a container shared with the fake. The same pattern
+moved by up to 15% between runs: an earlier run, before the request timeout was added,
+had the WAL put at −13% and the segment PUT at −4%. The allocation counts are the same
+from run to run to within a few bytes. The request timeout added 390 bytes and no
+allocations per request.
 
 The SPEC's decision rule (criterion 4) was: at least 25% less CPU **or** 25% fewer bytes
 allocated on at least four of the seven patterns, and no more than 10% worse on any. The
-own client wins on bytes allocated in five patterns (WAL put, fan-out, segment put, HEAD,
-delete) and on CPU in two (fan-out, HEAD). No pattern is worse than the noise floor: the
-delete's +5 µs is exactly one 10 ms `/proc` tick spread over its 2,000 requests. **The rule
-holds.**
+own client allocates at least 25% fewer bytes on five patterns (WAL put, fan-out, segment
+put, HEAD, delete) and uses at least 25% less CPU on two (fan-out, HEAD). The worst CPU
+result is the segment PUT at +6%, which is hashing 32 MiB in both clients and within this
+column's noise. **The rule holds.**
 
 What these numbers mean in production: at a real S3's 10 to 30 ms a round trip, 10 µs of
 CPU is under 0.1% of a request's latency. The benefit is CPU and allocator load per node,

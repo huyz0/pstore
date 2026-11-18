@@ -38,6 +38,9 @@ pub struct S3Config {
     /// `bucket.host/key` rather than `host/bucket/key`. AWS prefers it; emulators mostly
     /// serve only the path style.
     pub virtual_hosted: bool,
+    /// One request's whole budget, connect to last body byte. ⚠️ Without one a stalled
+    /// connection holds its caller forever; `object_store`'s default is 30 s.
+    pub timeout: std::time::Duration,
 }
 
 impl S3Config {
@@ -74,6 +77,7 @@ pub struct S3Backend {
     base: String,
     region: String,
     credentials: Credentials,
+    timeout: std::time::Duration,
 }
 
 /// What came back from one request.
@@ -138,6 +142,7 @@ impl S3Backend {
             base,
             region: config.region,
             credentials: config.credentials,
+            timeout: config.timeout,
         })
     }
 
@@ -203,24 +208,29 @@ impl S3Backend {
             .header("authorization", auth)
             .body(Full::new(body))
             .map_err(|e| BlobError::Other(e.to_string()))?;
-        let resp = self
-            .http
-            .request(req)
+        let exchange = async {
+            let resp = self
+                .http
+                .request(req)
+                .await
+                .map_err(|e| BlobError::Other(format!("s3: {e}")))?;
+            let (parts, body) = resp.into_parts();
+            // ⚠️ `to_bytes` on a one-frame body hands that frame on, no copy; on several it
+            // allocates the total once.
+            let body = body
+                .collect()
+                .await
+                .map_err(|e| BlobError::Other(format!("s3 body: {e}")))?
+                .to_bytes();
+            Ok(Reply {
+                status: parts.status,
+                headers: parts.headers,
+                body,
+            })
+        };
+        tokio::time::timeout(self.timeout, exchange)
             .await
-            .map_err(|e| BlobError::Other(format!("s3: {e}")))?;
-        let (parts, body) = resp.into_parts();
-        // ⚠️ `to_bytes` on a one-frame body hands that frame on, no copy; on several it
-        // allocates the total once.
-        let body = body
-            .collect()
-            .await
-            .map_err(|e| BlobError::Other(format!("s3 body: {e}")))?
-            .to_bytes();
-        Ok(Reply {
-            status: parts.status,
-            headers: parts.headers,
-            body,
-        })
+            .map_err(|_| BlobError::Other(format!("s3: no answer within {:?}", self.timeout)))?
     }
 
     async fn send_key(
@@ -233,12 +243,13 @@ impl S3Backend {
         self.send(method, &self.path(key), &[], extra, body).await
     }
 
-    /// A ranged read: `want` bytes, or `RangeOutOfBounds`.
+    /// A ranged read: `range`, or with `None` the last `suffix` bytes.
     async fn ranged(
         &self,
         key: &Key,
         header: &str,
         range: Option<Range<u64>>,
+        suffix: u64,
     ) -> Result<Bytes, BlobError> {
         let r = self
             .send_key(Method::GET, key, &[("range", header)], Bytes::new())
@@ -254,7 +265,14 @@ impl S3Backend {
                     }
                     Ok(r.body.slice(range.start as usize..range.end as usize))
                 }
-                None => Ok(r.body),
+                // A suffix: the last `n` bytes of what came back.
+                None => {
+                    let skip = r
+                        .body
+                        .len()
+                        .saturating_sub(usize::try_from(suffix).unwrap_or(usize::MAX));
+                    Ok(r.body.slice(skip..))
+                }
             },
             StatusCode::RANGE_NOT_SATISFIABLE => {
                 let len = content_range_total(&r.headers).unwrap_or(0);
@@ -317,7 +335,7 @@ impl BlobStore for S3Backend {
             return Ok(Bytes::new());
         }
         let header = format!("bytes={}-{}", range.start, range.end - 1);
-        let got = self.ranged(key, &header, Some(range.clone())).await?;
+        let got = self.ranged(key, &header, Some(range.clone()), 0).await?;
         // ⚠️ A `206` may carry fewer bytes than asked for when the range overruns the object:
         // a short read, which the trait makes an error (the conformance suite's finding).
         if got.len() as u64 != range.end - range.start {
@@ -330,7 +348,7 @@ impl BlobStore for S3Backend {
         if n == 0 {
             return Ok(Bytes::new());
         }
-        self.ranged(key, &format!("bytes=-{n}"), None).await
+        self.ranged(key, &format!("bytes=-{n}"), None, n).await
     }
 
     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
@@ -495,6 +513,7 @@ mod tests {
                 token: None,
             },
             virtual_hosted,
+            timeout: std::time::Duration::from_secs(1),
         }
     }
 
