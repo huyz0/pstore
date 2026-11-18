@@ -171,7 +171,10 @@ struct Server {
     url: String,
 }
 
-async fn start(store: &MemoryStore, lane: u64) -> (Server, tokio::net::TcpListener) {
+async fn start(
+    store: &MemoryStore,
+    lane: u64,
+) -> (Server, (tokio::net::TcpListener, std::net::UdpSocket)) {
     let view = Delayed {
         inner: store.clone(),
         delay_ms: Arc::default(),
@@ -182,8 +185,10 @@ async fn start(store: &MemoryStore, lane: u64) -> (Server, tokio::net::TcpListen
         exact_scan_threshold: 1_000,
         ..pstore_index::cluster::Params::default()
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("https://{}", listener.local_addr().unwrap());
+    // Both halves of a peer's port at once (M273): binding UDP to TCP's port later could
+    // find it taken.
+    let listener = pstore_testkit::ports::same_port_tokio();
+    let url = format!("https://{}", listener.0.local_addr().unwrap());
     (
         Server {
             api,
@@ -296,8 +301,7 @@ async fn split_bench() {
             }))
             .unwrap();
     }
-    for (s, l) in servers.iter().zip(listeners) {
-        let udp = std::net::UdpSocket::bind(l.local_addr().unwrap()).unwrap();
+    for (s, (l, udp)) in servers.iter().zip(listeners) {
         tokio::spawn(pstore_server::serve_peers(
             Arc::clone(&s.api),
             l,

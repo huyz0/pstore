@@ -10,5 +10,6 @@ pub mod depth;
 pub mod flaky;
 pub mod gated;
 pub mod no_suffix;
+pub mod ports;
 pub mod sim;
 pub mod sweep;
