@@ -23,7 +23,8 @@ bytes        = "1"
 tokio        = { version = "1", features = ["sync", "time", "rt", "macros"] }
 async-trait = "0.1.92"
 thiserror    = "2"
+# M279: the race probes start their writers at once, in one task.
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

@@ -49,7 +49,20 @@ pub struct RequestLimits {
     shape: shape::Shape,
     /// M238: read and discard what a refusal left of its body, so a proxy relays the refusal.
     drain_refused_bodies: bool,
+    /// M280: while more than this many server slots would stay free, a tenant at its own cap
+    /// may borrow another. `None` is M128's fixed cap.
+    tenant_borrow_reserve: Option<usize>,
 }
+
+/// The cluster default for [`RequestLimits::tenant_borrow_reserve`] (M280), chosen from the
+/// admission simulation in `ingress/tests.rs`: borrowing won three of its five workloads, tied
+/// one and lost one (a burst of small tenants larger than the reserve). See
+/// `docs/milestones/M280/VERIFIED.md`.
+const DEFAULT_BORROW_RESERVE: Option<usize> = Some(8);
+
+/// The reserve `tenant_borrowing: true` means when no reserve is given (M280): a tenant's own
+/// default cap, so a tenant arriving next finds a full share free.
+const BORROW_RESERVE_WHEN_ON: usize = 8;
 
 impl Default for RequestLimits {
     /// Version 1: 2 MiB bodies, 64 active requests, 8 per tenant, a 128 MiB body pool and a
@@ -76,6 +89,7 @@ impl Default for RequestLimits {
                 string_bytes: 256 << 10,
             },
             drain_refused_bodies: false,
+            tenant_borrow_reserve: DEFAULT_BORROW_RESERVE,
         }
     }
 }
@@ -202,6 +216,15 @@ impl RequestLimitsBuilder {
         self
     }
 
+    /// M280: lets a tenant at its own cap borrow a server slot while more than `reserve` would
+    /// stay free; `None` keeps M128's fixed cap. A reserve of `active_requests` or more never
+    /// lets anyone borrow, which is the fixed cap too.
+    #[must_use]
+    pub fn tenant_borrow_reserve(mut self, reserve: Option<usize>) -> Self {
+        self.0.tenant_borrow_reserve = reserve;
+        self
+    }
+
     /// Whether a refused request's unread body is read and discarded, up to `body_bytes` and
     /// within the body-read deadline, before the refusal is sent (M238). Off by default: off,
     /// a refused body is never polled (M128).
@@ -306,6 +329,10 @@ struct Config {
     object_members: Option<u64>,
     string_bytes: Option<u64>,
     drain_refused_bodies: Option<bool>,
+    /// M280: `false` keeps the fixed per-tenant cap; `true` lets a tenant borrow.
+    tenant_borrowing: Option<bool>,
+    /// M280: the slots borrowing leaves free, which also turns it on.
+    tenant_borrow_reserve: Option<u64>,
 }
 
 impl RequestLimits {
@@ -363,6 +390,11 @@ impl RequestLimits {
             .object_members(size("object_members", c.object_members, d.shape.members)?)
             .string_bytes(size("string_bytes", c.string_bytes, d.shape.string_bytes)?)
             .drain_refused_bodies(c.drain_refused_bodies.unwrap_or(d.drain_refused_bodies))
+            .tenant_borrow_reserve(borrowing(
+                c.tenant_borrowing,
+                c.tenant_borrow_reserve,
+                d.tenant_borrow_reserve,
+            )?)
             .build()
     }
 
@@ -388,6 +420,12 @@ impl RequestLimits {
     #[must_use]
     pub fn string_bytes(&self) -> usize {
         self.shape.string_bytes
+    }
+
+    /// The free slots a borrowing tenant leaves (M280), or `None` for the fixed cap.
+    #[must_use]
+    pub fn tenant_borrow_reserve(&self) -> Option<usize> {
+        self.tenant_borrow_reserve
     }
 
     /// Whether a refused request's unread body is read and discarded (M238).
@@ -596,13 +634,22 @@ impl Ingress {
         }
     }
 
+    /// M280: whether a tenant past its own cap may take one more slot with `active` admitted:
+    /// only while more than the reserve stays free after it, so a tenant arriving next finds
+    /// the reserve.
+    fn borrows(&self, active: usize) -> bool {
+        self.limits
+            .tenant_borrow_reserve
+            .is_some_and(|reserve| self.limits.active.saturating_sub(active) > reserve)
+    }
+
     /// A permit for `key`, or `None` at once when any capacity is spent. Never waits.
     fn admit(self: &Arc<Self>, key: Key) -> Option<Permit> {
         let bytes = self.limits.body_bytes;
         let mut c = self.lock();
         let mine = c.tenants.get(&key).copied().unwrap_or(0);
         if c.active >= self.limits.active
-            || mine >= self.limits.tenant_active
+            || (mine >= self.limits.tenant_active && !self.borrows(c.active))
             || c.bytes + bytes > self.limits.reserved_body_bytes
         {
             return None;
@@ -714,6 +761,24 @@ async fn collect(body: Body, max: usize, timeout: Duration) -> Result<bytes::Byt
         Ok(Err(e)) if e.is::<LengthLimitError>() => Err(too_large()),
         Ok(Err(_)) => Err(ApiError::bad_request("the request body could not be read")),
     }
+}
+
+/// The configured borrowing mode (M280): `tenant_borrowing: false` wins and keeps the fixed
+/// cap; a reserve turns it on; `true` alone means [`BORROW_RESERVE_WHEN_ON`]; neither, the
+/// default.
+fn borrowing(
+    on: Option<bool>,
+    reserve: Option<u64>,
+    default: Option<usize>,
+) -> Result<Option<usize>, LimitsError> {
+    Ok(match (on, reserve) {
+        (Some(false), _) => None,
+        (_, Some(r)) => Some(
+            usize::try_from(r).map_err(|_| LimitsError::AboveDefault("tenant_borrow_reserve"))?,
+        ),
+        (Some(true), None) => Some(default.unwrap_or(BORROW_RESERVE_WHEN_ON)),
+        (None, None) => default,
+    })
 }
 
 /// The ingress layer: after authentication and the route's scope, before the handler.

@@ -8,3 +8,4 @@
 
 mod cache;
 mod disk;
+mod tenant_share;

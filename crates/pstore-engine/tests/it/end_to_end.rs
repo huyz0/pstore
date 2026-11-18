@@ -13,6 +13,7 @@
 use pstore_blob::{Accounted, MemoryStore, OpClass};
 use pstore_engine::Engine;
 use pstore_format::{Document, Filter, Value};
+use pstore_testkit::budget::spend;
 use pstore_testkit::depth::DepthCounting;
 use pstore_types::{LaneId, TenantId};
 use std::sync::Arc;
@@ -120,17 +121,13 @@ async fn the_whole_flow_stays_inside_its_request_budget() {
         // which the resume now makes. Its depth is bounded too, and unchanged: HEAD, then the
         // probes beside the registry's read, then a new lane's CAS, then the PUT. At most,
         // because the counter merges rounds that overlap.
-        assert_eq!(
-            s.requests(),
-            if batch == 0 { 12 } else { 1 },
-            "a batch cost {} requests",
-            s.requests()
-        );
-        assert!(
-            s.depth() <= if batch == 0 { 4 } else { 1 },
-            "depth {}",
-            s.depth()
-        );
+        if batch == 0 {
+            spend("engine_first_flush_requests", s.requests());
+            spend("engine_first_flush_depth", s.depth());
+        } else {
+            spend("engine_flush_requests", s.requests());
+            spend("engine_flush_depth", s.depth());
+        }
         e.fold().await.unwrap();
     }
 

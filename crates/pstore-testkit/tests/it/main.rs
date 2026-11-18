@@ -6,6 +6,7 @@
 //! here as a module. Benches and the tests scripts run by name (`--test <name>`) stay
 //! separate binaries beside this directory.
 
+mod budget;
 mod class_forwarding;
 mod conformance;
 mod depth;

@@ -14,7 +14,7 @@
 # the weakest rung on the gate-design ladder this one can occupy. Named, not hidden.
 #
 # ⚠️ **Layer 2 tests plumbing** (D-99). `Supported` in the matrix means an emulator answered
-# ten probes correctly. It says nothing about S3, GCS or Azure.
+# thirteen probes correctly. It says nothing about S3, GCS or Azure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib/py.sh

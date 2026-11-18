@@ -7,8 +7,7 @@
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, ObjectStoreBackend};
 use pstore_server::{
-    Api, Backend, Config, Profile, SourceConfig, azure_store, open_cache, s3_capabilities,
-    serve_folding,
+    Api, Backend, Config, Profile, SourceConfig, azure_store, open_cache, s3_store, serve_folding,
 };
 use std::sync::Arc;
 
@@ -101,11 +100,7 @@ fn s3(config: &Config) -> Result<impl BlobStore, Box<dyn std::error::Error>> {
     )
 }
 
-/// One S3-compatible bucket.
-///
-/// ⚠️ The credentials are applied only when the operator gave both. Unset, `AmazonS3Builder`
-/// uses its own provider chain -- which is how an instance profile or a service-account role
-/// works, and the only way this image is usable on EC2 or EKS. `Config` decides; this applies.
+/// One S3-compatible bucket: [`pstore_server::s3_store`].
 fn bucket(
     endpoint: &str,
     name: &str,
@@ -113,21 +108,7 @@ fn bucket(
     region: &str,
     profile: Profile,
 ) -> Result<ObjectStoreBackend, Box<dyn std::error::Error>> {
-    let mut builder = object_store::aws::AmazonS3Builder::new()
-        .with_endpoint(endpoint)
-        .with_bucket_name(name)
-        .with_allow_http(true)
-        .with_region(region);
-    if let Some((key, secret)) = credentials {
-        builder = builder
-            .with_access_key_id(key)
-            .with_secret_access_key(secret);
-    }
-    let s3 = builder.build()?;
-    Ok(ObjectStoreBackend::new(
-        Arc::new(s3),
-        s3_capabilities(endpoint, profile),
-    ))
+    Ok(s3_store(endpoint, name, credentials, region, profile)?)
 }
 
 /// A replication source (M22): read only, so it needs no fencing and no profile.

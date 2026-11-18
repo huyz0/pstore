@@ -16,6 +16,9 @@ Latency objectives are therefore `blocked` on M0b, each with the measurement it 
 
 ⚠️ **D-34 restated by M47** (the project owner's decision, 2026-10-04): a cold user query ranks in at most three sequential round trips, and fetches the rows it ranked in at most one more. `rerank: exact`, an opt-in, adds a round to the ranking and is outside the bound. This weakens the written bound by decision, not to make a check pass: the code has asserted four since M7c. See [M47](../../milestones/M47/SPEC.md).
 
+Request counts that tests assert are read from one table, [request-budgets.md](request-budgets.md),
+where an `exact` row also fails when a count comes in below it (M278).
+
 | Objective | Value | Status | Gate |
 |---|---|---|---|
 | A write batch costs one write-class request, whatever it carries | 1 PUT | enforced | `the_whole_flow_stays_inside_its_request_budget` |

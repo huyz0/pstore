@@ -101,12 +101,10 @@ async fn a_query_costs_four_round_trips_however_many_segments_it_has() {
     let (four, _) = depth_at(4).await;
     let (eight, reqs) = depth_at(8).await;
 
-    assert_eq!(one, 4, "one segment: {one}");
-    assert_eq!(
-        (four, eight),
-        (4, 4),
-        "depth grew with the segment count: 1 -> {one}, 4 -> {four}, 8 -> {eight}"
-    );
+    // M278: each read from the table, which also fails below it.
+    for depth in [one, four, eight] {
+        pstore_testkit::budget::spend("api_query_depth", depth);
+    }
     // Requests may grow with segments -- width is free -- and depth may not.
     assert!(
         reqs >= eight,
