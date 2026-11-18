@@ -231,7 +231,8 @@ fn verified(parts: &http::request::Parts, body: &[u8]) -> bool {
     let (Some(date), Some(payload)) = (header("x-amz-date"), header("x-amz-content-sha256")) else {
         return false;
     };
-    if payload != "UNSIGNED-PAYLOAD" && payload != sign::sha256_hex(body) {
+    // Neither client sends `UNSIGNED-PAYLOAD` yet (M287 may), so the fake does not take it.
+    if payload != sign::sha256_hex(body) {
         return false;
     }
     let host = parts.uri.authority().map(ToString::to_string);

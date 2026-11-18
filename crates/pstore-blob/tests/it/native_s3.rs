@@ -72,6 +72,61 @@ async fn a_bad_secret_is_refused_by_the_fake() {
     assert_eq!(fake.bad_signatures(), 1);
 }
 
+/// A request signed correctly over a hash its body does not have: the fake must check the
+/// body, not only the signature, or a client that hashed the wrong bytes would pass.
+#[tokio::test]
+async fn a_body_that_does_not_match_its_signed_hash_is_refused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fake = FakeS3::start().await.unwrap();
+    let addr = fake.endpoint().trim_start_matches("http://").to_owned();
+    let send = |body: &'static str, declared: &'static str| {
+        let addr = addr.clone();
+        async move {
+            let date = "20261118T000000Z";
+            let hash = pstore_blob::s3::sign::sha256_hex(declared.as_bytes());
+            let path = format!("/{BUCKET}/k");
+            let auth = pstore_blob::s3::sign::authorization(
+                &pstore_blob::s3::sign::Credentials {
+                    key_id: KEY_ID.to_owned(),
+                    secret: SECRET.to_owned(),
+                    token: None,
+                },
+                &pstore_blob::s3::sign::Scope {
+                    amz_date: date,
+                    region: REGION,
+                    service: "s3",
+                },
+                &pstore_blob::s3::sign::Request {
+                    method: "PUT",
+                    path: &path,
+                    query: &[],
+                    headers: &[
+                        ("host", &addr),
+                        ("x-amz-content-sha256", &hash),
+                        ("x-amz-date", date),
+                    ],
+                    payload_sha256: &hash,
+                },
+            );
+            let mut tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            let req = format!(
+                "PUT {path} HTTP/1.1\r\nhost: {addr}\r\nx-amz-content-sha256: {hash}\r\n\
+                 x-amz-date: {date}\r\nauthorization: {auth}\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            tcp.write_all(req.as_bytes()).await.unwrap();
+            let mut answer = String::new();
+            tcp.read_to_string(&mut answer).await.unwrap();
+            answer.lines().next().unwrap_or_default().to_owned()
+        }
+    };
+    // The control: the same request with the body it declares is accepted.
+    assert!(send("abc", "abc").await.contains(" 200"), "control refused");
+    assert!(send("abd", "abc").await.contains(" 403"));
+    assert_eq!(fake.bad_signatures(), 1);
+}
+
 #[tokio::test]
 async fn a_503_is_slowdown_after_one_request() {
     let fake = FakeS3::start().await.unwrap();
