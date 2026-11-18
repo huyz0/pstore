@@ -47,7 +47,8 @@ struct State {
     requests: Vec<(Method, String)>,
     faults: VecDeque<Fault>,
     bad_signatures: u64,
-    page: usize,
+    /// Keys a list page holds; `None` is S3's 1000.
+    page: Option<std::num::NonZeroUsize>,
     ignore_ranges: bool,
 }
 
@@ -76,10 +77,7 @@ impl FakeS3 {
     pub async fn start_on(port: u16) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
         let addr = listener.local_addr()?;
-        let state = Arc::new(Mutex::new(State {
-            page: 1000,
-            ..State::default()
-        }));
+        let state = Arc::new(Mutex::new(State::default()));
         let shared = Arc::clone(&state);
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
@@ -132,7 +130,7 @@ impl FakeS3 {
 
     /// Keys a list page holds (1000 by default, as S3).
     pub fn set_page(&self, n: usize) {
-        lock(&self.state).page = n.max(1);
+        lock(&self.state).page = std::num::NonZeroUsize::new(n.max(1));
     }
 
     /// Answer a ranged GET with `200` and the whole object, as HTTP permits a server to.
@@ -179,21 +177,20 @@ fn decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
-    while i < b.len() {
+    while let Some(&c) = b.get(i) {
         let hex = b
             .get(i + 1..i + 3)
             .and_then(|h| std::str::from_utf8(h).ok())
             .and_then(|h| u8::from_str_radix(h, 16).ok());
-        match (b.get(i), hex) {
-            (Some(b'%'), Some(v)) => {
+        match (c, hex) {
+            (b'%', Some(v)) => {
                 out.push(v);
                 i += 3;
             }
-            (Some(&c), _) => {
+            _ => {
                 out.push(c);
                 i += 1;
             }
-            (None, _) => break,
         }
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -420,7 +417,7 @@ fn list(st: &State, uri: &http::Uri) -> Response<Full<Bytes>> {
         if !k.starts_with(&prefix) || k.as_str() <= after.as_str() {
             continue;
         }
-        if keys.len() == st.page {
+        if keys.len() == st.page.map_or(1000, std::num::NonZeroUsize::get) {
             next = keys.last().cloned();
             break;
         }

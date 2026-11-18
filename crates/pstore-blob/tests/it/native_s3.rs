@@ -270,6 +270,10 @@ async fn a_batch_delete_is_one_request_and_a_listing_reads_every_page() {
         before + 3,
         "an empty or over-cap batch sent a request"
     );
+    // Exactly at the cap is one request, not a refusal.
+    let at_cap: Vec<Key> = (0..1000).map(|i| Key::new(format!("k{i}"))).collect();
+    s.delete_batch(&at_cap).await.unwrap();
+    assert_eq!(fake.requests().len(), before + 4);
     fake.fail_next(Fault {
         status: 503,
         code: "SlowDown",
