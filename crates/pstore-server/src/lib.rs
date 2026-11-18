@@ -7927,6 +7927,10 @@ pub struct CacheConfig {
     pub ram: usize,
     /// `PSTORE_CACHE_DISK_BYTES`, 4 GiB by default.
     pub disk: usize,
+    /// `PSTORE_CACHE_TENANT_SHARE_PERMILLE` (M280): the most of each memory class one tenant
+    /// may hold, in thousandths; unset, none. Off by default: measured, it thrashed a tenant
+    /// alone on a node whose working set was above its share.
+    pub tenant_share: Option<u16>,
 }
 
 /// Where a server keeps its data.
@@ -8009,6 +8013,71 @@ pub fn s3_capabilities(endpoint: &str, profile: Profile) -> pstore_blob::Capabil
     }
 }
 
+/// One S3-compatible bucket, with `profile`'s capabilities (M282: moved from `main.rs`, so its
+/// retry policy is reachable from a test).
+///
+/// ⚠️ The credentials are applied only when the operator gave both. Unset, `AmazonS3Builder`
+/// uses its own provider chain -- which is how an instance profile or a service-account role
+/// works, and the only way this image is usable on EC2 or EKS. `Config` decides; this applies.
+///
+/// # Errors
+/// The client's refusal to build.
+pub fn s3_store(
+    endpoint: &str,
+    name: &str,
+    credentials: Option<&(String, String)>,
+    region: &str,
+    profile: Profile,
+) -> Result<pstore_blob::ObjectStoreBackend, object_store::Error> {
+    let mut builder = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(name)
+        .with_allow_http(true)
+        .with_region(region);
+    if let Some((key, secret)) = credentials {
+        builder = builder
+            .with_access_key_id(key)
+            .with_secret_access_key(secret);
+    }
+    let conditional = builder.clone().with_retry(conditional_retries()).build()?;
+    Ok(pstore_blob::ObjectStoreBackend::new(
+        std::sync::Arc::new(builder.with_retry(retries()).build()?),
+        s3_capabilities(endpoint, profile),
+    )
+    .with_conditional(std::sync::Arc::new(conditional)))
+}
+
+/// The retry policy of every request but a conditional write (M282), set here rather than
+/// inherited: `object_store` 0.14's own defaults, written down so a dependency bump cannot
+/// change them unseen. Ten retries with backoff from 100 ms to 15 s, within 3 minutes, of
+/// a `5xx`, a `429`, a `408` or a connection error. Reads, unconditional PUTs (a segment, a
+/// sidecar: written once at a derived key) and deletes are idempotent, so a repeat is safe.
+#[must_use]
+pub fn retries() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        backoff: object_store::BackoffConfig {
+            init_backoff: std::time::Duration::from_millis(100),
+            max_backoff: std::time::Duration::from_secs(15),
+            base: 2.0,
+        },
+        max_retries: 10,
+        retry_timeout: std::time::Duration::from_secs(180),
+    }
+}
+
+/// The retry policy of a conditional write (M282): **none**. A `5xx` does not say the write
+/// did not land, and a repeat of one that did fails its own precondition. hsearch retries a
+/// write only when no connection was made; `object_store` cannot tell that apart per request
+/// once retries are on, so this gives up the connect-error retry too, and the engine's own
+/// protocol (M17's read-back, a fold's next tick, a client's retry) takes its place.
+#[must_use]
+pub fn conditional_retries() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        max_retries: 0,
+        ..retries()
+    }
+}
+
 /// The capabilities an Azure account's profile claims (M46): S3's rule, under an
 /// `azure(account)` name. What the Azure client itself does -- no suffix reads, batches of
 /// 256 -- is [`pstore_blob::ObjectStoreBackend::azure`]'s, whatever the profile.
@@ -8039,10 +8108,12 @@ pub fn azure_store(
             .with_endpoint(endpoint.clone())
             .with_allow_http(true);
     }
+    let conditional = builder.clone().with_retry(conditional_retries()).build()?;
     Ok(pstore_blob::ObjectStoreBackend::azure(
-        std::sync::Arc::new(builder.build()?),
+        std::sync::Arc::new(builder.with_retry(retries()).build()?),
         azure_capabilities(&config.account, profile),
-    ))
+    )
+    .with_conditional(std::sync::Arc::new(conditional)))
 }
 
 /// Why a process could not read its configuration.
@@ -8382,11 +8453,24 @@ fn cache_config(
         bytes("PSTORE_CACHE_RAM_BYTES")?,
         bytes("PSTORE_CACHE_DISK_BYTES")?,
     );
+    let share = get("PSTORE_CACHE_TENANT_SHARE_PERMILLE")
+        .map(|v| {
+            v.parse::<u16>()
+                .ok()
+                .filter(|n| (1..1000).contains(n))
+                .ok_or(ConfigError::Cache(
+                    "PSTORE_CACHE_TENANT_SHARE_PERMILLE",
+                    v,
+                    "an integer from 1 to 999",
+                ))
+        })
+        .transpose()?;
     let Some(dir) = get("PSTORE_CACHE_DIR") else {
         // ⚠️ A size with no directory is a setting that does nothing, and says nothing.
         for (var, v) in [
             ("PSTORE_CACHE_RAM_BYTES", ram),
             ("PSTORE_CACHE_DISK_BYTES", disk),
+            ("PSTORE_CACHE_TENANT_SHARE_PERMILLE", share.map(usize::from)),
         ] {
             if let Some(n) = v {
                 return Err(ConfigError::Cache(
@@ -8411,6 +8495,7 @@ fn cache_config(
         dir: dir.into(),
         ram: ram.unwrap_or(256 << 20),
         disk: disk.unwrap_or(4 << 30),
+        tenant_share: share,
     }))
 }
 
@@ -8717,7 +8802,11 @@ pub async fn open_cache<S: BlobStore>(
     };
     let identity = store_identity(store, &config.endpoint, &config.bucket).await?;
     let disk = pstore_cache::DiskConfig::new(&c.dir, config.lane.0, c.disk, identity);
-    Ok(Some(Arc::new(CacheCore::open(c.ram, disk).await)))
+    Ok(Some(Arc::new(
+        CacheCore::open(c.ram, disk)
+            .await
+            .with_tenant_share(c.tenant_share),
+    )))
 }
 
 /// Where a store keeps the id its read caches are validated by (M20).

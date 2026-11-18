@@ -142,6 +142,119 @@ async fn probe_aba_resistance<S: BlobStore>(s: &S, run: u64) -> Support {
     }
 }
 
+/// How many writers each race probe starts at once (M279): hsearch's provider suite uses 8.
+pub const RACERS: usize = 8;
+
+/// The verdict on one race: exactly one attempt won, every other lost **as a conflict** (412,
+/// or a 409 the caller retries into one), and the object holds the winner's body.
+async fn one_winner<S: BlobStore>(
+    s: &S,
+    key: &Key,
+    bodies: &[Bytes],
+    results: Vec<Result<pstore_blob::PutOutcome, CasError>>,
+) -> Support {
+    let mut winners = Vec::new();
+    for (i, r) in results.into_iter().enumerate() {
+        match r {
+            Ok(_) => winners.push(i),
+            Err(CasError::Lost | CasError::Contended) => {}
+            Err(CasError::Io(e)) => {
+                return Support::Divergent(format!(
+                    "a losing writer got an error, not a conflict: {e}"
+                ));
+            }
+        }
+    }
+    let [winner] = winners[..] else {
+        return Support::Divergent(format!(
+            "{} of {RACERS} concurrent conditional writes succeeded",
+            winners.len()
+        ));
+    };
+    match s.get(key).await {
+        Ok(body) if bodies.get(winner) == Some(&body) => Support::Supported,
+        Ok(_) => Support::Divergent("the object does not hold the winner's body".to_owned()),
+        Err(e) => Support::Divergent(format!("the winner's object cannot be read: {e}")),
+    }
+}
+
+fn racer_bodies() -> Vec<Bytes> {
+    (0..RACERS)
+        .map(|i| Bytes::from(format!("racer {i}")))
+        .collect()
+}
+
+/// M279: [`RACERS`] creates of one absent key at once. The single-writer probe cannot see a
+/// backend that evaluates `If-None-Match: *` against a stale view under concurrency.
+async fn probe_concurrent_create<S: BlobStore>(s: &S, run: u64) -> Support {
+    let key = k(run, "race-create");
+    let bodies = racer_bodies();
+    let results = futures_util::future::join_all(
+        bodies
+            .iter()
+            .map(|b| s.put_conditional(&key, b.clone(), Precondition::NotExists)),
+    )
+    .await;
+    one_winner(s, &key, &bodies, results).await
+}
+
+/// M279: [`RACERS`] compare-and-swaps on one observed tag at once: the property every HEAD
+/// commit rests on, under the contention a single writer never produces.
+async fn probe_concurrent_cas<S: BlobStore>(s: &S, run: u64) -> Support {
+    let key = k(run, "race-cas");
+    let Ok(first) = s
+        .put_conditional(&key, Bytes::from_static(b"0"), Precondition::NotExists)
+        .await
+    else {
+        return Support::Unsupported;
+    };
+    let bodies = racer_bodies();
+    let results = futures_util::future::join_all(
+        bodies
+            .iter()
+            .map(|b| s.put_conditional(&key, b.clone(), Precondition::Match(first.tag.clone()))),
+    )
+    .await;
+    one_winner(s, &key, &bodies, results).await
+}
+
+/// M279: a compare-and-swap on a tag whose object was deleted since. AWS answers 404 or 412
+/// depending on the race; either way another writer won, so it must surface as `Lost` and
+/// never as an error the caller retries unchanged, nor as a success that recreates the object.
+async fn probe_cas_after_delete<S: BlobStore>(s: &S, run: u64) -> Support {
+    let key = k(run, "cas-deleted");
+    let Ok(first) = s
+        .put_conditional(&key, Bytes::from_static(b"1"), Precondition::NotExists)
+        .await
+    else {
+        return Support::Unsupported;
+    };
+    if s.delete_batch(std::slice::from_ref(&key)).await.is_err() {
+        return Support::Unsupported;
+    }
+    match s
+        .put_conditional(
+            &key,
+            Bytes::from_static(b"2"),
+            Precondition::Match(first.tag),
+        )
+        .await
+    {
+        Err(CasError::Lost) => Support::Supported,
+        Ok(_) => Support::Divergent(
+            "a compare-and-swap on a deleted object succeeded and recreated it".to_owned(),
+        ),
+        Err(e) => Support::Divergent(format!(
+            "a compare-and-swap on a deleted object was not a conflict: {e}"
+        )),
+    }
+}
+
+/// The worse of two probes of one primitive: a race probe can only take support away.
+fn worst(a: Support, b: Support) -> Support {
+    if a == Support::Supported { b } else { a }
+}
+
 async fn probe_ranged_read<S: BlobStore>(s: &S, run: u64) -> Support {
     let key = k(run, "range");
     if s.put(&key, Bytes::from_static(b"0123456789"))
@@ -302,6 +415,18 @@ pub async fn run<S: BlobStore>(s: &S, run_id: u64) -> Report {
             outcome: probe_cas(s, run_id).await,
         },
         Probe {
+            name: "concurrent_create_one_winner",
+            outcome: probe_concurrent_create(s, run_id).await,
+        },
+        Probe {
+            name: "concurrent_cas_one_winner",
+            outcome: probe_concurrent_cas(s, run_id).await,
+        },
+        Probe {
+            name: "cas_after_delete_is_lost",
+            outcome: probe_cas_after_delete(s, run_id).await,
+        },
+        Probe {
             name: "aba_resistance",
             outcome: probe_aba_resistance(s, run_id).await,
         },
@@ -347,8 +472,20 @@ pub async fn run<S: BlobStore>(s: &S, run_id: u64) -> Report {
             backend: declared.backend.clone(),
             // ⚠️ Taken from the PROBE, not from what the backend claims. That difference
             // is the entire point of this module.
-            cas: find("compare_and_swap"),
-            create_if_absent: find("create_if_absent"),
+            // M279: and from the races. A backend that fences one writer and admits two winners
+            // under concurrency does not fence; neither does one that reports a lost CAS on a
+            // deleted object as an error.
+            cas: worst(
+                find("compare_and_swap"),
+                worst(
+                    find("concurrent_cas_one_winner"),
+                    find("cas_after_delete_is_lost"),
+                ),
+            ),
+            create_if_absent: worst(
+                find("create_if_absent"),
+                find("concurrent_create_one_winner"),
+            ),
             delete_is_free: declared.delete_is_free,
             max_batch_delete: declared.max_batch_delete,
             coalesce_gap: declared.coalesce_gap,

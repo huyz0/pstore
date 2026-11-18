@@ -264,6 +264,7 @@ fn the_cache_is_configured_by_name() {
             dir: PathBuf::from("/var/cache/pstore"),
             ram: 256 << 20,
             disk: 4 << 30,
+            tenant_share: None,
         }
     );
     let mut sized = on.clone();
@@ -271,11 +272,20 @@ fn the_cache_is_configured_by_name() {
     sized.push(("PSTORE_CACHE_DISK_BYTES", "4096"));
     let c = Config::from_vars(vars(&sized)).unwrap().cache.unwrap();
     assert_eq!((c.ram, c.disk), (1024, 4096));
+    // M280: a tenant share, off unless set.
+    let mut shared = on.clone();
+    shared.push(("PSTORE_CACHE_TENANT_SHARE_PERMILLE", "250"));
+    let c = Config::from_vars(vars(&shared)).unwrap().cache.unwrap();
+    assert_eq!(c.tenant_share, Some(250));
 }
 
 #[test]
 fn a_bad_cache_setting_is_refused_by_name() {
-    for var in ["PSTORE_CACHE_RAM_BYTES", "PSTORE_CACHE_DISK_BYTES"] {
+    for var in [
+        "PSTORE_CACHE_RAM_BYTES",
+        "PSTORE_CACHE_DISK_BYTES",
+        "PSTORE_CACHE_TENANT_SHARE_PERMILLE",
+    ] {
         for bad in ["0", "-1", "lots"] {
             let mut v = S3.to_vec();
             v.push(("PSTORE_CACHE_DIR", "/c"));
@@ -286,11 +296,26 @@ fn a_bad_cache_setting_is_refused_by_name() {
         }
         // A size with no directory is a setting that would do nothing.
         let mut v = S3.to_vec();
-        v.push((var, "1024"));
+        v.push((
+            var,
+            if var.ends_with("PERMILLE") {
+                "250"
+            } else {
+                "1024"
+            },
+        ));
         let e = Config::from_vars(vars(&v)).unwrap_err();
         assert!(e.to_string().contains(var), "{e}");
         assert!(e.to_string().contains("PSTORE_CACHE_DIR"), "{e}");
     }
+    // M280: a share of the whole quota or more is no share, and is refused as a typo.
+    let mut v = S3.to_vec();
+    v.push(("PSTORE_CACHE_DIR", "/c"));
+    v.push(("PSTORE_CACHE_TENANT_SHARE_PERMILLE", "1000"));
+    assert!(matches!(
+        Config::from_vars(vars(&v)).unwrap_err(),
+        ConfigError::Cache("PSTORE_CACHE_TENANT_SHARE_PERMILLE", ..)
+    ));
     // A memory store is new and empty every start, so its keys repeat with other bytes.
     let e = Config::from_vars(vars(&[("PSTORE_CACHE_DIR", "/c")])).unwrap_err();
     assert!(e.to_string().contains("PSTORE_CACHE_DIR"), "{e}");

@@ -36,6 +36,8 @@ fn limits(body: usize, active: usize, tenant: usize, pool: usize) -> RequestLimi
         .active_requests(active)
         .tenant_active_requests(tenant)
         .reserved_body_bytes(pool)
+        // M128's fixed cap, pinned since M280 made borrowing the default.
+        .tenant_borrow_reserve(None)
         .build()
         .unwrap()
 }

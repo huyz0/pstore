@@ -21,6 +21,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ObjectStoreBackend {
     inner: Arc<dyn ObjectStore>,
+    /// The client conditional writes go through, when it is not `inner` (M282): one that
+    /// never repeats a request, since a repeat of a write that landed meets itself as a rival.
+    conditional: Option<Arc<dyn ObjectStore>>,
     caps: Capabilities,
     /// GCS's batch endpoint (M107), which `delete_batch` uses in place of `delete_stream`.
     #[cfg(feature = "gcs")]
@@ -37,10 +40,22 @@ impl ObjectStoreBackend {
     pub fn new(inner: Arc<dyn ObjectStore>, caps: Capabilities) -> Self {
         Self {
             inner,
+            conditional: None,
             caps,
             #[cfg(feature = "gcs")]
             batch: None,
         }
+    }
+
+    /// Sends every conditional write through `client` instead (M282): the same bucket, built
+    /// with no retries. ⚠️ A client's own retry of a conditional write that got a `5xx` repeats
+    /// a write that may have landed, and the repeat then fails its own precondition: `Lost`,
+    /// where the truth is "mine". Without the repeat the answer is an I/O error, which the
+    /// engine resolves by reading (M17), or hands back to the caller to retry.
+    #[must_use]
+    pub fn with_conditional(mut self, client: Arc<dyn ObjectStore>) -> Self {
+        self.conditional = Some(client);
+        self
     }
 
     /// A profile for a backend the conformance suite has not run against yet.
@@ -107,6 +122,7 @@ impl ObjectStoreBackend {
         };
         Self {
             inner: Arc::new(store),
+            conditional: None,
             caps: Capabilities {
                 max_batch_delete: crate::gcs_batch::MAX_BATCH,
                 delete_is_free: false,
@@ -266,7 +282,9 @@ impl crate::BlobStore for ObjectStoreBackend {
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
         match self
-            .inner
+            .conditional
+            .as_ref()
+            .unwrap_or(&self.inner)
             .put_opts(&Self::path(key), body.into(), Self::put_opts(&pre))
             .await
         {

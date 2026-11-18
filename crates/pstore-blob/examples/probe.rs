@@ -3,7 +3,7 @@
 //! ⚠️ **This is layer 2, and layer 2 tests plumbing.** D-99 is explicit: correctness is
 //! proven against the in-process store, emulators validate HTTP wiring and error mapping,
 //! and only a real cloud says anything about economics. A `Supported` printed here means
-//! *this emulator answered ten probes correctly*, never *S3 does*.
+//! *this emulator answered thirteen probes correctly*, never *S3 does*.
 //!
 //! Not a `#[test]`: it needs containers, and a suite that cannot run without Docker is a
 //! suite that stops running. `scripts/conformance.sh` is the entry point.
@@ -153,7 +153,7 @@ async fn main() {
     println!();
     println!(
         "⚠️ **These are emulators, and emulators test plumbing** (D-99). `Supported` here \
-         means this emulator answered ten probes correctly. It says nothing about S3, GCS or \
+         means this emulator answered thirteen probes correctly. It says nothing about S3, GCS or \
          Azure, whose profiles need real accounts — M0b."
     );
     println!();

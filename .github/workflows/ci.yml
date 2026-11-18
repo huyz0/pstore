@@ -129,6 +129,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # ⚠️ The release profile's single codegen unit and thin LTO starve the runner linking the
+    # server's `it` test binary: on PR #72 `index-scale.sh` ran an hour and the runner "lost
+    # communication", where main's build of the same step took 32 minutes. Every gate here
+    # asserts counts, recall and bytes, never time, so a lighter build changes no verdict;
+    # the timings these scripts print were already provisional.
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -284,6 +292,8 @@ jobs:
       - run: ./scripts/check-verified.py
       - run: ./scripts/selftest-check-verified.sh
       - run: ./scripts/check-slos.py
+      - run: ./scripts/check-budgets.py
+      - run: ./scripts/check-budgets.py --self-test
       - run: ./scripts/selftest-check-slos.sh
       - run: ./scripts/selftest-coverage-scope.sh
       - run: ./scripts/selftest-coverage-mismatch.sh

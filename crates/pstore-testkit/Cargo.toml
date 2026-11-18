@@ -29,10 +29,11 @@ hyper-util     = { version = "0.1", default-features = false, features = ["tokio
 http           = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 md-5           = { version = "0.11", optional = true }
+# M279: the race probes start their writers at once, in one task.
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 [features]
 s3 = ["pstore-blob/s3-native", "dep:hyper", "dep:hyper-util", "dep:http", "dep:http-body-util", "dep:md-5", "tokio/net"]
 
 [dev-dependencies]
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
