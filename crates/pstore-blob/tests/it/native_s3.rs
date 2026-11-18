@@ -230,6 +230,8 @@ async fn reads_answer_exactly_the_bytes_asked_for_or_an_error() {
         s.put(&k, Bytes::new()).await,
         Err(BlobError::Other(_))
     ));
+    // A refused write did not land.
+    assert_eq!(s.get(&k).await.unwrap(), body);
     assert_eq!(fake.bad_signatures(), 0);
 }
 

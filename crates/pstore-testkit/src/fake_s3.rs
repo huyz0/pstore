@@ -332,7 +332,8 @@ async fn handle(
     }
     let header = |k: &str| parts.headers.get(k).and_then(|v| v.to_str().ok());
     match (parts.method.clone(), key.is_empty()) {
-        (Method::POST, true) if query_param(&parts.uri, "delete").is_some() => {
+        (Method::POST, true) => {
+            // A bucket-level POST is a `DeleteObjects`: the only one either client sends.
             // As S3: quiet mode lists only failures (none here), verbose mode every key.
             let text = String::from_utf8_lossy(&body);
             let quiet = text.contains("<Quiet>true</Quiet>");
@@ -387,12 +388,13 @@ async fn handle(
             };
             let (a, b) = range.split_once('-').unwrap_or((range, ""));
             let (start, end) = match (a.parse::<u64>().ok(), b.parse::<u64>().ok()) {
-                (Some(s), Some(e)) => (s, e.saturating_add(1).min(len)),
+                // A reversed range reads as empty rather than panicking the slice.
+                (Some(s), Some(e)) => (s, e.saturating_add(1).min(len).max(s)),
                 (Some(s), None) => (s, len),
                 (None, Some(n)) => (len.saturating_sub(n), len),
                 (None, None) => return error(StatusCode::BAD_REQUEST, "InvalidRange"),
             };
-            if start >= len || start >= end {
+            if start >= len {
                 headers.push(("content-range", format!("bytes */{len}")));
                 return reply(StatusCode::RANGE_NOT_SATISFIABLE, &headers, Bytes::new());
             }
@@ -403,10 +405,6 @@ async fn handle(
             )]
             let slice = data.slice(start as usize..end as usize);
             reply(StatusCode::PARTIAL_CONTENT, &headers, slice)
-        }
-        (Method::DELETE, false) => {
-            st.objects.remove(&key);
-            reply(StatusCode::NO_CONTENT, &[], Bytes::new())
         }
         _ => error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),
     }
