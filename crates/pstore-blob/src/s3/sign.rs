@@ -294,6 +294,39 @@ mod tests {
         assert_eq!(amz_date(1_798_761_599), "20261231T235959Z");
     }
 
+    /// Every day from 1970 to past 2500, against a calendar walked one day at a time. The
+    /// century terms of the closed form only differ from a wrong one near 2100, 2200, 2300
+    /// and 2400, so four sample dates in this century cannot pin them (M286's mutants did).
+    #[test]
+    fn every_day_to_2500_matches_a_calendar_walk() {
+        let leap =
+            |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+        let (mut y, mut m, mut d) = (1970_u64, 1_u64, 1_u64);
+        for day in 0..194_000_u64 {
+            assert_eq!(
+                amz_date(day * 86_400 + 3_661),
+                format!("{y:04}{m:02}{d:02}T010101Z"),
+                "day {day}"
+            );
+            let len = match m {
+                2 if leap(y) => 29,
+                2 => 28,
+                4 | 6 | 9 | 11 => 30,
+                _ => 31,
+            };
+            d += 1;
+            if d > len {
+                d = 1;
+                m += 1;
+                if m > 12 {
+                    m = 1;
+                    y += 1;
+                }
+            }
+        }
+        assert_eq!(y, 2501);
+    }
+
     #[test]
     fn a_session_token_never_reaches_debug() {
         let c = Credentials {
