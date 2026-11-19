@@ -16,6 +16,7 @@ mod auth_baseline;
 mod auth_contract;
 mod auth_peers;
 mod auth_sources;
+mod blob_client;
 mod boost;
 mod bounded;
 mod branch;

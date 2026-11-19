@@ -8,6 +8,7 @@
 //! ⚠️ **Errors come from the status code**, never from a message: 404 absent, 412 `Lost`,
 //! 409 `Contended`, 503 throttled, 416 out of range.
 
+pub mod creds;
 pub mod sign;
 mod xml;
 
@@ -23,6 +24,28 @@ use sign::{Credentials, EMPTY_SHA256};
 use std::ops::Range;
 
 type Https = hyper_rustls::HttpsConnector<HttpConnector>;
+/// The one HTTP client type: the store's requests, and the credential providers'.
+pub(crate) type Http = Client<Https, Full<Bytes>>;
+
+/// An HTTP/1 client that speaks both `http://` (emulators, IMDS, ECS) and `https://`.
+fn http_client() -> Result<Http, BlobError> {
+    let tls = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .map_err(|e| BlobError::Other(format!("no TLS roots: {e}")))?
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(tls))
+}
+
+/// Where a request's signing keys come from.
+#[derive(Debug, Clone)]
+enum Signer {
+    /// Keys that never change: no lock, no clone of the strings.
+    Static(std::sync::Arc<Credentials>),
+    /// A provider of temporary ones (M287).
+    Provided(std::sync::Arc<creds::Cache>),
+}
 
 /// Where a bucket is, and who is asking.
 #[derive(Debug, Clone)]
@@ -79,7 +102,7 @@ impl S3Config {
 /// The client.
 #[derive(Debug, Clone)]
 pub struct S3Backend {
-    http: Client<Https, Full<Bytes>>,
+    http: Http,
     caps: Capabilities,
     scheme: String,
     /// The `host` header: `host[:port]`, with the bucket in front when virtual-hosted.
@@ -87,7 +110,7 @@ pub struct S3Backend {
     /// The path before the key: `/bucket` path-style, empty virtual-hosted.
     base: String,
     region: String,
-    credentials: Credentials,
+    signer: Signer,
     timeout: std::time::Duration,
 }
 
@@ -139,22 +162,29 @@ impl S3Backend {
                 format!("/{}", sign::uri_encode(&config.bucket, false)),
             )
         };
-        let tls = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|e| BlobError::Other(format!("no TLS roots: {e}")))?
-            .https_or_http()
-            .enable_http1()
-            .build();
         Ok(Self {
-            http: Client::builder(TokioExecutor::new()).build(tls),
+            http: http_client()?,
             caps,
             scheme: scheme.to_owned(),
             host,
             base,
             region: config.region,
-            credentials: config.credentials,
+            signer: Signer::Static(std::sync::Arc::new(config.credentials)),
             timeout: config.timeout,
         })
+    }
+
+    /// The same client, signing with what `provider` answers instead of the config's keys
+    /// (M287). A [`creds::Provider::Static`] stays lock-free.
+    ///
+    /// # Errors
+    /// A system with no TLS roots, for the provider's own client.
+    pub fn with_provider(mut self, provider: creds::Provider) -> Result<Self, BlobError> {
+        self.signer = match provider {
+            creds::Provider::Static(c) => Signer::Static(std::sync::Arc::new(c)),
+            p => Signer::Provided(std::sync::Arc::new(creds::Cache::new(p, http_client()?))),
+        };
+        Ok(self)
     }
 
     fn path(&self, key: &Key) -> String {
@@ -179,16 +209,20 @@ impl S3Backend {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let date = sign::amz_date(now);
+        let credentials = match &self.signer {
+            Signer::Static(c) => c.clone(),
+            Signer::Provided(cache) => cache.get().await?,
+        };
         let mut headers: Vec<(&str, &str)> = Vec::with_capacity(extra.len() + 4);
         headers.push(("host", &self.host));
         headers.push(("x-amz-content-sha256", &payload));
         headers.push(("x-amz-date", &date));
-        if let Some(t) = &self.credentials.token {
+        if let Some(t) = &credentials.token {
             headers.push(("x-amz-security-token", t));
         }
         headers.extend_from_slice(extra);
         let auth = sign::authorization(
-            &self.credentials,
+            &credentials,
             &sign::Scope {
                 amz_date: &date,
                 region: &self.region,
@@ -426,6 +460,10 @@ impl BlobStore for S3Backend {
                 tag: etag(&r.headers),
             }),
             StatusCode::PRECONDITION_FAILED => Err(CasError::Lost),
+            // ⚠️ An `If-Match` on a key deleted since answers 404, on S3 and `rustfs`: another
+            // writer won, so `Lost`, as `object_store` reads it (M279's probe). Read as an
+            // I/O error, the caller would retry a write that can never succeed (M287).
+            StatusCode::NOT_FOUND if matches!(pre, Precondition::Match(_)) => Err(CasError::Lost),
             // S3 answers `If-None-Match: *` on a key that exists with 412, and a conditional
             // write racing another on the same key with 409 `ConditionalRequestConflict`.
             StatusCode::CONFLICT => Err(CasError::Contended),

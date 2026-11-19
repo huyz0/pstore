@@ -368,13 +368,26 @@ pub(crate) fn map_cas_err(e: &object_store::Error) -> CasError {
         }
         other => {
             let s = other.to_string();
-            if s.contains("409") || s.contains("ConditionalRequestConflict") {
+            if names_409(&s) || s.contains("ConditionalRequestConflict") {
                 CasError::Contended
             } else {
                 CasError::Io(s)
             }
         }
     }
+}
+
+/// Whether `s` names the status 409: as a number of its own, never inside one. ⚠️ The
+/// message carries the request's elapsed time, so a bare `contains("409")` read a 503 that
+/// took `1.409ms` as a conflict (M287).
+fn names_409(s: &str) -> bool {
+    let b = s.as_bytes();
+    let part = |c: u8| c.is_ascii_digit() || c == b'.';
+    s.match_indices("409").any(|(i, _)| {
+        let before = i.checked_sub(1).and_then(|j| b.get(j)).copied();
+        let after = b.get(i + 3).copied();
+        !before.is_some_and(part) && !after.is_some_and(part)
+    })
 }
 
 #[cfg(test)]
@@ -497,6 +510,28 @@ mod tests {
         );
         assert_eq!(
             map_cas_err(&generic("status 409 from S3")),
+            CasError::Contended
+        );
+    }
+
+    /// M287: `object_store`'s message carries the elapsed time, and a 503 that took 1.409 ms
+    /// read as a 409: `Contended`, retried as a conflict. Found as a flake of `s3_retry`.
+    #[test]
+    fn a_409_in_the_elapsed_time_is_not_a_409() {
+        for msg in [
+            "Error performing PUT http://h/b/k in 1.409ms - Server returned non-2xx status code: 503 Service Unavailable: ",
+            "Error performing PUT http://h/b/k in 409.1ms - Server returned non-2xx status code: 503 Service Unavailable: ",
+            "Error performing PUT http://h/b/k in 14090ms - Server returned non-2xx status code: 500 Internal Server Error: ",
+        ] {
+            assert!(
+                matches!(map_cas_err(&generic(msg)), CasError::Io(_)),
+                "{msg}"
+            );
+        }
+        assert_eq!(
+            map_cas_err(&generic(
+                "Error performing PUT http://h/b/k in 1.2ms - Server returned non-2xx status code: 409 Conflict: "
+            )),
             CasError::Contended
         );
     }
