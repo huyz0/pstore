@@ -186,6 +186,35 @@ async fn a_conditional_write_that_lands_and_then_gets_a_503_is_not_repeated() {
     assert_eq!(&s.get(&k).await.unwrap()[..], b"x");
 }
 
+/// M287: S3 and `rustfs` answer an `If-Match` on a deleted key with 404. Another writer won,
+/// so it is `Lost`; a 404 to a create is no such answer, and stays an error.
+#[tokio::test]
+async fn a_compare_and_swap_on_a_deleted_key_is_lost() {
+    let fake = FakeS3::start().await.unwrap();
+    let s = native(&fake);
+    let k = Key::new("gone");
+    let first = s
+        .put_conditional(&k, Bytes::from_static(b"1"), Precondition::NotExists)
+        .await
+        .unwrap();
+    s.delete_batch(std::slice::from_ref(&k)).await.unwrap();
+    assert_eq!(
+        s.put_conditional(&k, Bytes::from_static(b"2"), Precondition::Match(first.tag))
+            .await,
+        Err(CasError::Lost)
+    );
+    assert!(matches!(s.get(&k).await, Err(BlobError::NotFound(_))));
+    fake.fail_next(Fault {
+        status: 404,
+        code: "NoSuchBucket",
+        apply: false,
+    });
+    let r = s
+        .put_conditional(&k, Bytes::new(), Precondition::NotExists)
+        .await;
+    assert!(matches!(r, Err(CasError::Io(_))), "{r:?}");
+}
+
 #[tokio::test]
 async fn conditional_writes_win_and_lose_by_status() {
     let fake = FakeS3::start().await.unwrap();

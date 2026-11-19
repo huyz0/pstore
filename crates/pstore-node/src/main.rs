@@ -10,12 +10,12 @@
 //! It owns nothing. Placement tells it which shards it would *cache*; the blob store holds
 //! everything. That is why adding or removing nodes copies no bytes.
 
-use pstore_blob::{BlobStore, Capabilities, ObjectStoreBackend};
+use pstore_blob::s3::{S3Backend, S3Config, sign::Credentials};
+use pstore_blob::{BlobStore, Capabilities};
 use pstore_cluster::Roster;
 use pstore_node::policy::{self, fresh_node_id, read_roster_patiently};
 use pstore_node::schedule::{self, Cadence, Clock};
 use pstore_node::{ATTEMPT_TIMEOUT, gossip, swim};
-use std::sync::Arc;
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
@@ -309,22 +309,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn blob_store(endpoint: &str, bucket: &str) -> Result<impl BlobStore, Box<dyn std::error::Error>> {
-    let s3 = object_store::aws::AmazonS3Builder::new()
-        .with_endpoint(endpoint)
-        .with_bucket_name(bucket)
-        .with_access_key_id(env("PSTORE_ACCESS_KEY", "pstore"))
-        .with_secret_access_key(env("PSTORE_SECRET_KEY", "pstore-dev-secret"))
-        .with_allow_http(true)
-        .with_region("us-east-1")
-        .build()?;
+    // M287: pstore's own S3 client, path style as `object_store`'s default was.
     // ⚠️ `unprobed`: this backend's capabilities have NOT been measured here. MinIO is known
     // to ignore `If-None-Match: *`, which is why the roster uses CAS on an observed tag and
     // never create-if-absent.
-    Ok(ObjectStoreBackend::new(
-        Arc::new(s3),
+    Ok(S3Backend::new(
+        S3Config {
+            endpoint: endpoint.to_owned(),
+            bucket: bucket.to_owned(),
+            region: "us-east-1".to_owned(),
+            credentials: Credentials {
+                key_id: env("PSTORE_ACCESS_KEY", "pstore"),
+                secret: env("PSTORE_SECRET_KEY", "pstore-dev-secret"),
+                token: None,
+            },
+            virtual_hosted: false,
+            timeout: std::time::Duration::from_secs(30),
+        },
         Capabilities {
             backend: format!("s3({endpoint})"),
-            ..ObjectStoreBackend::unprobed("s3")
+            ..S3Backend::unprobed("s3")
         },
-    ))
+    )?)
 }

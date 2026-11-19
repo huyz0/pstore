@@ -47,6 +47,11 @@ stays out: neither client sends it and it is not needed to switch.
    `ecs_credentials_come_from_the_relative_uri_with_its_token`,
    `web_identity_is_exchanged_with_sts`, and the chain's order and fall-through:
    `the_chain_takes_the_first_provider_that_answers`.
+
+   ⚠️ **Corrected (M287.2):** the chain takes the first provider that is **configured**, not
+   the first that answers, and a configured provider that fails is an error. Falling through
+   on failure would let a broken web identity silently become the instance's role. The test
+   is `the_chain_takes_the_first_provider_that_is_configured`.
 2. Credentials near expiry are refreshed once, before use, and a failed refresh keeps
    unexpired ones: `credentials_refresh_before_they_expire`,
    `a_failed_refresh_keeps_credentials_that_have_not_expired`.

@@ -755,6 +755,7 @@ Fleet quotas remain incomplete: `pstore-meter` exists and is not wired.
 | `PSTORE_S3_ENDPOINT` | — | e.g. `http://rustfs:9000`. |
 | `PSTORE_BUCKET` | `pstore` | Must exist; the server does not create it. |
 | `PSTORE_ACCESS_KEY` / `PSTORE_SECRET_KEY` | the provider's credential chain | ⚠️ **Unset is the deployed case**: an instance profile or a service-account role. Both halves or neither — half a pair is ignored. |
+| `PSTORE_BLOB_CLIENT` | `native` | Which S3 client opens the store and every replication source (M287): `native`, pstore's own (M286), or `object_store`. Anything else is refused at start. Both read and write the same objects, so switching back is the rollback. The native client resolves credentials from `PSTORE_ACCESS_KEY` / `PSTORE_SECRET_KEY`, then `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, then web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN`), then the ECS container endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`), then IMDSv2 unless `AWS_EC2_METADATA_DISABLED=true`. ⚠️ The first one configured is the one used: a configured provider that fails is an error at the first request, never a fall-through to the next. Temporary credentials are refreshed five minutes before they expire. |
 | `PSTORE_REGION` | `us-east-1` | |
 | `PSTORE_AZURE_ACCOUNT` | — | **Required** with `PSTORE_BACKEND=azure`. |
 | `PSTORE_AZURE_KEY` | the client's credential chain | Unset is managed identity, as S3's unset keys are the provider chain. |

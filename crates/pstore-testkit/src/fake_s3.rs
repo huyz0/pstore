@@ -5,8 +5,11 @@
 //! talk to it, so `object_store`'s requests passing is evidence that pstore's signer computes
 //! what AWS's does, beyond the published examples.
 //!
-//! What it is not: S3. Path-style only, one bucket, no versioning, no multipart, and an
-//! `If-Match` on a missing key answers 412 where S3 answers 404.
+//! What it is not: S3. Path-style only, one bucket, no versioning, no multipart.
+//!
+//! ⚠️ An `If-Match` on a missing key answers **404**, as S3 and `rustfs` do. Until M287 it
+//! answered 412, and the native client's mapping of 404 to an I/O error passed here and
+//! diverged on `rustfs`'s `cas_after_delete_is_lost`.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -353,6 +356,9 @@ async fn handle(
         (Method::GET, true) => list(&st, &parts.uri),
         (Method::PUT, false) => {
             let current = st.objects.get(&key).map(|(_, t)| t.clone());
+            if current.is_none() && header("if-match").is_some() {
+                return error(StatusCode::NOT_FOUND, "NoSuchKey");
+            }
             let refused = match (header("if-none-match"), header("if-match")) {
                 (Some("*"), _) => current.is_some(),
                 (_, Some(want)) => current.as_deref() != Some(want),

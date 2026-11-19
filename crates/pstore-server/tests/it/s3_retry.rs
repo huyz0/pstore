@@ -278,3 +278,49 @@ fn the_retry_policy_is_object_stores_default() {
     assert_eq!(r.backoff.max_backoff, d.backoff.max_backoff);
     assert!((r.backoff.base - d.backoff.base).abs() < f64::EPSILON);
 }
+
+/// M287: the native client (`PSTORE_BLOB_CLIENT=native`) on the same fake. It retries
+/// nothing, conditional or not: every `503` reaches `Congested`, the one retry layer, after
+/// exactly one request (M286's design). The `object_store` tests above pin that mode.
+#[tokio::test]
+async fn the_native_client_sends_every_request_once() {
+    let (endpoint, fake) = serve().await;
+    let creds = ("key".to_owned(), "secret".to_owned());
+    let s = pstore_server::native_s3_store(
+        &endpoint,
+        "b",
+        Some(&creds),
+        "us-east-1",
+        Profile::Conforming,
+        |_| None,
+    )
+    .unwrap();
+    fake.lock().unwrap().landing_puts = 1;
+    let got = s
+        .put_conditional(
+            &Key::new("t/wal/1"),
+            Bytes::from_static(b"mine"),
+            Precondition::NotExists,
+        )
+        .await;
+    assert!(matches!(got, Err(CasError::Io(_))), "{got:?}");
+    assert_eq!(seen(&fake, "PUT"), 1, "a conditional write was repeated");
+    fake.lock().unwrap().failing_gets = 1;
+    assert_eq!(
+        s.get(&Key::new("t/wal/1")).await,
+        Err(pstore_blob::BlobError::SlowDown)
+    );
+    assert_eq!(seen(&fake, "GET"), 1);
+    assert_eq!(
+        s.get(&Key::new("t/wal/1")).await.unwrap(),
+        Bytes::from_static(b"mine")
+    );
+    fake.lock().unwrap().landing_puts = 1;
+    assert_eq!(
+        s.put(&Key::new("t/seg"), Bytes::from_static(b"seg"))
+            .await
+            .map(|_| ()),
+        Err(pstore_blob::BlobError::SlowDown)
+    );
+    assert_eq!(seen(&fake, "PUT"), 2);
+}

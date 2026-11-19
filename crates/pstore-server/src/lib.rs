@@ -7801,6 +7801,8 @@ pub struct Config {
     pub backend: Backend,
     /// Which recorded profile the operator says applies to it.
     pub profile: Profile,
+    /// Which client speaks to the blob store, `PSTORE_BLOB_CLIENT` (M287).
+    pub client: BlobClient,
     /// The S3 endpoint. Required by [`Backend::S3`], ignored by [`Backend::Memory`].
     pub endpoint: String,
     /// The bucket, ignored by [`Backend::Memory`].
@@ -8001,7 +8003,7 @@ pub enum Profile {
 pub fn s3_capabilities(endpoint: &str, profile: Profile) -> pstore_blob::Capabilities {
     let base = pstore_blob::Capabilities {
         backend: format!("s3({endpoint})"),
-        ..pstore_blob::ObjectStoreBackend::unprobed("s3")
+        ..pstore_blob::s3::S3Backend::unprobed("s3")
     };
     match profile {
         Profile::Unprobed => base,
@@ -8011,6 +8013,110 @@ pub fn s3_capabilities(endpoint: &str, profile: Profile) -> pstore_blob::Capabil
             ..base
         },
     }
+}
+
+/// Which client the server speaks to its blob store with, `PSTORE_BLOB_CLIENT` (M287).
+///
+/// ⚠️ **A cluster setting with no index-level override.** The client is the transport the
+/// process opens once for its one store: it changes no byte on disk and no answer, only the
+/// server's CPU and allocations (M286's bench), so there is nothing an index could choose.
+/// Either client reads what the other wrote, so the setting is also the rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlobClient {
+    /// pstore's own (M286): no retries inside it, errors typed from the status, 55-85% fewer
+    /// bytes allocated a request on five of M286's seven patterns. The default.
+    #[default]
+    Native,
+    /// `object_store` 0.14, with M282's two retry policies.
+    ObjectStore,
+}
+
+impl BlobClient {
+    /// `PSTORE_BLOB_CLIENT`'s value; unset is [`BlobClient::Native`].
+    ///
+    /// # Errors
+    /// [`ConfigError::BlobClient`] for anything else, so a typo is a refusal at startup, not a
+    /// silent default.
+    pub fn from_var(v: Option<&str>) -> Result<Self, ConfigError> {
+        match v {
+            None | Some("native") => Ok(Self::Native),
+            Some("object_store") => Ok(Self::ObjectStore),
+            Some(other) => Err(ConfigError::BlobClient(other.to_owned())),
+        }
+    }
+}
+
+/// One S3-compatible bucket through pstore's own client (M287), with `profile`'s
+/// capabilities.
+///
+/// The operator's keys when both are given; otherwise the credential chain over `lookup`
+/// (the process environment, in `main.rs`): `AWS_*` keys, web identity, the ECS container
+/// endpoint, IMDSv2 -- what `object_store`'s chain does, so the same deployment
+/// authenticates with either client.
+///
+/// # Errors
+/// An endpoint that is not `scheme://host[:port]`, a system with no TLS roots, or a chain
+/// with no provider at all.
+pub fn native_s3_store(
+    endpoint: &str,
+    name: &str,
+    credentials: Option<&(String, String)>,
+    region: &str,
+    profile: Profile,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<pstore_blob::s3::S3Backend, pstore_blob::BlobError> {
+    use pstore_blob::s3::{S3Backend, S3Config, creds::Provider, sign::Credentials};
+    let provider = match credentials {
+        Some((key, secret)) => Provider::Static(Credentials {
+            key_id: key.clone(),
+            secret: secret.clone(),
+            token: None,
+        }),
+        None => Provider::from_vars(lookup, region)?,
+    };
+    S3Backend::new(
+        S3Config {
+            endpoint: endpoint.to_owned(),
+            bucket: name.to_owned(),
+            region: region.to_owned(),
+            credentials: Credentials {
+                key_id: String::new(),
+                secret: String::new(),
+                token: None,
+            },
+            // `object_store`'s default, path style, so either client addresses a bucket the
+            // same way: an emulator, an in-VPC endpoint, and AWS.
+            virtual_hosted: false,
+            // `object_store`'s default request timeout.
+            timeout: std::time::Duration::from_secs(30),
+        },
+        s3_capabilities(endpoint, profile),
+    )?
+    .with_provider(provider)
+}
+
+/// One S3-compatible bucket through `client`: [`native_s3_store`] or [`s3_store`].
+///
+/// # Errors
+/// The chosen client's refusal to build, as text.
+pub fn open_s3(
+    client: BlobClient,
+    endpoint: &str,
+    name: &str,
+    credentials: Option<&(String, String)>,
+    region: &str,
+    profile: Profile,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<std::sync::Arc<dyn pstore_blob::BlobStore>, String> {
+    Ok(match client {
+        BlobClient::Native => std::sync::Arc::new(
+            native_s3_store(endpoint, name, credentials, region, profile, lookup)
+                .map_err(|e| e.to_string())?,
+        ),
+        BlobClient::ObjectStore => std::sync::Arc::new(
+            s3_store(endpoint, name, credentials, region, profile).map_err(|e| e.to_string())?,
+        ),
+    })
 }
 
 /// One S3-compatible bucket, with `profile`'s capabilities (M282: moved from `main.rs`, so its
@@ -8137,6 +8243,9 @@ pub enum ConfigError {
     /// `PSTORE_PROFILE` named something that is not a recorded profile.
     #[error("PSTORE_PROFILE={0} is not a profile: unprobed, conforming")]
     Profile(String),
+    /// `PSTORE_BLOB_CLIENT` named something that is not a client (M287).
+    #[error("PSTORE_BLOB_CLIENT={0} is not a blob client: native, object_store")]
+    BlobClient(String),
     /// `PSTORE_BACKEND=s3` with no endpoint.
     ///
     /// ⚠️ **Refused here rather than discovered on the first request.** An empty endpoint
@@ -8207,6 +8316,7 @@ impl Config {
             Some("conforming") => Profile::Conforming,
             Some(other) => return Err(ConfigError::Profile(other.to_owned())),
         };
+        let client = BlobClient::from_var(get("PSTORE_BLOB_CLIENT").as_deref())?;
         let endpoint = get("PSTORE_S3_ENDPOINT").unwrap_or_default();
         if backend == Backend::S3 && endpoint.is_empty() {
             return Err(ConfigError::Endpoint);
@@ -8231,6 +8341,7 @@ impl Config {
             lane: LaneId(lane),
             backend,
             profile,
+            client,
             endpoint,
             bucket: get("PSTORE_BUCKET").unwrap_or_else(|| "pstore".to_owned()),
             azure,

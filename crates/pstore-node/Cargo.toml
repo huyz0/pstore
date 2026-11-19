@@ -11,7 +11,7 @@ repository.workspace   = true
 workspace = true
 
 [dependencies]
-pstore-blob    = { path = "../pstore-blob", features = ["object_store"] }
+pstore-blob    = { path = "../pstore-blob", features = ["s3-native"] }
 pstore-cluster = { path = "../pstore-cluster" }
 pstore-gossip  = { path = "../pstore-gossip" }
 pstore-types   = { path = "../pstore-types" }
@@ -21,7 +21,6 @@ ring           = "0.17"
 socket2        = "0.6"
 anyhow         = "1"
 async-trait    = "0.1"
-object_store   = { version = "0.14.1", features = ["aws"] }
 tokio          = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
 
 [dev-dependencies]

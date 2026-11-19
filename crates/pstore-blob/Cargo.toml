@@ -29,6 +29,8 @@ http-body-util = { version = "0.1", optional = true }
 ring           = { version = "0.17", optional = true }
 md-5           = { version = "0.11", optional = true }
 base64         = { version = "0.22", optional = true }
+# M287: the JSON IMDS and the ECS endpoint answer with credentials. In the lockfile already.
+serde_json     = { version = "1", optional = true }
 
 [dev-dependencies]
 # M286: `s3` for the fake S3 both clients are tested against.
@@ -53,7 +55,7 @@ http = "1"
 object_store = ["dep:object_store"]
 # M286: `S3Backend`, pstore's own S3 client, which needs neither `object_store` nor what it
 # brings (chrono, humantime, reqwest, quinn).
-s3-native = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:http", "dep:http-body-util", "dep:ring", "dep:md-5", "dep:base64"]
+s3-native = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:http", "dep:http-body-util", "dep:ring", "dep:md-5", "dep:base64", "dep:serde_json"]
 # M107: GCS's batch delete, one request for up to 100 objects. Not in `pstore-server`'s
 # features: GCS is not a server backend (the capability matrix), only a probe target.
 gcs = ["object_store", "object_store/gcp", "dep:http"]
@@ -64,6 +66,8 @@ compat = [
     "object_store/aws",
     "gcs",
     "object_store/azure",
+    # M287: pstore's own S3 client, probed on `rustfs` beside `object_store`'s.
+    "s3-native",
 ]
 
 [[example]]
