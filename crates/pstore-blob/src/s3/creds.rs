@@ -468,6 +468,10 @@ mod tests {
             "2026-11-19-01T12:00:00Z",
             "2026-11-19T12:00:00:00Z",
             "2026-1a-19T12:00:00Z",
+            // A field of the wrong width, and one that `parse` would take: each check alone
+            // lets one through.
+            "2026-011-19T12:00:00Z",
+            "2026-+1-19T12:00:00Z",
             "1969-12-31T23:59:59Z",
         ] {
             assert!(rfc3339(bad).is_err(), "{bad}");

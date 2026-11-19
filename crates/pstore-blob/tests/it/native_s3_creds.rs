@@ -18,15 +18,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// One request a fake saw.
 #[derive(Debug, Clone)]
-struct Seen {
-    method: String,
-    target: String,
-    headers: Vec<(String, String)>,
-    body: String,
+pub(crate) struct Seen {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: String,
 }
 
 impl Seen {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -34,16 +34,17 @@ impl Seen {
     }
 }
 
-/// A scripted HTTP endpoint: answers `route(&request)` and records every request.
-struct Endpoint {
-    url: String,
+/// A scripted HTTP endpoint: answers `route(&request)` and records every request. M288's
+/// Azure token tests use it too.
+pub(crate) struct Endpoint {
+    pub(crate) url: String,
     seen: Arc<Mutex<Vec<Seen>>>,
 }
 
-type Route = dyn Fn(&Seen) -> (u16, String) + Send + Sync;
+pub(crate) type Route = dyn Fn(&Seen) -> (u16, String) + Send + Sync;
 
 impl Endpoint {
-    async fn start(route: Arc<Route>) -> Self {
+    pub(crate) async fn start(route: Arc<Route>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -106,12 +107,12 @@ impl Endpoint {
         Self { url, seen }
     }
 
-    fn seen(&self) -> Vec<Seen> {
+    pub(crate) fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
     }
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -401,6 +402,93 @@ async fn credentials_refresh_before_they_expire() {
         2,
         "fetched once, refreshed once ahead of expiry, then cached"
     );
+    assert_eq!(fake.bad_signatures(), 0);
+}
+
+/// The cache's bounds are strict: credentials exactly [`REFRESH_AHEAD`] from expiry are
+/// due, and credentials expiring this second are expired. Each assertion holds whatever the
+/// clock does between the two requests; only a bound moved to `<=` changes the count.
+#[tokio::test]
+async fn the_refresh_bounds_are_strict() {
+    use pstore_blob::s3::creds::REFRESH_AHEAD;
+    let fake = FakeS3::start().await.unwrap();
+    let now = unix_now();
+    let meta = imds(vec![
+        (200, json_credentials(now + REFRESH_AHEAD)),
+        (200, json_credentials(now + 6 * 3600)),
+    ])
+    .await;
+    let s = store_with(
+        &fake,
+        Provider::Imds {
+            endpoint: meta.url.clone(),
+        },
+    )
+    .await;
+    for i in 0..2 {
+        s.put(&Key::new(format!("k{i}")), Bytes::from_static(b"v"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(credential_fetches(&meta), 2, "due at exactly the window");
+
+    // Expiring now, and the refresh fails: expired, so an error, not the old keys.
+    let meta = imds(vec![(200, json_credentials(now)), (500, "busy".to_owned())]).await;
+    let s = store_with(
+        &fake,
+        Provider::Imds {
+            endpoint: meta.url.clone(),
+        },
+    )
+    .await;
+    s.put(&Key::new("first"), Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+    assert!(s.put(&Key::new("second"), Bytes::new()).await.is_err());
+}
+
+/// Callers that queue behind one refresh use what it fetched, and fetch again only when
+/// that is itself already expired.
+#[tokio::test]
+async fn callers_waiting_on_a_refresh_share_its_answer() {
+    let fake = FakeS3::start().await.unwrap();
+    let now = unix_now();
+    let meta = imds(vec![(200, json_credentials(now + 6 * 3600))]).await;
+    let s = store_with(
+        &fake,
+        Provider::Imds {
+            endpoint: meta.url.clone(),
+        },
+    )
+    .await;
+    let (ka, kb, kc) = (Key::new("a"), Key::new("b"), Key::new("c"));
+    let (a, b, c) = tokio::join!(
+        s.put(&ka, Bytes::from_static(b"v")),
+        s.put(&kb, Bytes::from_static(b"v")),
+        s.put(&kc, Bytes::from_static(b"v")),
+    );
+    a.unwrap();
+    b.unwrap();
+    c.unwrap();
+    assert_eq!(credential_fetches(&meta), 1);
+
+    // What the first caller fetched expires this second: the second caller fetches again.
+    let meta = imds(vec![(200, json_credentials(unix_now()))]).await;
+    let s = store_with(
+        &fake,
+        Provider::Imds {
+            endpoint: meta.url.clone(),
+        },
+    )
+    .await;
+    let (kd, ke) = (Key::new("d"), Key::new("e"));
+    let (a, b) = tokio::join!(
+        s.put(&kd, Bytes::from_static(b"v")),
+        s.put(&ke, Bytes::from_static(b"v")),
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(credential_fetches(&meta), 2);
     assert_eq!(fake.bad_signatures(), 0);
 }
 
