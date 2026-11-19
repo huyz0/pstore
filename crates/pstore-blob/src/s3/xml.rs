@@ -56,12 +56,12 @@ fn unescape(s: &str) -> String {
 }
 
 /// Every `<tag>text</tag>` in `body`, in order, unescaped.
-fn all(body: &str, tag: &str) -> Vec<String> {
+pub(crate) fn all(body: &str, tag: &str) -> Vec<String> {
     raw_elements(body, tag).into_iter().map(unescape).collect()
 }
 
 /// The first `<tag>`'s text.
-pub(super) fn text(body: &[u8], tag: &str) -> Option<String> {
+pub(crate) fn text(body: &[u8], tag: &str) -> Option<String> {
     all(std::str::from_utf8(body).ok()?, tag).into_iter().next()
 }
 
@@ -79,7 +79,7 @@ pub(super) fn list_keys(body: &[u8]) -> Vec<String> {
 }
 
 /// Every `<tag>...</tag>`'s inner text, raw.
-fn raw_elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
+pub(crate) fn raw_elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
     let mut out = Vec::new();
     let mut rest = body;

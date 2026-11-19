@@ -7,9 +7,12 @@
 )]
 
 use bytes::Bytes;
+#[cfg(feature = "compat")]
+use pstore_blob::ObjectStoreBackend;
 use pstore_blob::s3::S3Backend;
-use pstore_blob::{BlobError, BlobStore, CasError, Key, ObjectStoreBackend, Precondition};
+use pstore_blob::{BlobError, BlobStore, CasError, Key, Precondition};
 use pstore_testkit::fake_s3::{BUCKET, FakeS3, Fault, KEY_ID, REGION, SECRET};
+#[cfg(feature = "compat")]
 use std::sync::Arc;
 
 fn native(fake: &FakeS3) -> S3Backend {
@@ -17,7 +20,9 @@ fn native(fake: &FakeS3) -> S3Backend {
 }
 
 /// `object_store`'s S3 client on the same fake, with its retries off so a fault is seen
-/// once, as the native client sees it.
+/// once, as the native client sees it. Needs `compat` (M288), the feature that brings
+/// `object_store`'s cloud clients.
+#[cfg(feature = "compat")]
 fn object_store(fake: &FakeS3) -> ObjectStoreBackend {
     let s3 = object_store::aws::AmazonS3Builder::new()
         .with_endpoint(fake.endpoint())
@@ -42,6 +47,7 @@ fn puts(fake: &FakeS3) -> usize {
         .count()
 }
 
+#[cfg(feature = "compat")]
 #[tokio::test]
 async fn native_s3_conformance() {
     let fake = FakeS3::start().await.unwrap();

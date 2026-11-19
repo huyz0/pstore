@@ -1,5 +1,8 @@
 //! M282: the S3 client's retry policy, against a fake S3 that answers `503` after a write lands.
 //!
+//! The `object_store` tests need `--features object-store-client` (M288), which CI's
+//! `--all-features` turns on; the native client's run in every build.
+//!
 //! ⚠️ **A conditional write that got a status is never repeated.** A `503` does not prove the
 //! write did not commit, and a repeat of one that did meets its own object as a rival: `412`,
 //! read as `Lost`, so a bundle's own write reads as another writer on its lane and a HEAD
@@ -14,7 +17,9 @@
 
 use bytes::Bytes;
 use pstore_blob::{BlobStore, CasError, Key, Precondition};
-use pstore_server::{Profile, s3_store};
+use pstore_server::Profile;
+#[cfg(feature = "object-store-client")]
+use pstore_server::s3_store;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -151,6 +156,7 @@ async fn serve() -> (String, Arc<Mutex<Fake>>) {
     (endpoint, fake)
 }
 
+#[cfg(feature = "object-store-client")]
 async fn store(endpoint: &str) -> pstore_blob::ObjectStoreBackend {
     let creds = ("key".to_owned(), "secret".to_owned());
     s3_store(
@@ -168,6 +174,7 @@ fn seen(fake: &Mutex<Fake>, method: &str) -> usize {
     fake.seen.iter().filter(|r| r.starts_with(method)).count()
 }
 
+#[cfg(feature = "object-store-client")]
 #[tokio::test]
 async fn a_conditional_write_that_lands_and_then_gets_a_503_is_not_repeated() {
     let (endpoint, fake) = serve().await;
@@ -189,6 +196,7 @@ async fn a_conditional_write_that_lands_and_then_gets_a_503_is_not_repeated() {
     );
 }
 
+#[cfg(feature = "object-store-client")]
 #[tokio::test]
 async fn a_read_that_gets_a_503_is_retried() {
     let (endpoint, fake) = serve().await;
@@ -204,6 +212,7 @@ async fn a_read_that_gets_a_503_is_retried() {
     assert_eq!(seen(&fake, "GET"), 2);
 }
 
+#[cfg(feature = "object-store-client")]
 #[tokio::test]
 async fn an_unconditional_write_that_gets_a_503_is_retried() {
     let (endpoint, fake) = serve().await;
@@ -216,6 +225,7 @@ async fn an_unconditional_write_that_gets_a_503_is_retried() {
 }
 
 /// Azure goes through the same pair of clients (M46's `azure_store`).
+#[cfg(feature = "object-store-client")]
 #[tokio::test]
 async fn an_azure_conditional_write_that_lands_and_then_gets_a_503_is_not_repeated() {
     let (endpoint, fake) = serve().await;
@@ -246,6 +256,7 @@ async fn an_azure_conditional_write_that_lands_and_then_gets_a_503_is_not_repeat
 }
 
 /// The policies, by number: a dependency bump cannot move them unseen.
+#[cfg(feature = "object-store-client")]
 #[test]
 fn the_retry_policies_are_pinned() {
     let r = pstore_server::retries();
@@ -265,6 +276,7 @@ fn the_retry_policies_are_pinned() {
 /// `retries()` is `object_store`'s own default today, so the mutant that replaces it with
 /// `Default::default()` changes nothing and is excluded in `.cargo/mutants.toml`. This is that
 /// exclusion's premise: a bump that moves the default fails here, and the mutant matters again.
+#[cfg(feature = "object-store-client")]
 #[test]
 fn the_retry_policy_is_object_stores_default() {
     fn default_of<T: Default>(_: &T) -> T {

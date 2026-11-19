@@ -8,8 +8,11 @@
 )]
 
 use bytes::Bytes;
-use pstore_blob::{BlobStore, CasError, Key, Precondition};
-use pstore_server::{BlobClient, Config, ConfigError, Profile, open_s3};
+use pstore_blob::{BlobStore, Key};
+#[cfg(feature = "object-store-client")]
+use pstore_blob::{CasError, Precondition};
+use pstore_server::{AzureConfig, BlobClient, Config, ConfigError, Profile, open_azure, open_s3};
+use pstore_testkit::fake_azure::FakeAzure;
 use pstore_testkit::fake_s3::{BUCKET, FakeS3, KEY_ID, SECRET};
 
 fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -44,6 +47,7 @@ fn blob_client_setting_is_parsed_and_refused_when_unknown() {
     assert_eq!(BlobClient::default(), BlobClient::Native);
 }
 
+#[cfg(feature = "object-store-client")]
 async fn open(fake: &FakeS3, client: BlobClient) -> std::sync::Arc<dyn BlobStore> {
     let keys = (KEY_ID.to_owned(), SECRET.to_owned());
     open_s3(
@@ -59,6 +63,7 @@ async fn open(fake: &FakeS3, client: BlobClient) -> std::sync::Arc<dyn BlobStore
 }
 
 /// Everything the engine asks of a store, as text, so two clients' runs compare whole.
+#[cfg(feature = "object-store-client")]
 async fn run(s: &dyn BlobStore, prefix: &str) -> Vec<String> {
     let k = |n: &str| Key::new(format!("{prefix}/{n}"));
     let mut out = Vec::new();
@@ -153,6 +158,7 @@ async fn run(s: &dyn BlobStore, prefix: &str) -> Vec<String> {
     out
 }
 
+#[cfg(feature = "object-store-client")]
 #[tokio::test]
 async fn both_s3_clients_serve_the_same_answers() {
     let fake = FakeS3::start().await.unwrap();
@@ -217,4 +223,126 @@ async fn the_native_client_finds_keys_through_the_chain_without_static_ones() {
         )
         .is_err()
     );
+}
+
+fn azure_config(fake: &FakeAzure) -> AzureConfig {
+    AzureConfig {
+        account: pstore_testkit::fake_azure::ACCOUNT.to_owned(),
+        key: Some(pstore_testkit::fake_azure::KEY.to_owned()),
+        container: pstore_testkit::fake_azure::CONTAINER.to_owned(),
+        endpoint: Some(fake.endpoint()),
+    }
+}
+
+/// M288: the same run through both clients, on S3 and on Azure, each on its fake.
+#[cfg(feature = "object-store-client")]
+#[tokio::test]
+async fn both_blob_clients_serve_the_same_answers() {
+    let s3 = FakeS3::start().await.unwrap();
+    let s3_native = run(&*open(&s3, BlobClient::Native).await, "n").await;
+    let s3_theirs = run(&*open(&s3, BlobClient::ObjectStore).await, "o").await;
+    assert_eq!(s3_native, s3_theirs);
+
+    let az = FakeAzure::start().await.unwrap();
+    let open_az = |client| open_azure(client, &azure_config(&az), Profile::Conforming, |_| None);
+    let az_native = run(&*open_az(BlobClient::Native).unwrap(), "n").await;
+    let az_theirs = run(&*open_az(BlobClient::ObjectStore).unwrap(), "o").await;
+    assert_eq!(az_native, az_theirs);
+    // The conditional writes won and lost as they should, and Azure refused the suffix
+    // read (C-14) where S3 served it: the one line the two backends differ on.
+    assert!(az_native[7].starts_with("Ok"), "{az_native:?}");
+    assert_eq!(az_native[8], "Err(true)");
+    assert_eq!(az_native[10], "Err(true)");
+    let differ: Vec<usize> = (0..s3_native.len())
+        .filter(|&i| s3_native[i] != az_native[i])
+        .collect();
+    assert_eq!(differ, [3], "{s3_native:?}\n{az_native:?}");
+    assert_eq!(az.bad_signatures(), 0);
+    assert_eq!(s3.bad_signatures(), 0);
+}
+
+/// M288: a default build has only the native client and refuses `object_store` by name, at
+/// open, for S3 and Azure alike. With the feature, the same calls open. CI runs this test in
+/// both builds (`.github/workflows/ci.yml`, the `test` job).
+#[tokio::test]
+async fn object_store_mode_needs_its_feature() {
+    let s3 = FakeS3::start().await.unwrap();
+    let az = FakeAzure::start().await.unwrap();
+    let keys = (KEY_ID.to_owned(), SECRET.to_owned());
+    let s3_opened = open_s3(
+        BlobClient::ObjectStore,
+        &s3.endpoint(),
+        BUCKET,
+        Some(&keys),
+        pstore_testkit::fake_s3::REGION,
+        Profile::Conforming,
+        |_| None,
+    )
+    .map(|_| ());
+    let az_opened = open_azure(
+        BlobClient::ObjectStore,
+        &azure_config(&az),
+        Profile::Conforming,
+        |_| None,
+    )
+    .map(|_| ());
+    if cfg!(feature = "object-store-client") {
+        assert_eq!(s3_opened, Ok(()));
+        assert_eq!(az_opened, Ok(()));
+    } else {
+        let refused = Err(pstore_server::OBJECT_STORE_ABSENT.to_owned());
+        assert_eq!(s3_opened, refused);
+        assert_eq!(az_opened, refused);
+        assert!(pstore_server::OBJECT_STORE_ABSENT.contains("object-store-client"));
+    }
+    // The native client opens in every build.
+    assert!(
+        open_azure(
+            BlobClient::Native,
+            &azure_config(&az),
+            Profile::Conforming,
+            |_| None
+        )
+        .is_ok()
+    );
+}
+
+/// M288: the native Azure client with no key takes a bearer token from the chain, here IMDS's.
+#[tokio::test]
+async fn the_native_azure_client_takes_a_token_without_a_key() {
+    let az = FakeAzure::start().await.unwrap();
+    az.accept_bearer("imds-token");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let imds = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            let mut buf = [0_u8; 4096];
+            let _ = tcp.read(&mut buf).await;
+            let body = r#"{"access_token":"imds-token","expires_on":"4102444800"}"#;
+            let _ = tcp
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    });
+    let mut config = azure_config(&az);
+    config.key = None;
+    let s = pstore_server::native_azure_store(&config, Profile::Conforming, |k| {
+        (k == "AZURE_IMDS_ENDPOINT").then(|| imds.clone())
+    })
+    .unwrap();
+    s.put(&Key::new("k"), Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+    assert_eq!(az.bad_signatures(), 0);
+    assert_eq!(s.capabilities().backend, "azure(devstoreaccount1)");
+    // The public endpoint when none is given: offline, so only that it builds.
+    config.endpoint = None;
+    assert!(pstore_server::native_azure_store(&config, Profile::Conforming, |_| None).is_ok());
 }

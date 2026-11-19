@@ -96,9 +96,39 @@ Admits durable writes: **true**
 
 Admits durable writes: **true**
 
+## azurite-native
+
+| probe | outcome |
+|---|---|
+| `create_if_absent` | Supported |
+| `compare_and_swap` | Supported |
+| `concurrent_create_one_winner` | Supported |
+| `concurrent_cas_one_winner` | Supported |
+| `cas_after_delete_is_lost` | Supported |
+| `aba_resistance` | Supported |
+| `ranged_read` | Supported |
+| `suffix_read` | Divergent — suffix read failed: blob store error: Operation not supported: Azure does not support suffix range requests |
+| `range_past_end_is_an_error` | Supported |
+| `coalesced_read` | Supported |
+| `get_tag` | Supported |
+| `missing_key_is_an_error` | Supported |
+| `batch_delete` | Supported |
+
+| field | source | value |
+|---|---|---|
+| `cas` | measured | Supported |
+| `create_if_absent` | measured | Supported |
+| `suffix_read` | measured | false |
+| `backend` | declared | `azurite-native` |
+| `delete_is_free` | declared | false |
+| `max_batch_delete` | declared | 256 |
+| `coalesce_gap` | declared | 1048576 |
+
+Admits durable writes: **true**
+
 ## fake-gcs-server
 
-**UNREACHABLE** — blob store error: Generic GCS error: Error performing PUT http://localhost:4443/pstore/conformance%2Ffake%2Dgcs%2Dserver%2Fcanary in 1.945739ms - Server returned non-2xx status code: 400 Bad Request: {"error":{"code":400,"message":"invalid uploadType","errors":[{"domain":"global","reason":"invalid","message":"invalid uploadType"}]}}
+**UNREACHABLE** — blob store error: Generic GCS error: Error performing PUT http://localhost:4443/pstore/conformance%2Ffake%2Dgcs%2Dserver%2Fcanary in 4.180747ms - Server returned non-2xx status code: 400 Bad Request: {"error":{"code":400,"message":"invalid uploadType","errors":[{"domain":"global","reason":"invalid","message":"invalid uploadType"}]}}
 
 
 No probe ran. This is recorded as an absence, never as a pass.

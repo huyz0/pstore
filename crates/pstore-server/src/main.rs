@@ -7,7 +7,7 @@
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore};
 use pstore_server::{
-    Api, Backend, Config, Profile, SourceConfig, azure_store, open_cache, open_s3, serve_folding,
+    Api, Backend, Config, Profile, SourceConfig, open_azure, open_cache, open_s3, serve_folding,
 };
 use std::sync::Arc;
 
@@ -67,10 +67,11 @@ async fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+        // M288: through the client `PSTORE_BLOB_CLIENT` names, as S3 is.
         Backend::Azure => match config
             .azure
             .as_ref()
-            .map(|a| azure_store(a, config.profile))
+            .map(|a| open_azure(config.client, a, config.profile, |k| std::env::var(k).ok()))
         {
             Some(Ok(store)) => run(Accounted::new(store), &config, auth, limits, peer).await,
             Some(Err(e)) => {

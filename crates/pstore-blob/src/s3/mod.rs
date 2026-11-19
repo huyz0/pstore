@@ -10,7 +10,7 @@
 
 pub mod creds;
 pub mod sign;
-mod xml;
+pub(crate) mod xml;
 
 use crate::{BlobError, BlobStore, Capabilities, CasError, Key, Precondition, PutOutcome};
 use bytes::Bytes;
@@ -25,10 +25,13 @@ use std::ops::Range;
 
 type Https = hyper_rustls::HttpsConnector<HttpConnector>;
 /// The one HTTP client type: the store's requests, and the credential providers'.
-pub(crate) type Http = Client<Https, Full<Bytes>>;
+pub type Http = Client<Https, Full<Bytes>>;
 
 /// An HTTP/1 client that speaks both `http://` (emulators, IMDS, ECS) and `https://`.
-fn http_client() -> Result<Http, BlobError> {
+///
+/// # Errors
+/// A system with no TLS roots.
+pub fn http_client() -> Result<Http, BlobError> {
     let tls = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
         .map_err(|e| BlobError::Other(format!("no TLS roots: {e}")))?

@@ -8113,9 +8113,73 @@ pub fn open_s3(
             native_s3_store(endpoint, name, credentials, region, profile, lookup)
                 .map_err(|e| e.to_string())?,
         ),
+        #[cfg(feature = "object-store-client")]
         BlobClient::ObjectStore => std::sync::Arc::new(
             s3_store(endpoint, name, credentials, region, profile).map_err(|e| e.to_string())?,
         ),
+        #[cfg(not(feature = "object-store-client"))]
+        BlobClient::ObjectStore => return Err(OBJECT_STORE_ABSENT.to_owned()),
+    })
+}
+
+/// Why a default build refuses `PSTORE_BLOB_CLIENT=object_store` (M288): by name, at startup.
+pub const OBJECT_STORE_ABSENT: &str = "PSTORE_BLOB_CLIENT=object_store needs a pstore-server built \
+     with the object-store-client feature; this build has only the native client";
+
+/// The Azure container `config` names through pstore's own client (M288), with `profile`'s
+/// capabilities.
+///
+/// The account key when one is given (SharedKey); otherwise a bearer token from the chain over
+/// `lookup`: a client secret, workload identity, the App Service identity endpoint, then
+/// IMDS (`pstore_blob::azure::token`).
+///
+/// # Errors
+/// A malformed endpoint, a key that is not base64, or a system with no TLS roots.
+pub fn native_azure_store(
+    config: &AzureConfig,
+    profile: Profile,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<pstore_blob::azure::AzureBackend, pstore_blob::BlobError> {
+    use pstore_blob::azure::{AzureAuth, AzureBackend, token::Provider};
+    let auth = match &config.key {
+        Some(key) => AzureAuth::Key(key.clone()),
+        None => AzureAuth::Token(Provider::from_vars(lookup)),
+    };
+    AzureBackend::new(
+        pstore_blob::azure::AzureConfig {
+            account: config.account.clone(),
+            container: config.container.clone(),
+            endpoint: config
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", config.account)),
+            timeout: std::time::Duration::from_secs(30),
+        },
+        auth,
+        azure_capabilities(&config.account, profile),
+    )
+}
+
+/// The Azure container through `client`: [`native_azure_store`] or [`azure_store`].
+///
+/// # Errors
+/// The chosen client's refusal to build, as text.
+pub fn open_azure(
+    client: BlobClient,
+    config: &AzureConfig,
+    profile: Profile,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<std::sync::Arc<dyn pstore_blob::BlobStore>, String> {
+    Ok(match client {
+        BlobClient::Native => std::sync::Arc::new(
+            native_azure_store(config, profile, lookup).map_err(|e| e.to_string())?,
+        ),
+        #[cfg(feature = "object-store-client")]
+        BlobClient::ObjectStore => {
+            std::sync::Arc::new(azure_store(config, profile).map_err(|e| e.to_string())?)
+        }
+        #[cfg(not(feature = "object-store-client"))]
+        BlobClient::ObjectStore => return Err(OBJECT_STORE_ABSENT.to_owned()),
     })
 }
 
@@ -8128,6 +8192,7 @@ pub fn open_s3(
 ///
 /// # Errors
 /// The client's refusal to build.
+#[cfg(feature = "object-store-client")]
 pub fn s3_store(
     endpoint: &str,
     name: &str,
@@ -8159,6 +8224,7 @@ pub fn s3_store(
 /// a `5xx`, a `429`, a `408` or a connection error. Reads, unconditional PUTs (a segment, a
 /// sidecar: written once at a derived key) and deletes are idempotent, so a repeat is safe.
 #[must_use]
+#[cfg(feature = "object-store-client")]
 pub fn retries() -> object_store::RetryConfig {
     object_store::RetryConfig {
         backoff: object_store::BackoffConfig {
@@ -8177,6 +8243,7 @@ pub fn retries() -> object_store::RetryConfig {
 /// once retries are on, so this gives up the connect-error retry too, and the engine's own
 /// protocol (M17's read-back, a fold's next tick, a client's retry) takes its place.
 #[must_use]
+#[cfg(feature = "object-store-client")]
 pub fn conditional_retries() -> object_store::RetryConfig {
     object_store::RetryConfig {
         max_retries: 0,
@@ -8199,6 +8266,7 @@ pub fn azure_capabilities(account: &str, profile: Profile) -> pstore_blob::Capab
 ///
 /// # Errors
 /// The client's refusal to build, which with an account present is a malformed endpoint.
+#[cfg(feature = "object-store-client")]
 pub fn azure_store(
     config: &AzureConfig,
     profile: Profile,

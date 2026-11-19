@@ -18,14 +18,17 @@ ignore = [
     { id = "RUSTSEC-2026-0403", reason = "zstd legacy-frame decompress_stream into a Vec; no caller decodes a stream into a Vec; pinned by foyer 0.22.3 and chitchat 0.13; owner accepted 2026-10-26" },
     { id = "RUSTSEC-2026-0410", reason = "zstd-sys allocator shim on wasm32 only; pstore ships no wasm32 target; pinned by foyer 0.22.3 and chitchat 0.13; owner accepted 2026-10-26" },
     # chrono and humantime are unmaintained (2026-09-14), not vulnerable, and have no safe
-    # version. `object_store` 0.14 requires both, with no feature to drop them, and `parquet`
-    # (a dev-dependency, M235's export tests) requires chrono. Ignored by the owner's decision
-    # (2026-11-17, confirmed for PR 74 on 2026-11-18). Remove these when M287/M288 take
-    # `object_store` out of the build and `parquet` no longer brings chrono
-    # (docs/comparisons/object-store-layer-2026-11-18.md): the gate warns about an ignore that
-    # matches nothing.
-    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, not vulnerable; via object_store 0.14 and dev-dependency parquet; owner accepted 2026-11-17 pending the M287/M288 swap" },
-    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained, not vulnerable; via object_store 0.14; owner accepted 2026-11-17 pending the M287/M288 swap" },
+    # version. Since M288 neither is in the DEFAULT build: `object_store`, which requires both
+    # with no feature to drop them, is behind `pstore-server`'s non-default
+    # `object-store-client` (the `PSTORE_BLOB_CLIENT=object_store` mode) and `pstore-blob`'s
+    # own features. CI's cargo-deny step scans `--all-features`, which turns that mode on, so
+    # both ignores stay while the mode exists. `parquet` (a dev-dependency, M235's export
+    # tests) also requires chrono. Ignored by the owner's decision (2026-11-17, confirmed for
+    # PR 74 on 2026-11-18). Remove humantime's when the `object_store` mode is retired, and
+    # chrono's when `parquet` no longer brings it: the gate warns about an ignore that matches
+    # nothing.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, not vulnerable; via the opt-in object-store-client build and dev-dependency parquet; owner accepted 2026-11-17" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained, not vulnerable; only via the opt-in object-store-client build (object_store 0.14) since M288; owner accepted 2026-11-17" },
 ]
 
 [licenses]

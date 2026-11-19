@@ -114,6 +114,30 @@ fn s3_native(name: &str) -> Result<Arc<dyn BlobStore>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// pstore's own Azure client (M288) on the same Azurite, with its well-known account key: its
+/// rows must agree with `object_store`'s, or the server's default Azure client stays
+/// `object_store`.
+fn azure_native(name: &str) -> Result<Arc<dyn BlobStore>, String> {
+    // Azurite's published development key, the same one `scripts/conformance.sh` signs with.
+    const AZURITE_KEY: &str =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+    pstore_blob::azure::AzureBackend::new(
+        pstore_blob::azure::AzureConfig {
+            account: "devstoreaccount1".to_owned(),
+            container: env("PSTORE_AZURE_CONTAINER", "pstore"),
+            endpoint: format!(
+                "{}/devstoreaccount1",
+                env("PSTORE_AZURE_ENDPOINT", "http://127.0.0.1:10000")
+            ),
+            timeout: std::time::Duration::from_secs(30),
+        },
+        pstore_blob::azure::AzureAuth::Key(AZURITE_KEY.to_owned()),
+        pstore_blob::s3::S3Backend::unprobed(name),
+    )
+    .map(|s| Arc::new(s) as Arc<dyn BlobStore>)
+    .map_err(|e| e.to_string())
+}
+
 /// An `object_store` client, behind [`ObjectStoreBackend`].
 fn through_object_store(
     build: fn() -> Result<Arc<dyn object_store::ObjectStore>, String>,
@@ -197,6 +221,8 @@ async fn main() {
         // two runs never meet each other's objects.
         ("rustfs-native", s3_native("rustfs-native")),
         ("azurite", through_object_store(azure, "azurite")),
+        // M288: the same emulator through the native client.
+        ("azurite-native", azure_native("azurite-native")),
         (
             "fake-gcs-server",
             through_object_store(gcs, "fake-gcs-server"),

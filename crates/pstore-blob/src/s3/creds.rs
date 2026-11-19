@@ -55,13 +55,45 @@ pub enum Provider {
     },
 }
 
-/// Credentials and when they stop working, in Unix seconds (`None`: never).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Expiring {
+/// Credentials and when they stop working, in Unix seconds (`None`: never). S3's keys by
+/// default; an Azure bearer token for M288's providers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Expiring<T = Credentials> {
     /// The keys.
-    pub credentials: Arc<Credentials>,
-    /// When AWS stops accepting them.
+    pub credentials: Arc<T>,
+    /// When the service stops accepting them.
     pub expires: Option<u64>,
+}
+
+impl<T> Clone for Expiring<T> {
+    fn clone(&self) -> Self {
+        Self {
+            credentials: Arc::clone(&self.credentials),
+            expires: self.expires,
+        }
+    }
+}
+
+/// What a [`Cache`] asks for temporary credentials: S3's [`Provider`], or Azure's token
+/// providers (M288), so both refresh by one rule.
+pub trait Source: std::fmt::Debug + Send + Sync {
+    /// What it answers.
+    type Secret: std::fmt::Debug + PartialEq + Send + Sync;
+    /// Asks once.
+    fn fetch(
+        &self,
+        http: &super::Http,
+    ) -> impl std::future::Future<Output = Result<Expiring<Self::Secret>, BlobError>> + Send;
+}
+
+impl Source for Provider {
+    type Secret = Credentials;
+    fn fetch(
+        &self,
+        http: &super::Http,
+    ) -> impl std::future::Future<Output = Result<Expiring, BlobError>> + Send {
+        self.fetch_once(http)
+    }
 }
 
 impl Provider {
@@ -114,7 +146,7 @@ impl Provider {
     }
 
     /// Asks the provider once.
-    async fn fetch(&self, http: &super::Http) -> Result<Expiring, BlobError> {
+    async fn fetch_once(&self, http: &super::Http) -> Result<Expiring, BlobError> {
         match self {
             Self::Static(c) => Ok(Expiring {
                 credentials: Arc::new(c.clone()),
@@ -211,14 +243,14 @@ impl Provider {
     }
 }
 
-fn read_token(path: &std::path::Path) -> Result<String, BlobError> {
+pub(crate) fn read_token(path: &std::path::Path) -> Result<String, BlobError> {
     std::fs::read_to_string(path)
         .map(|t| t.trim().to_owned())
         .map_err(|e| BlobError::Other(format!("cannot read {}: {e}", path.display())))
 }
 
 /// One bodiless request to a credential endpoint: [`send`].
-async fn get(
+pub(crate) async fn get(
     http: &super::Http,
     method: Method,
     uri: &str,
@@ -229,7 +261,7 @@ async fn get(
 }
 
 /// One request to a credential endpoint, and its body if it answered 200.
-async fn send(
+pub(crate) async fn send(
     http: &super::Http,
     method: Method,
     uri: &str,
@@ -339,17 +371,17 @@ pub fn rfc3339(s: &str) -> Result<u64, BlobError> {
 
 /// A provider and what it last answered.
 #[derive(Debug)]
-pub struct Cache {
-    provider: Provider,
+pub struct Cache<P: Source = Provider> {
+    provider: P,
     http: super::Http,
-    current: Mutex<Option<Expiring>>,
+    current: Mutex<Option<Expiring<P::Secret>>>,
     refresh: tokio::sync::Mutex<()>,
 }
 
-impl Cache {
+impl<P: Source> Cache<P> {
     /// Nothing fetched yet: the first request fetches.
     #[must_use]
-    pub fn new(provider: Provider, http: super::Http) -> Self {
+    pub fn new(provider: P, http: super::Http) -> Self {
         Self {
             provider,
             http,
@@ -358,7 +390,7 @@ impl Cache {
         }
     }
 
-    fn cached(&self) -> Option<Expiring> {
+    fn cached(&self) -> Option<Expiring<P::Secret>> {
         self.current
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -374,7 +406,7 @@ impl Cache {
     ///
     /// # Errors
     /// The provider's, when there is nothing unexpired to fall back on.
-    pub async fn get(&self) -> Result<Arc<Credentials>, BlobError> {
+    pub async fn get(&self) -> Result<Arc<P::Secret>, BlobError> {
         let now = now();
         let cached = self.cached();
         if let Some(c) = &cached {
@@ -405,14 +437,14 @@ impl Cache {
         Ok(self.store(self.provider.fetch(&self.http).await?))
     }
 
-    fn store(&self, fresh: Expiring) -> Arc<Credentials> {
+    fn store(&self, fresh: Expiring<P::Secret>) -> Arc<P::Secret> {
         let out = fresh.credentials.clone();
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(fresh);
         out
     }
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

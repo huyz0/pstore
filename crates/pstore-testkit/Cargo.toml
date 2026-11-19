@@ -34,6 +34,8 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 
 [features]
 s3 = ["pstore-blob/s3-native", "dep:hyper", "dep:hyper-util", "dep:http", "dep:http-body-util", "dep:md-5", "tokio/net"]
+# M288: the fake Azure Blob service, which verifies with pstore's own SharedKey signer.
+azure = ["s3", "pstore-blob/azure-native"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
