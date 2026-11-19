@@ -9,7 +9,7 @@ and EKS the way `object_store` does.
 ## Delta
 1. **`pstore_blob::s3` gains a credential chain**, tried in `object_store`'s order, first
    that answers wins:
-   - static credentials the operator gave (`PSTORE_S3_ACCESS_KEY` / `_SECRET_KEY`, as today);
+   - static credentials the operator gave (`PSTORE_ACCESS_KEY` / `PSTORE_SECRET_KEY`, as today);
    - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` (M286's);
    - **web identity** (EKS IRSA): `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, exchanged
      with STS `AssumeRoleWithWebIdentity` (`AWS_ROLE_SESSION_NAME` optional, STS endpoint
