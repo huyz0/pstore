@@ -34,17 +34,17 @@ serde_json     = { version = "1", optional = true }
 
 [dev-dependencies]
 # M286: `s3` for the fake S3 both clients are tested against.
-pstore-testkit = { path = "../pstore-testkit", features = ["s3"] }
+pstore-testkit = { path = "../pstore-testkit", features = ["s3", "azure"] }
 # The M85 measurement example clusters real vectors; a dev-dependency cycle cargo allows.
 pstore-index = { path = "../pstore-index" }
 pstore-format = { path = "../pstore-format" }
 pstore-types = { path = "../pstore-types" }
 bytes = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+# `io-util`: the scripted endpoints of the credential tests (M287), which `object_store` used
+# to bring in as a dev-dependency.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "io-util", "net"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "alloc"] }
 async-trait = "0.1"
-# `aws` (M286): `object_store`'s S3 client on the fake, beside pstore's own.
-object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
 hyper = { version = "1", default-features = false }
 # M286's bench counts the clients' allocations.
 stats_alloc = "0.1.10"
@@ -56,6 +56,9 @@ object_store = ["dep:object_store"]
 # M286: `S3Backend`, pstore's own S3 client, which needs neither `object_store` nor what it
 # brings (chrono, humantime, reqwest, quinn).
 s3-native = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:http", "dep:http-body-util", "dep:ring", "dep:md-5", "dep:base64", "dep:serde_json"]
+# M288: `AzureBackend`, pstore's own Azure client. It shares M286's HTTP client, signer helpers
+# and M287's credential cache, so it needs nothing `s3-native` does not already bring.
+azure-native = ["s3-native"]
 # M107: GCS's batch delete, one request for up to 100 objects. Not in `pstore-server`'s
 # features: GCS is not a server backend (the capability matrix), only a probe target.
 gcs = ["object_store", "object_store/gcp", "dep:http"]
@@ -68,6 +71,8 @@ compat = [
     "object_store/azure",
     # M287: pstore's own S3 client, probed on `rustfs` beside `object_store`'s.
     "s3-native",
+    # M288: and its own Azure client, on Azurite.
+    "azure-native",
 ]
 
 [[example]]
@@ -76,7 +81,7 @@ required-features = ["compat"]
 
 [[example]]
 name = "s3_clients"
-required-features = ["object_store", "s3-native"]
+required-features = ["compat"]
 
 [[example]]
 name = "coalesce_s3"

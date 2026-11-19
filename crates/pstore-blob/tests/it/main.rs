@@ -14,6 +14,7 @@ mod coalescing;
 mod dyn_store;
 mod faults;
 mod memory_tags;
+mod native_azure;
 mod native_s3;
 mod native_s3_creds;
 mod object_store_adapter;

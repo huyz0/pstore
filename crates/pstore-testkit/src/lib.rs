@@ -8,6 +8,8 @@ pub mod budget;
 pub mod claims;
 pub mod conformance;
 pub mod depth;
+#[cfg(feature = "azure")]
+pub mod fake_azure;
 #[cfg(feature = "s3")]
 pub mod fake_s3;
 pub mod flaky;

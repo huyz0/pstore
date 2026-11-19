@@ -17,6 +17,9 @@ mod memory;
 mod object_store_backend;
 #[cfg(feature = "s3-native")]
 pub mod s3;
+// M288: pstore's own Azure client, on the S3 client's HTTP stack and credential cache.
+#[cfg(feature = "azure-native")]
+pub mod azure;
 mod scanning;
 mod store;
 mod types;

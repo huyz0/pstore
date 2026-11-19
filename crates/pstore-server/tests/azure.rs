@@ -14,11 +14,11 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use pstore_blob::{Accounted, BlobStore, ObjectStoreBackend};
+use pstore_blob::{Accounted, BlobStore};
 use pstore_engine::Engine;
 use pstore_format::{Document, Impact, Value, VectorField};
 use pstore_query::{Fusion, Prefetch};
-use pstore_server::{Api, Config, Profile, azure_store};
+use pstore_server::{Api, Config, Profile, open_azure};
 use pstore_types::{Epoch, LaneId, TenantId};
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
@@ -91,7 +91,7 @@ async fn ranked<S: BlobStore + 'static>(e: &Engine<S>, at: Option<Epoch>) -> Str
 
 /// One request through the server's own router, as a client sends it.
 async fn send(
-    api: &Arc<Api<ObjectStoreBackend>>,
+    api: &Arc<Api<Arc<dyn BlobStore>>>,
     tenant: TenantId,
     method: &str,
     uri: &str,
@@ -127,7 +127,11 @@ async fn the_server_writes_folds_and_answers_as_of_against_azurite() {
     // The server's own stack -- `Accounted`, its tenant views, the routes -- over Azure.
     let config = Config::from_vars(|k| std::env::var(k).ok()).unwrap();
     let azure = config.azure.expect("PSTORE_BACKEND=azure");
-    let store = azure_store(&azure, Profile::Conforming).unwrap();
+    // M288: through the client `PSTORE_BLOB_CLIENT` names, native unset, as `main` opens it.
+    let store = open_azure(config.client, &azure, Profile::Conforming, |k| {
+        std::env::var(k).ok()
+    })
+    .unwrap();
     let api = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
     let tenant = TenantId(T.0 + 1000 + u128::from(std::process::id() % 1000));
     let mut at = 0;
@@ -173,7 +177,11 @@ async fn the_server_writes_folds_and_answers_as_of_against_azurite() {
 async fn writes_folds_queries_and_reads_as_of_against_azurite() {
     let config = Config::from_vars(|k| std::env::var(k).ok()).unwrap();
     let azure = config.azure.expect("PSTORE_BACKEND=azure");
-    let store = azure_store(&azure, Profile::Conforming).unwrap();
+    // M288: through the client `PSTORE_BLOB_CLIENT` names, native unset, as `main` opens it.
+    let store = open_azure(config.client, &azure, Profile::Conforming, |k| {
+        std::env::var(k).ok()
+    })
+    .unwrap();
     assert!(!store.capabilities().suffix_read);
     // The profile admits durable writes, so a server would serve this container.
     assert!(Api::unsecured(Accounted::new(store.clone()), LaneId(9)).is_ok());
@@ -205,11 +213,12 @@ async fn writes_folds_queries_and_reads_as_of_against_azurite() {
     assert_eq!(ranked(&r, Some(at)).await, before, "as_of differs");
 }
 
+#[cfg(feature = "object-store-client")]
 #[test]
 fn the_azure_store_builds_offline_and_names_its_account() {
     // Not ignored: building a client reaches no network, so what `main` does with the
     // configuration is checked here and not only against Azurite.
-    use pstore_server::AzureConfig;
+    use pstore_server::{AzureConfig, azure_store};
     let with = |key: Option<&str>, endpoint: Option<&str>| AzureConfig {
         account: "acct".to_owned(),
         key: key.map(str::to_owned),
@@ -227,4 +236,42 @@ fn the_azure_store_builds_offline_and_names_its_account() {
     // A key that is not base64 is the client's refusal to build, reported rather than
     // discovered on the first request.
     assert!(azure_store(&with(Some("not base64!"), None), Profile::Conforming).is_err());
+}
+
+/// M288: the native client, as the `object_store` test above: offline, named for its account,
+/// and a key that is not base64 refused at build.
+#[test]
+fn the_native_azure_store_builds_offline_and_names_its_account() {
+    use pstore_server::{AzureConfig, native_azure_store};
+    let with = |key: Option<&str>, endpoint: Option<&str>| AzureConfig {
+        account: "acct".to_owned(),
+        key: key.map(str::to_owned),
+        container: "pstore".to_owned(),
+        endpoint: endpoint.map(str::to_owned),
+    };
+    for c in [
+        with(None, None),
+        with(Some("a2V5"), None),
+        with(Some("a2V5"), Some("http://127.0.0.1:10000/acct")),
+    ] {
+        let store = native_azure_store(&c, Profile::Conforming, |_| None).unwrap();
+        assert_eq!(store.capabilities().backend, "azure(acct)", "{c:?}");
+        assert!(!store.capabilities().suffix_read);
+    }
+    assert!(
+        native_azure_store(
+            &with(Some("not base64!"), None),
+            Profile::Conforming,
+            |_| None
+        )
+        .is_err()
+    );
+    assert!(
+        native_azure_store(
+            &with(None, Some("ftp://nowhere")),
+            Profile::Conforming,
+            |_| None
+        )
+        .is_err()
+    );
 }

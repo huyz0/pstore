@@ -39,6 +39,18 @@ needs it, and `cargo deny` keeps its ignore while anything in the default build 
 **Not changed:** GCS (a probe target only, through `object_store` behind `gcs`), on-disk
 bytes, the `BlobStore` trait.
 
+⚠️ **Corrected (M288.2, M288.3):**
+- The token chain takes the first provider that is **configured**, not the first that
+  answers, by M287's correction: a configured provider that fails is an error.
+- The humantime ignore **stays**. CI's cargo-deny step scans `--all-features`, which turns the
+  opt-in `object-store-client` mode on, and that mode needs `object_store`. The default build
+  passes `cargo deny check advisories` without the ignore, and an all-features scan fails
+  without it. Keeping the mode as a rollback client, and the ignore with it, was decided on
+  2026-11-19, under the owner's standing "you reason and decide for me". Narrowing the CI scan
+  to the default build was not done: that changes what a gate scans.
+- Delta 1's 409 mapping: `BlobAlreadyExists` (an `If-None-Match: *` on a blob that exists) is
+  `Lost`, as `object_store` reads every 409; any other 409 is `Contended`.
+
 ## Acceptance criteria
 1. `AzureBackend` passes the conformance cases `ObjectStoreBackend::azure` does against an
    in-process fake Blob service that verifies SharedKey: `native_azure_conformance`.
