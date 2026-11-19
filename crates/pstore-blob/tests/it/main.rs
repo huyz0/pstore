@@ -14,6 +14,7 @@ mod coalescing;
 mod dyn_store;
 mod faults;
 mod memory_tags;
+mod native_s3;
 mod object_store_adapter;
 mod scanning;
 mod semantics;
