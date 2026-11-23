@@ -9,8 +9,15 @@
 use std::io;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 
-/// Tries in all, half TCP first and half UDP first.
-const TRIES: usize = 64;
+/// Tries each way: TCP first, then UDP first.
+///
+/// ⚠️ A count, not `TRIES / 2`: a mutant of that division is caught by this module's tests in
+/// 0.1 s, but `pstore-testkit` is a dev-dependency of every crate, so cargo-mutants runs the
+/// whole workspace suite on it, past CI's 600 s limit, and reports a timeout, not a kill.
+const HALF: usize = 32;
+
+/// Tries in all.
+const TRIES: usize = 2 * HALF;
 
 /// Binds `first` to any port and `second` to the port it was given, up to `tries` times. Each
 /// `first` socket whose port `second` refused is pushed to `held`, so later tries are given
@@ -48,11 +55,11 @@ fn search<T, U>(
     // Held, both halves, until the search returns.
     let mut held_tcp = Vec::new();
     let mut held_udp = Vec::new();
-    let tcp_first = match half(TRIES / 2, tcp_any, udp_on, &mut held_tcp) {
+    let tcp_first = match half(HALF, tcp_any, udp_on, &mut held_tcp) {
         Ok(pair) => return Ok(pair),
         Err(e) => e,
     };
-    match half(TRIES / 2, udp_any, tcp_on, &mut held_udp) {
+    match half(HALF, udp_any, tcp_on, &mut held_udp) {
         Ok((u, t)) => Ok((t, u)),
         Err(udp_first) => Err(format!(
             "no port free for both TCP and UDP in {TRIES} tries: TCP first, {tcp_first}; \
