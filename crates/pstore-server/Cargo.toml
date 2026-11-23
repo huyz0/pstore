@@ -11,7 +11,7 @@ repository.workspace   = true
 workspace = true
 
 [dependencies]
-pstore-blob   = { path = "../pstore-blob", features = ["object_store"] }
+pstore-blob   = { path = "../pstore-blob", features = ["s3-native", "azure-native"] }
 pstore-engine = { path = "../pstore-engine" }
 pstore-cache  = { path = "../pstore-cache" }
 pstore-format = { path = "../pstore-format" }
@@ -29,7 +29,7 @@ axum          = { version = "0.8", default-features = false, features = ["http1"
 # must never be a CAS target. Not `pstore-blob`'s `compat` feature, which pulls all three for
 # a probe example. Azure is here because M45 took the segment open off the suffix read C-14
 # found absent there.
-object_store  = { version = "0.14.1", features = ["aws", "azure"] }
+object_store  = { version = "0.14.1", features = ["aws", "azure"], optional = true }
 # D-36: a vector may arrive as base64 of little-endian `f32`s (M9d). Already in the lockfile.
 base64        = "0.22"
 # M9g: a multi-query's sub-queries run concurrently.
@@ -55,7 +55,7 @@ tokio-rustls  = { version = "0.26", default-features = false, features = ["aws_l
 tokio         = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
 
 [dev-dependencies]
-pstore-testkit = { path = "../pstore-testkit" }
+pstore-testkit = { path = "../pstore-testkit", features = ["s3", "azure"] }
 tower         = { version = "0.5", features = ["util"] }
 tokio         = { version = "1", features = ["io-util", "test-util"] }
 async-trait   = "0.1"
@@ -67,3 +67,9 @@ stats_alloc   = "0.1.10"
 regex         = { version = "1", default-features = false, features = ["std", "unicode"] }
 # M235: the reference reader an exported page must open.
 parquet       = { version = "60.1.0", default-features = false, features = ["json"] }
+
+[features]
+# M288: the `object_store` client, `PSTORE_BLOB_CLIENT=object_store`. Off by default, so a
+# default build links neither `object_store` nor what it brings (chrono, humantime, reqwest,
+# quinn). CI builds and tests with `--all-features`, so both clients stay tested.
+object-store-client = ["dep:object_store", "pstore-blob/object_store"]

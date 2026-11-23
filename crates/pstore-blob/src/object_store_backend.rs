@@ -21,6 +21,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ObjectStoreBackend {
     inner: Arc<dyn ObjectStore>,
+    /// The client conditional writes go through, when it is not `inner` (M282): one that
+    /// never repeats a request, since a repeat of a write that landed meets itself as a rival.
+    conditional: Option<Arc<dyn ObjectStore>>,
     caps: Capabilities,
     /// GCS's batch endpoint (M107), which `delete_batch` uses in place of `delete_stream`.
     #[cfg(feature = "gcs")]
@@ -37,10 +40,22 @@ impl ObjectStoreBackend {
     pub fn new(inner: Arc<dyn ObjectStore>, caps: Capabilities) -> Self {
         Self {
             inner,
+            conditional: None,
             caps,
             #[cfg(feature = "gcs")]
             batch: None,
         }
+    }
+
+    /// Sends every conditional write through `client` instead (M282): the same bucket, built
+    /// with no retries. ⚠️ A client's own retry of a conditional write that got a `5xx` repeats
+    /// a write that may have landed, and the repeat then fails its own precondition: `Lost`,
+    /// where the truth is "mine". Without the repeat the answer is an I/O error, which the
+    /// engine resolves by reading (M17), or hands back to the caller to retry.
+    #[must_use]
+    pub fn with_conditional(mut self, client: Arc<dyn ObjectStore>) -> Self {
+        self.conditional = Some(client);
+        self
     }
 
     /// A profile for a backend the conformance suite has not run against yet.
@@ -107,6 +122,7 @@ impl ObjectStoreBackend {
         };
         Self {
             inner: Arc::new(store),
+            conditional: None,
             caps: Capabilities {
                 max_batch_delete: crate::gcs_batch::MAX_BATCH,
                 delete_is_free: false,
@@ -266,7 +282,9 @@ impl crate::BlobStore for ObjectStoreBackend {
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
         match self
-            .inner
+            .conditional
+            .as_ref()
+            .unwrap_or(&self.inner)
             .put_opts(&Self::path(key), body.into(), Self::put_opts(&pre))
             .await
         {
@@ -350,13 +368,26 @@ pub(crate) fn map_cas_err(e: &object_store::Error) -> CasError {
         }
         other => {
             let s = other.to_string();
-            if s.contains("409") || s.contains("ConditionalRequestConflict") {
+            if names_409(&s) || s.contains("ConditionalRequestConflict") {
                 CasError::Contended
             } else {
                 CasError::Io(s)
             }
         }
     }
+}
+
+/// Whether `s` names the status 409: as a number of its own, never inside one. ⚠️ The
+/// message carries the request's elapsed time, so a bare `contains("409")` read a 503 that
+/// took `1.409ms` as a conflict (M287).
+fn names_409(s: &str) -> bool {
+    let b = s.as_bytes();
+    let part = |c: u8| c.is_ascii_digit() || c == b'.';
+    s.match_indices("409").any(|(i, _)| {
+        let before = i.checked_sub(1).and_then(|j| b.get(j)).copied();
+        let after = b.get(i + 3).copied();
+        !before.is_some_and(part) && !after.is_some_and(part)
+    })
 }
 
 #[cfg(test)]
@@ -479,6 +510,28 @@ mod tests {
         );
         assert_eq!(
             map_cas_err(&generic("status 409 from S3")),
+            CasError::Contended
+        );
+    }
+
+    /// M287: `object_store`'s message carries the elapsed time, and a 503 that took 1.409 ms
+    /// read as a 409: `Contended`, retried as a conflict. Found as a flake of `s3_retry`.
+    #[test]
+    fn a_409_in_the_elapsed_time_is_not_a_409() {
+        for msg in [
+            "Error performing PUT http://h/b/k in 1.409ms - Server returned non-2xx status code: 503 Service Unavailable: ",
+            "Error performing PUT http://h/b/k in 409.1ms - Server returned non-2xx status code: 503 Service Unavailable: ",
+            "Error performing PUT http://h/b/k in 14090ms - Server returned non-2xx status code: 500 Internal Server Error: ",
+        ] {
+            assert!(
+                matches!(map_cas_err(&generic(msg)), CasError::Io(_)),
+                "{msg}"
+            );
+        }
+        assert_eq!(
+            map_cas_err(&generic(
+                "Error performing PUT http://h/b/k in 1.2ms - Server returned non-2xx status code: 409 Conflict: "
+            )),
             CasError::Contended
         );
     }

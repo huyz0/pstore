@@ -3,6 +3,14 @@
 **Answers:** Q7
 **Status:** Complete (v1)
 
+> ⚠️ **Corrected by M286 (2026-11-18).** "Hand-rolled ... only worth it if `object_store`
+> blocks us" turned out to be the wrong test. `object_store` 0.14 cannot drop `chrono` and
+> `humantime`, which are flagged unmaintained, and its in-client retries hide `503`s from the
+> congestion controller (M282). A hand-rolled S3 client on `hyper` allocates 55% to 85% fewer
+> bytes a request on five of seven patterns, with CPU lower or within noise. D-1's wrapper stays.
+> What sits under it changes. See
+> [object-store-layer-2026-11-18.md](../../comparisons/object-store-layer-2026-11-18.md).
+
 ## Candidates
 
 | Crate | Backends | CAS | Verdict |

@@ -21,9 +21,29 @@ use tower::ServiceExt;
 
 type A = Arc<Api<MemoryStore>>;
 
-/// A server at `PSTORE_APPLIED_WRITES=1` on lane `lane` of `store`.
+/// A server at `PSTORE_APPLIED_WRITES=1` on lane `lane` of `store`, admitting under M128's
+/// fixed per-tenant cap.
+///
+/// ⚠️ Pinned since M280 made borrowing the default: four servers at 8 of one tenant's writes
+/// each hold at most 32 in flight, HEAD's list of outcomes (`OUTCOMES_KEPT`). Borrowing lets
+/// each hold up to 56, and then an outcome can fall off the list before its writer reads it:
+/// `outcome_unavailable`, which this test's counts cannot read. Found by CI's coverage run.
 fn api(store: &Accounted<MemoryStore>, lane: u64) -> A {
-    let api = Api::unsecured(store.clone(), LaneId(lane)).unwrap();
+    let limits = pstore_server::RequestLimits::builder()
+        .tenant_borrow_reserve(None)
+        .build()
+        .unwrap();
+    let api = Api::with_limits(
+        store.clone(),
+        LaneId(lane),
+        None,
+        pstore_server::Auth::from_vars(|k| {
+            (k == "PSTORE_ALLOW_UNAUTHENTICATED").then(|| "1".to_owned())
+        })
+        .unwrap(),
+        limits,
+    )
+    .unwrap();
     api.set_applied_writes(true);
     api
 }

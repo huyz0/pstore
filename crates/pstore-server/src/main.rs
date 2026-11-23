@@ -5,10 +5,9 @@
 //! measured at 0% coverage. Everything here is wiring, and everything with a branch worth
 //! being wrong about is in the library.
 
-use pstore_blob::{Accounted, BlobStore, MemoryStore, ObjectStoreBackend};
+use pstore_blob::{Accounted, BlobStore, MemoryStore};
 use pstore_server::{
-    Api, Backend, Config, Profile, SourceConfig, azure_store, open_cache, s3_capabilities,
-    serve_folding,
+    Api, Backend, Config, Profile, SourceConfig, open_azure, open_cache, open_s3, serve_folding,
 };
 use std::sync::Arc;
 
@@ -68,10 +67,11 @@ async fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+        // M288: through the client `PSTORE_BLOB_CLIENT` names, as S3 is.
         Backend::Azure => match config
             .azure
             .as_ref()
-            .map(|a| azure_store(a, config.profile))
+            .map(|a| open_azure(config.client, a, config.profile, |k| std::env::var(k).ok()))
         {
             Some(Ok(store)) => run(Accounted::new(store), &config, auth, limits, peer).await,
             Some(Err(e)) => {
@@ -91,8 +91,9 @@ async fn main() -> std::process::ExitCode {
 /// ⚠️ The credentials are read here and nowhere else, and `with_allow_http` is what lets this
 /// reach MinIO and an in-VPC endpoint. TLS to a real bucket is the default because the URL
 /// scheme decides it.
-fn s3(config: &Config) -> Result<impl BlobStore, Box<dyn std::error::Error>> {
+fn s3(config: &Config) -> Result<Arc<dyn BlobStore>, String> {
     bucket(
+        config,
         &config.endpoint,
         &config.bucket,
         config.credentials.as_ref(),
@@ -101,45 +102,37 @@ fn s3(config: &Config) -> Result<impl BlobStore, Box<dyn std::error::Error>> {
     )
 }
 
-/// One S3-compatible bucket.
-///
-/// ⚠️ The credentials are applied only when the operator gave both. Unset, `AmazonS3Builder`
-/// uses its own provider chain -- which is how an instance profile or a service-account role
-/// works, and the only way this image is usable on EC2 or EKS. `Config` decides; this applies.
+/// One S3-compatible bucket, through the client `PSTORE_BLOB_CLIENT` names (M287):
+/// [`pstore_server::open_s3`].
 fn bucket(
+    config: &Config,
     endpoint: &str,
     name: &str,
     credentials: Option<&(String, String)>,
     region: &str,
     profile: Profile,
-) -> Result<ObjectStoreBackend, Box<dyn std::error::Error>> {
-    let mut builder = object_store::aws::AmazonS3Builder::new()
-        .with_endpoint(endpoint)
-        .with_bucket_name(name)
-        .with_allow_http(true)
-        .with_region(region);
-    if let Some((key, secret)) = credentials {
-        builder = builder
-            .with_access_key_id(key)
-            .with_secret_access_key(secret);
-    }
-    let s3 = builder.build()?;
-    Ok(ObjectStoreBackend::new(
-        Arc::new(s3),
-        s3_capabilities(endpoint, profile),
-    ))
+) -> Result<Arc<dyn BlobStore>, String> {
+    open_s3(
+        config.client,
+        endpoint,
+        name,
+        credentials,
+        region,
+        profile,
+        |k| std::env::var(k).ok(),
+    )
 }
 
 /// A replication source (M22): read only, so it needs no fencing and no profile.
-fn source(s: &SourceConfig) -> Result<Arc<dyn BlobStore>, Box<dyn std::error::Error>> {
-    let b = bucket(
+fn source(config: &Config, s: &SourceConfig) -> Result<Arc<dyn BlobStore>, String> {
+    bucket(
+        config,
         &s.endpoint,
         &s.bucket,
         s.credentials.as_ref(),
         &s.region,
         Profile::Unprobed,
-    )?;
-    Ok(Arc::new(b))
+    )
 }
 
 fn env(key: &str, default: &str) -> String {
@@ -211,7 +204,7 @@ async fn run<S: BlobStore + 'static>(
     };
     let mut sources = std::collections::BTreeMap::new();
     for s in &config.sources {
-        match source(s) {
+        match source(config, s) {
             Ok(store) => {
                 sources.insert(s.name.clone(), store);
             }

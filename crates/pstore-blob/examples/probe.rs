@@ -3,7 +3,7 @@
 //! ⚠️ **This is layer 2, and layer 2 tests plumbing.** D-99 is explicit: correctness is
 //! proven against the in-process store, emulators validate HTTP wiring and error mapping,
 //! and only a real cloud says anything about economics. A `Supported` printed here means
-//! *this emulator answered ten probes correctly*, never *S3 does*.
+//! *this emulator answered thirteen probes correctly*, never *S3 does*.
 //!
 //! Not a `#[test]`: it needs containers, and a suite that cannot run without Docker is a
 //! suite that stops running. `scripts/conformance.sh` is the entry point.
@@ -92,21 +92,72 @@ const FAKE_SERVICE_ACCOUNT: &str = r#"{
   "private_key": ""
 }"#;
 
-async fn probe(
-    name: &str,
+/// pstore's own S3 client (M286) on the same `rustfs`, with the same keys (M287): its rows must
+/// agree with `object_store`'s, or the server's default client stays `object_store`.
+fn s3_native(name: &str) -> Result<Arc<dyn BlobStore>, String> {
+    pstore_blob::s3::S3Backend::new(
+        pstore_blob::s3::S3Config {
+            endpoint: env("PSTORE_S3_ENDPOINT", "http://127.0.0.1:9000"),
+            bucket: env("PSTORE_S3_BUCKET", "pstore"),
+            region: "us-east-1".to_owned(),
+            credentials: pstore_blob::s3::sign::Credentials {
+                key_id: env("PSTORE_ACCESS_KEY", "pstore"),
+                secret: env("PSTORE_SECRET_KEY", "pstore-dev-secret"),
+                token: None,
+            },
+            virtual_hosted: false,
+            timeout: std::time::Duration::from_secs(30),
+        },
+        pstore_blob::s3::S3Backend::unprobed(name),
+    )
+    .map(|s| Arc::new(s) as Arc<dyn BlobStore>)
+    .map_err(|e| e.to_string())
+}
+
+/// pstore's own Azure client (M288) on the same Azurite, with its well-known account key: its
+/// rows must agree with `object_store`'s, or the server's default Azure client stays
+/// `object_store`.
+fn azure_native(name: &str) -> Result<Arc<dyn BlobStore>, String> {
+    // Azurite's published development key, the same one `scripts/conformance.sh` signs with.
+    const AZURITE_KEY: &str =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+    pstore_blob::azure::AzureBackend::new(
+        pstore_blob::azure::AzureConfig {
+            account: "devstoreaccount1".to_owned(),
+            container: env("PSTORE_AZURE_CONTAINER", "pstore"),
+            endpoint: format!(
+                "{}/devstoreaccount1",
+                env("PSTORE_AZURE_ENDPOINT", "http://127.0.0.1:10000")
+            ),
+            timeout: std::time::Duration::from_secs(30),
+        },
+        pstore_blob::azure::AzureAuth::Key(AZURITE_KEY.to_owned()),
+        pstore_blob::s3::S3Backend::unprobed(name),
+    )
+    .map(|s| Arc::new(s) as Arc<dyn BlobStore>)
+    .map_err(|e| e.to_string())
+}
+
+/// An `object_store` client, behind [`ObjectStoreBackend`].
+fn through_object_store(
     build: fn() -> Result<Arc<dyn object_store::ObjectStore>, String>,
-) -> Outcome {
-    let inner = match build() {
-        Ok(i) => i,
-        Err(e) => return Outcome::Unreachable(format!("client could not be built: {e}")),
-    };
-    let store = ObjectStoreBackend::new(
+    name: &str,
+) -> Result<Arc<dyn BlobStore>, String> {
+    let inner = build()?;
+    Ok(Arc::new(ObjectStoreBackend::new(
         inner,
         Capabilities {
             backend: name.to_owned(),
             ..ObjectStoreBackend::unprobed(name)
         },
-    );
+    )))
+}
+
+async fn probe(name: &str, store: Result<Arc<dyn BlobStore>, String>) -> Outcome {
+    let store = match store {
+        Ok(s) => s,
+        Err(e) => return Outcome::Unreachable(format!("client could not be built: {e}")),
+    };
     // ⚠️ Reachability is checked with a WRITE, not a read. A backend that 404s everything
     // answers a read happily and fails every probe, which would be recorded as ten
     // divergences rather than as "there is nothing there".
@@ -153,7 +204,7 @@ async fn main() {
     println!();
     println!(
         "⚠️ **These are emulators, and emulators test plumbing** (D-99). `Supported` here \
-         means this emulator answered ten probes correctly. It says nothing about S3, GCS or \
+         means this emulator answered thirteen probes correctly. It says nothing about S3, GCS or \
          Azure, whose profiles need real accounts — M0b."
     );
     println!();
@@ -164,15 +215,23 @@ async fn main() {
          which is OQ-2 and blocked on real clouds. Those four are **declared**."
     );
 
-    for (name, build) in [
-        ("rustfs", s3 as fn() -> _),
-        ("azurite", azure as fn() -> _),
-        ("fake-gcs-server", gcs as fn() -> _),
+    for (name, store) in [
+        ("rustfs", through_object_store(s3, "rustfs")),
+        // M287: the same emulator through the native client; the key prefix differs, so the
+        // two runs never meet each other's objects.
+        ("rustfs-native", s3_native("rustfs-native")),
+        ("azurite", through_object_store(azure, "azurite")),
+        // M288: the same emulator through the native client.
+        ("azurite-native", azure_native("azurite-native")),
+        (
+            "fake-gcs-server",
+            through_object_store(gcs, "fake-gcs-server"),
+        ),
     ] {
         println!();
         println!("## {name}");
         println!();
-        match probe(name, build).await {
+        match probe(name, store).await {
             Outcome::Unreachable(why) => {
                 unreachable += 1;
                 println!("**UNREACHABLE** — {why}");

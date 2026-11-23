@@ -29,6 +29,8 @@ struct Contend {
     refused: AtomicU32,
     /// A rival's HEAD, landed by the next HEAD commit in place of ours, which then loses.
     rival: std::sync::Mutex<Option<bytes::Bytes>>,
+    /// HEAD commits that land and then answer an I/O error (M282): a 503 after the write.
+    land_then_fail: AtomicU32,
 }
 
 impl Contend {
@@ -38,6 +40,7 @@ impl Contend {
             left: times.into(),
             refused: 0.into(),
             rival: std::sync::Mutex::default(),
+            land_then_fail: 0.into(),
         })
     }
 }
@@ -104,7 +107,19 @@ impl BlobStore for Contend {
             self.inner.put(key, theirs).await.unwrap();
             return Err(pstore_blob::CasError::Lost);
         }
-        self.inner.put_conditional(key, body, pre).await
+        let landed = self.inner.put_conditional(key, body, pre).await;
+        if landed.is_ok()
+            && key.as_str().ends_with("/HEAD")
+            && self
+                .land_then_fail
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(pstore_blob::CasError::Io(
+                "503 Service Unavailable after the write".to_owned(),
+            ));
+        }
+        landed
     }
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), pstore_blob::BlobError> {
         self.inner.delete_batch(keys).await
@@ -275,4 +290,23 @@ async fn a_flag_that_keeps_contending_reports_contention_after_every_attempt() {
     assert_eq!(store.refused.load(SeqCst), ATTEMPTS);
     store.left.store(0, SeqCst);
     assert!(e.head_for_test().await.read_only.is_empty());
+}
+
+/// M282: a registration whose HEAD commit lands and then answers an error is the caller's to
+/// retry, but its codes are live: HEAD names them, so nothing buries them and GC keeps them.
+#[tokio::test(start_paused = true)]
+async fn a_registration_that_lands_and_then_errs_keeps_its_codes() {
+    let (store, e) = engine(0).await;
+    store.land_then_fail.store(1, SeqCst);
+    let err = register(&e).await.unwrap_err();
+    assert!(matches!(err, EngineError::Blob(_)), "{err:?}");
+    let head = e.head_for_test().await;
+    let codes = head.externals["x"].codes.clone();
+    let buried: Vec<&String> = head.graveyard.values().flatten().collect();
+    assert!(!buried.contains(&&codes), "live codes buried: {buried:?}");
+    e.gc(0).await.unwrap();
+    assert!(
+        store.inner.head(&Key::new(codes)).await.is_ok(),
+        "GC deleted live codes"
+    );
 }

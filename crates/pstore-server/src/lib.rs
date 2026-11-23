@@ -7804,6 +7804,8 @@ pub struct Config {
     pub backend: Backend,
     /// Which recorded profile the operator says applies to it.
     pub profile: Profile,
+    /// Which client speaks to the blob store, `PSTORE_BLOB_CLIENT` (M287).
+    pub client: BlobClient,
     /// The S3 endpoint. Required by [`Backend::S3`], ignored by [`Backend::Memory`].
     pub endpoint: String,
     /// The bucket, ignored by [`Backend::Memory`].
@@ -7930,6 +7932,10 @@ pub struct CacheConfig {
     pub ram: usize,
     /// `PSTORE_CACHE_DISK_BYTES`, 4 GiB by default.
     pub disk: usize,
+    /// `PSTORE_CACHE_TENANT_SHARE_PERMILLE` (M280): the most of each memory class one tenant
+    /// may hold, in thousandths; unset, none. Off by default: measured, it thrashed a tenant
+    /// alone on a node whose working set was above its share.
+    pub tenant_share: Option<u16>,
 }
 
 /// Where a server keeps its data.
@@ -8000,7 +8006,7 @@ pub enum Profile {
 pub fn s3_capabilities(endpoint: &str, profile: Profile) -> pstore_blob::Capabilities {
     let base = pstore_blob::Capabilities {
         backend: format!("s3({endpoint})"),
-        ..pstore_blob::ObjectStoreBackend::unprobed("s3")
+        ..pstore_blob::s3::S3Backend::unprobed("s3")
     };
     match profile {
         Profile::Unprobed => base,
@@ -8009,6 +8015,242 @@ pub fn s3_capabilities(endpoint: &str, profile: Profile) -> pstore_blob::Capabil
             create_if_absent: pstore_blob::Support::Supported,
             ..base
         },
+    }
+}
+
+/// Which client the server speaks to its blob store with, `PSTORE_BLOB_CLIENT` (M287).
+///
+/// ⚠️ **A cluster setting with no index-level override.** The client is the transport the
+/// process opens once for its one store: it changes no byte on disk and no answer, only the
+/// server's CPU and allocations (M286's bench), so there is nothing an index could choose.
+/// Either client reads what the other wrote, so the setting is also the rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlobClient {
+    /// pstore's own (M286): no retries inside it, errors typed from the status, 55-85% fewer
+    /// bytes allocated a request on five of M286's seven patterns. The default.
+    #[default]
+    Native,
+    /// `object_store` 0.14, with M282's two retry policies.
+    ObjectStore,
+}
+
+impl BlobClient {
+    /// `PSTORE_BLOB_CLIENT`'s value; unset is [`BlobClient::Native`].
+    ///
+    /// # Errors
+    /// [`ConfigError::BlobClient`] for anything else, so a typo is a refusal at startup, not a
+    /// silent default.
+    pub fn from_var(v: Option<&str>) -> Result<Self, ConfigError> {
+        match v {
+            None | Some("native") => Ok(Self::Native),
+            Some("object_store") => Ok(Self::ObjectStore),
+            Some(other) => Err(ConfigError::BlobClient(other.to_owned())),
+        }
+    }
+}
+
+/// One S3-compatible bucket through pstore's own client (M287), with `profile`'s
+/// capabilities.
+///
+/// The operator's keys when both are given; otherwise the credential chain over `lookup`
+/// (the process environment, in `main.rs`): `AWS_*` keys, web identity, the ECS container
+/// endpoint, IMDSv2 -- what `object_store`'s chain does, so the same deployment
+/// authenticates with either client.
+///
+/// # Errors
+/// An endpoint that is not `scheme://host[:port]`, a system with no TLS roots, or a chain
+/// with no provider at all.
+pub fn native_s3_store(
+    endpoint: &str,
+    name: &str,
+    credentials: Option<&(String, String)>,
+    region: &str,
+    profile: Profile,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<pstore_blob::s3::S3Backend, pstore_blob::BlobError> {
+    use pstore_blob::s3::{S3Backend, S3Config, creds::Provider, sign::Credentials};
+    let provider = match credentials {
+        Some((key, secret)) => Provider::Static(Credentials {
+            key_id: key.clone(),
+            secret: secret.clone(),
+            token: None,
+        }),
+        None => Provider::from_vars(lookup, region)?,
+    };
+    S3Backend::new(
+        S3Config {
+            endpoint: endpoint.to_owned(),
+            bucket: name.to_owned(),
+            region: region.to_owned(),
+            credentials: Credentials {
+                key_id: String::new(),
+                secret: String::new(),
+                token: None,
+            },
+            // `object_store`'s default, path style, so either client addresses a bucket the
+            // same way: an emulator, an in-VPC endpoint, and AWS.
+            virtual_hosted: false,
+            // `object_store`'s default request timeout.
+            timeout: std::time::Duration::from_secs(30),
+        },
+        s3_capabilities(endpoint, profile),
+    )?
+    .with_provider(provider)
+}
+
+/// One S3-compatible bucket through `client`: [`native_s3_store`] or [`s3_store`].
+///
+/// # Errors
+/// The chosen client's refusal to build, as text.
+pub fn open_s3(
+    client: BlobClient,
+    endpoint: &str,
+    name: &str,
+    credentials: Option<&(String, String)>,
+    region: &str,
+    profile: Profile,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<std::sync::Arc<dyn pstore_blob::BlobStore>, String> {
+    Ok(match client {
+        BlobClient::Native => std::sync::Arc::new(
+            native_s3_store(endpoint, name, credentials, region, profile, lookup)
+                .map_err(|e| e.to_string())?,
+        ),
+        #[cfg(feature = "object-store-client")]
+        BlobClient::ObjectStore => std::sync::Arc::new(
+            s3_store(endpoint, name, credentials, region, profile).map_err(|e| e.to_string())?,
+        ),
+        #[cfg(not(feature = "object-store-client"))]
+        BlobClient::ObjectStore => return Err(OBJECT_STORE_ABSENT.to_owned()),
+    })
+}
+
+/// Why a default build refuses `PSTORE_BLOB_CLIENT=object_store` (M288): by name, at startup.
+pub const OBJECT_STORE_ABSENT: &str = "PSTORE_BLOB_CLIENT=object_store needs a pstore-server built \
+     with the object-store-client feature; this build has only the native client";
+
+/// The Azure container `config` names through pstore's own client (M288), with `profile`'s
+/// capabilities.
+///
+/// The account key when one is given (SharedKey); otherwise a bearer token from the chain over
+/// `lookup`: a client secret, workload identity, the App Service identity endpoint, then
+/// IMDS (`pstore_blob::azure::token`).
+///
+/// # Errors
+/// A malformed endpoint, a key that is not base64, or a system with no TLS roots.
+pub fn native_azure_store(
+    config: &AzureConfig,
+    profile: Profile,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<pstore_blob::azure::AzureBackend, pstore_blob::BlobError> {
+    use pstore_blob::azure::{AzureAuth, AzureBackend, token::Provider};
+    let auth = match &config.key {
+        Some(key) => AzureAuth::Key(key.clone()),
+        None => AzureAuth::Token(Provider::from_vars(lookup)),
+    };
+    AzureBackend::new(
+        pstore_blob::azure::AzureConfig {
+            account: config.account.clone(),
+            container: config.container.clone(),
+            endpoint: config
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", config.account)),
+            timeout: std::time::Duration::from_secs(30),
+        },
+        auth,
+        azure_capabilities(&config.account, profile),
+    )
+}
+
+/// The Azure container through `client`: [`native_azure_store`] or [`azure_store`].
+///
+/// # Errors
+/// The chosen client's refusal to build, as text.
+pub fn open_azure(
+    client: BlobClient,
+    config: &AzureConfig,
+    profile: Profile,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<std::sync::Arc<dyn pstore_blob::BlobStore>, String> {
+    Ok(match client {
+        BlobClient::Native => std::sync::Arc::new(
+            native_azure_store(config, profile, lookup).map_err(|e| e.to_string())?,
+        ),
+        #[cfg(feature = "object-store-client")]
+        BlobClient::ObjectStore => {
+            std::sync::Arc::new(azure_store(config, profile).map_err(|e| e.to_string())?)
+        }
+        #[cfg(not(feature = "object-store-client"))]
+        BlobClient::ObjectStore => return Err(OBJECT_STORE_ABSENT.to_owned()),
+    })
+}
+
+/// One S3-compatible bucket, with `profile`'s capabilities (M282: moved from `main.rs`, so its
+/// retry policy is reachable from a test).
+///
+/// ⚠️ The credentials are applied only when the operator gave both. Unset, `AmazonS3Builder`
+/// uses its own provider chain -- which is how an instance profile or a service-account role
+/// works, and the only way this image is usable on EC2 or EKS. `Config` decides; this applies.
+///
+/// # Errors
+/// The client's refusal to build.
+#[cfg(feature = "object-store-client")]
+pub fn s3_store(
+    endpoint: &str,
+    name: &str,
+    credentials: Option<&(String, String)>,
+    region: &str,
+    profile: Profile,
+) -> Result<pstore_blob::ObjectStoreBackend, object_store::Error> {
+    let mut builder = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(name)
+        .with_allow_http(true)
+        .with_region(region);
+    if let Some((key, secret)) = credentials {
+        builder = builder
+            .with_access_key_id(key)
+            .with_secret_access_key(secret);
+    }
+    let conditional = builder.clone().with_retry(conditional_retries()).build()?;
+    Ok(pstore_blob::ObjectStoreBackend::new(
+        std::sync::Arc::new(builder.with_retry(retries()).build()?),
+        s3_capabilities(endpoint, profile),
+    )
+    .with_conditional(std::sync::Arc::new(conditional)))
+}
+
+/// The retry policy of every request but a conditional write (M282), set here rather than
+/// inherited: `object_store` 0.14's own defaults, written down so a dependency bump cannot
+/// change them unseen. Ten retries with backoff from 100 ms to 15 s, within 3 minutes, of
+/// a `5xx`, a `429`, a `408` or a connection error. Reads, unconditional PUTs (a segment, a
+/// sidecar: written once at a derived key) and deletes are idempotent, so a repeat is safe.
+#[must_use]
+#[cfg(feature = "object-store-client")]
+pub fn retries() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        backoff: object_store::BackoffConfig {
+            init_backoff: std::time::Duration::from_millis(100),
+            max_backoff: std::time::Duration::from_secs(15),
+            base: 2.0,
+        },
+        max_retries: 10,
+        retry_timeout: std::time::Duration::from_secs(180),
+    }
+}
+
+/// The retry policy of a conditional write (M282): **none**. A `5xx` does not say the write
+/// did not land, and a repeat of one that did fails its own precondition. hsearch retries a
+/// write only when no connection was made; `object_store` cannot tell that apart per request
+/// once retries are on, so this gives up the connect-error retry too, and the engine's own
+/// protocol (M17's read-back, a fold's next tick, a client's retry) takes its place.
+#[must_use]
+#[cfg(feature = "object-store-client")]
+pub fn conditional_retries() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        max_retries: 0,
+        ..retries()
     }
 }
 
@@ -8027,6 +8269,7 @@ pub fn azure_capabilities(account: &str, profile: Profile) -> pstore_blob::Capab
 ///
 /// # Errors
 /// The client's refusal to build, which with an account present is a malformed endpoint.
+#[cfg(feature = "object-store-client")]
 pub fn azure_store(
     config: &AzureConfig,
     profile: Profile,
@@ -8042,10 +8285,12 @@ pub fn azure_store(
             .with_endpoint(endpoint.clone())
             .with_allow_http(true);
     }
+    let conditional = builder.clone().with_retry(conditional_retries()).build()?;
     Ok(pstore_blob::ObjectStoreBackend::azure(
-        std::sync::Arc::new(builder.build()?),
+        std::sync::Arc::new(builder.with_retry(retries()).build()?),
         azure_capabilities(&config.account, profile),
-    ))
+    )
+    .with_conditional(std::sync::Arc::new(conditional)))
 }
 
 /// Why a process could not read its configuration.
@@ -8069,6 +8314,9 @@ pub enum ConfigError {
     /// `PSTORE_PROFILE` named something that is not a recorded profile.
     #[error("PSTORE_PROFILE={0} is not a profile: unprobed, conforming")]
     Profile(String),
+    /// `PSTORE_BLOB_CLIENT` named something that is not a client (M287).
+    #[error("PSTORE_BLOB_CLIENT={0} is not a blob client: native, object_store")]
+    BlobClient(String),
     /// `PSTORE_BACKEND=s3` with no endpoint.
     ///
     /// ⚠️ **Refused here rather than discovered on the first request.** An empty endpoint
@@ -8139,6 +8387,7 @@ impl Config {
             Some("conforming") => Profile::Conforming,
             Some(other) => return Err(ConfigError::Profile(other.to_owned())),
         };
+        let client = BlobClient::from_var(get("PSTORE_BLOB_CLIENT").as_deref())?;
         let endpoint = get("PSTORE_S3_ENDPOINT").unwrap_or_default();
         if backend == Backend::S3 && endpoint.is_empty() {
             return Err(ConfigError::Endpoint);
@@ -8163,6 +8412,7 @@ impl Config {
             lane: LaneId(lane),
             backend,
             profile,
+            client,
             endpoint,
             bucket: get("PSTORE_BUCKET").unwrap_or_else(|| "pstore".to_owned()),
             azure,
@@ -8385,11 +8635,24 @@ fn cache_config(
         bytes("PSTORE_CACHE_RAM_BYTES")?,
         bytes("PSTORE_CACHE_DISK_BYTES")?,
     );
+    let share = get("PSTORE_CACHE_TENANT_SHARE_PERMILLE")
+        .map(|v| {
+            v.parse::<u16>()
+                .ok()
+                .filter(|n| (1..1000).contains(n))
+                .ok_or(ConfigError::Cache(
+                    "PSTORE_CACHE_TENANT_SHARE_PERMILLE",
+                    v,
+                    "an integer from 1 to 999",
+                ))
+        })
+        .transpose()?;
     let Some(dir) = get("PSTORE_CACHE_DIR") else {
         // ⚠️ A size with no directory is a setting that does nothing, and says nothing.
         for (var, v) in [
             ("PSTORE_CACHE_RAM_BYTES", ram),
             ("PSTORE_CACHE_DISK_BYTES", disk),
+            ("PSTORE_CACHE_TENANT_SHARE_PERMILLE", share.map(usize::from)),
         ] {
             if let Some(n) = v {
                 return Err(ConfigError::Cache(
@@ -8414,6 +8677,7 @@ fn cache_config(
         dir: dir.into(),
         ram: ram.unwrap_or(256 << 20),
         disk: disk.unwrap_or(4 << 30),
+        tenant_share: share,
     }))
 }
 
@@ -8720,7 +8984,11 @@ pub async fn open_cache<S: BlobStore>(
     };
     let identity = store_identity(store, &config.endpoint, &config.bucket).await?;
     let disk = pstore_cache::DiskConfig::new(&c.dir, config.lane.0, c.disk, identity);
-    Ok(Some(Arc::new(CacheCore::open(c.ram, disk).await)))
+    Ok(Some(Arc::new(
+        CacheCore::open(c.ram, disk)
+            .await
+            .with_tenant_share(c.tenant_share),
+    )))
 }
 
 /// Where a store keeps the id its read caches are validated by (M20).
