@@ -21,6 +21,8 @@ pub struct Segment {
     text_fields: Vec<String>,
     /// Its blocks are columnar (M231).
     columnar: bool,
+    /// Its Fields table may name f16 and i8 fields (M289): it is version 4.
+    narrow: bool,
 }
 
 /// A dense field's stored bytes as its vectors of `dims` components each, little-endian f32s
@@ -101,6 +103,7 @@ impl Segment {
         if version != VERSION
             && version != crate::VERSION_TYPED
             && version != crate::VERSION_COLUMNAR
+            && version != crate::VERSION_NARROW
         {
             return Err(FormatError::UnsupportedVersion(version));
         }
@@ -182,7 +185,8 @@ impl Segment {
             sections,
             fields: Vec::new(),
             text_fields: Vec::new(),
-            columnar: version == crate::VERSION_COLUMNAR,
+            columnar: version == crate::VERSION_COLUMNAR || version == crate::VERSION_NARROW,
+            narrow: version == crate::VERSION_NARROW,
         };
         seg.fields = seg.decode_fields(&idx_bytes, meta_offset)?;
         seg.text_fields = seg.decode_text_fields(&idx_bytes, meta_offset)?;
@@ -262,6 +266,8 @@ impl Segment {
                     vectors: Section::Vectors as u16,
                     rabitq: Section::RaBitQ as u16,
                     sq8: Section::Sq8 as u16,
+                    elem: crate::narrow::Elem::F32,
+                    tail: 0,
                 }]
             } else {
                 Vec::new()
@@ -277,7 +283,7 @@ impl Segment {
         let n = d.u32()? as usize;
         let mut out = Vec::with_capacity(n.min(1 << 12));
         for _ in 0..n {
-            out.push(crate::FieldLayout {
+            let f = crate::FieldLayout {
                 name: d.string()?,
                 kind: d.u8()?,
                 metric: d.u8()?,
@@ -286,7 +292,10 @@ impl Segment {
                 vectors: d.u16()?,
                 rabitq: d.u16()?,
                 sq8: d.u16()?,
-            });
+                elem: crate::narrow::Elem::F32,
+                tail: 0,
+            };
+            out.push(narrow_layout(f, self.narrow)?);
         }
         Ok(out)
     }
@@ -490,8 +499,8 @@ impl Segment {
         if dims == 0 {
             return Ok(BTreeMap::new());
         }
-        let width = (dims * 4) as u64;
-        let decode = |raw: &[u8]| decode_vectors(raw, dims);
+        let width = f.vector_len() as u64;
+        let decode = |raw: &[u8]| f.decode_vectors(raw);
         let mut out = BTreeMap::new();
         if f.per_row != 0 {
             let ranges: Vec<std::ops::Range<u64>> = wanted
@@ -502,7 +511,7 @@ impl Segment {
                 })
                 .collect();
             for (row, raw) in wanted.iter().zip(store.get_ranges(key, &ranges).await?) {
-                out.insert(*row, decode(&raw));
+                out.insert(*row, decode(&raw)?);
             }
             return Ok(out);
         }
@@ -521,7 +530,7 @@ impl Segment {
             out.insert(*row, Vec::new());
         }
         for ((row, _), raw) in nonempty.into_iter().zip(bufs) {
-            out.insert(row, decode(&raw));
+            out.insert(row, decode(&raw)?);
         }
         Ok(out)
     }
@@ -767,17 +776,11 @@ impl Segment {
             })
             .collect();
         let bufs = store.get_ranges(key, &ranges).await?;
-        Ok(wanted
+        wanted
             .into_iter()
             .zip(bufs)
-            .map(|(row, raw)| {
-                let v = raw
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
-                    .collect();
-                (row, v)
-            })
-            .collect())
+            .map(|(row, raw)| Ok((row, self.decode_row(&raw)?)))
+            .collect()
     }
 
     /// Whether [`Self::vector_rows`] reads the `vector` field's vectors (M64): that field is a
@@ -810,14 +813,25 @@ impl Segment {
             return Ok(Vec::new());
         }
         let per_row = raw.len() / self.rows as usize;
-        Ok(raw
-            .chunks_exact(per_row.max(1))
-            .map(|row| {
-                row.chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
-                    .collect()
-            })
-            .collect())
+        raw.chunks_exact(per_row.max(1))
+            .map(|row| self.decode_row(row))
+            .collect()
+    }
+
+    /// One row of the legacy `Vectors` section, by the layout of the field it holds: f32
+    /// unless that field is stored narrow (M289).
+    fn decode_row(&self, raw: &[u8]) -> Result<Vec<f32>, FormatError> {
+        match self
+            .fields
+            .iter()
+            .find(|f| f.kind == 0 && f.vectors == Section::Vectors as u16)
+        {
+            Some(f) if f.elem != crate::narrow::Elem::F32 => f.decode_vector(raw),
+            _ => Ok(raw
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                .collect()),
+        }
     }
 
     fn decode_index(bytes: &[u8], version: u16) -> Result<Vec<BlockMeta>, FormatError> {
@@ -841,7 +855,10 @@ impl Segment {
         }
         // M9h.1: a typed segment says whether its zone maps are on; if they are, a float table
         // per block follows, and every block's zones are complete.
-        if version == crate::VERSION_TYPED || version == crate::VERSION_COLUMNAR {
+        if version == crate::VERSION_TYPED
+            || version == crate::VERSION_COLUMNAR
+            || version == crate::VERSION_NARROW
+        {
             let flag = d.u8()?;
             if flag > 3 {
                 return Err(FormatError::Corrupt(
@@ -1068,10 +1085,7 @@ impl Segment {
                     .filter(|_| simple)
                     .and_then(|v| v.get(r * per_row..(r + 1) * per_row))
                 {
-                    let v: Vec<f32> = raw
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
-                        .collect();
+                    let v: Vec<f32> = self.decode_row(raw)?;
                     doc.vectors
                         .insert(first_field.clone(), crate::VectorField::dense(v));
                 }
@@ -1443,6 +1457,24 @@ impl Segment {
     }
 }
 
+/// A Fields table row as read, with a narrow kind (M289) made dense: its element type from
+/// the kind, its f32 tail from the metric byte. Only a version 4 segment (`narrow`) may hold
+/// one, and a tail is always narrower than the vector.
+fn narrow_layout(
+    mut f: crate::FieldLayout,
+    narrow: bool,
+) -> Result<crate::FieldLayout, FormatError> {
+    if let Some(elem) =
+        crate::narrow::Elem::of_kind(f.kind).filter(|e| *e != crate::narrow::Elem::F32)
+    {
+        if !narrow || u32::from(f.metric) >= f.dims {
+            return Err(FormatError::Corrupt("a narrow vector field's layout"));
+        }
+        (f.kind, f.elem, f.tail, f.metric) = (0, elem, f.metric, 0);
+    }
+    Ok(f)
+}
+
 /// Decodes one field's vector section.
 fn decode_field(
     raw: &[u8],
@@ -1450,15 +1482,11 @@ fn decode_field(
     rows: usize,
 ) -> Result<Vec<Vec<Vec<f32>>>, FormatError> {
     let dims = f.dims as usize;
-    let width = dims * 4;
+    let width = f.vector_len();
     if dims == 0 {
         return Ok(vec![Vec::new(); rows]);
     }
-    let read = |b: &[u8]| -> Vec<f32> {
-        b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap_or([0; 4])))
-            .collect()
-    };
+    let read = |b: &[u8]| f.decode_vector(b);
     if f.per_row == 0 {
         // Variable width: `rows + 1` offsets, so row `i` is `offsets[i]..offsets[i + 1]`
         // and the last row is not a special case.
@@ -1483,15 +1511,18 @@ fn decode_field(
                 .zip(table.checked_add(hi))
                 .and_then(|(a, b)| raw.get(a..b))
                 .ok_or(FormatError::Truncated)?;
-            out.push(body.chunks_exact(width).map(read).collect());
+            out.push(
+                body.chunks_exact(width)
+                    .map(read)
+                    .collect::<Result<_, _>>()?,
+            );
         }
         return Ok(out);
     }
-    Ok(raw
-        .chunks_exact(width)
-        .map(|b| vec![read(b)])
+    raw.chunks_exact(width)
         .take(rows)
-        .collect())
+        .map(|b| Ok(vec![read(b)?]))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1501,6 +1532,39 @@ fn decode_field(
     reason = "assertions in tests are the reporting mechanism"
 )]
 mod tests {
+    /// M289: a narrow kind is read only from a version 4 segment, and only with a tail
+    /// narrower than the vector; an f32 or sparse row is read as it was.
+    #[test]
+    fn a_narrow_layout_needs_version_4_and_a_narrower_tail() {
+        let row = |kind: u8, metric: u8| crate::FieldLayout {
+            name: "v".to_owned(),
+            kind,
+            metric,
+            dims: 4,
+            per_row: 1,
+            vectors: 2,
+            rabitq: 0,
+            sq8: 0,
+            elem: crate::narrow::Elem::F32,
+            tail: 0,
+        };
+        for (kind, elem) in [(2, crate::narrow::Elem::F16), (3, crate::narrow::Elem::I8)] {
+            let f = super::narrow_layout(row(kind, 1), true).unwrap();
+            assert_eq!((f.kind, f.elem, f.tail, f.metric), (0, elem, 1, 0));
+            assert_eq!(super::narrow_layout(row(kind, 3), true).unwrap().tail, 3);
+            assert!(super::narrow_layout(row(kind, 0), false).is_err());
+            assert!(super::narrow_layout(row(kind, 4), true).is_err());
+        }
+        for kind in [0, 1] {
+            for narrow in [false, true] {
+                assert_eq!(
+                    super::narrow_layout(row(kind, 2), narrow).unwrap(),
+                    row(kind, 2)
+                );
+            }
+        }
+    }
+
     use super::*;
     use crate::codec::Enc;
 

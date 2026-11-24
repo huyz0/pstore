@@ -5753,6 +5753,8 @@ struct StoragePatch {
     block_aggregates: Option<Option<bool>>,
     #[serde(default, deserialize_with = "present")]
     filter_cache: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "present")]
+    vector_storage: Option<Option<String>>,
 }
 
 /// A member that is present, `null` or not: absent is the `default`, `None`.
@@ -5771,6 +5773,7 @@ struct StorageChange {
     equality: Option<Option<bool>>,
     aggregates: Option<Option<bool>>,
     filter_cache: Option<Option<bool>>,
+    vectors: Option<Option<pstore_format::narrow::Elem>>,
 }
 
 impl StorageChange {
@@ -5780,6 +5783,7 @@ impl StorageChange {
             equality: self.equality.unwrap_or(s.equality),
             aggregates: self.aggregates.unwrap_or(s.aggregates),
             filter_cache: self.filter_cache.unwrap_or(s.filter_cache),
+            vectors: self.vectors.unwrap_or(s.vectors),
         }
     }
 }
@@ -5797,11 +5801,25 @@ fn storage_change(p: &StoragePatch) -> Result<StorageChange, String> {
             ));
         }
     };
+    // M289: by name, as the layout is.
+    let vectors = match p.vector_storage.as_ref().map(Option::as_deref) {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(v)) => match pstore_format::narrow::Elem::of_name(v) {
+            Some(e) => Some(Some(e)),
+            None => {
+                return Err(format!(
+                    "storage.vector_storage is \"f32\", \"f16\", \"i8\" or null, not {v:?}"
+                ));
+            }
+        },
+    };
     Ok(StorageChange {
         columnar,
         equality: p.equality_filters,
         aggregates: p.block_aggregates,
         filter_cache: p.filter_cache,
+        vectors,
     })
 }
 
@@ -7900,6 +7918,20 @@ fn block_options(
         },
         equality: flag("PSTORE_EQUALITY_FILTERS")?,
         aggregates: flag("PSTORE_BLOCK_AGGREGATES")?,
+        // M289: f32 unset. The tail is the engine's, from each index's metric.
+        vectors: pstore_format::narrow::Vectors {
+            elem: match get("PSTORE_VECTOR_STORAGE").as_deref() {
+                None => pstore_format::narrow::Elem::F32,
+                Some(v) => pstore_format::narrow::Elem::of_name(v).ok_or_else(|| {
+                    ConfigError::Storage(
+                        "PSTORE_VECTOR_STORAGE",
+                        v.to_owned(),
+                        "unset, f32, f16 or i8",
+                    )
+                })?,
+            },
+            tail: 0,
+        },
     })
 }
 

@@ -1053,9 +1053,12 @@ pub struct StorageSettings {
     /// Whether its filtered queries use the server's filter-mask cache (M234). Not a storage
     /// format: it changes no segment, only what a query reads again.
     pub filter_cache: bool,
+    /// What its folded rows' dense vectors are stored as (M289): `f32`, `f16` or `i8`. A
+    /// narrow type rounds what a folded row answers and scores; f32 keeps every value.
+    pub vector_storage: &'static str,
     /// The settings the index overrides; any other takes this server's default
     /// (`PSTORE_BLOCK_LAYOUT`, `PSTORE_EQUALITY_FILTERS`, `PSTORE_BLOCK_AGGREGATES`,
-    /// `PSTORE_FILTER_CACHE_BYTES`).
+    /// `PSTORE_FILTER_CACHE_BYTES`, `PSTORE_VECTOR_STORAGE`).
     pub overrides: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1082,11 +1085,20 @@ impl StorageSettings {
         if let Some(f) = overrides.filter_cache {
             o.insert("filter_cache".to_owned(), f.into());
         }
+        if let Some(v) = overrides.vectors {
+            o.insert("vector_storage".to_owned(), v.name().into());
+        }
         Self {
             block_layout: layout(b.columnar),
             equality_filters: b.equality,
             block_aggregates: b.aggregates,
             filter_cache: cache && overrides.filter_cache_over(true),
+            // Row blocks never narrow (M289): what the next fold writes is f32 there.
+            vector_storage: if b.columnar {
+                b.vectors.elem.name()
+            } else {
+                "f32"
+            },
             overrides: o,
         }
     }

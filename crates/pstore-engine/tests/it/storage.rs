@@ -36,6 +36,10 @@ const ROWS: BlockOptions = BlockOptions {
     columnar: false,
     equality: false,
     aggregates: false,
+    vectors: pstore_format::narrow::Vectors {
+        elem: pstore_format::narrow::Elem::F32,
+        tail: 0,
+    },
 };
 
 /// The footer's version, `MAGIC(8) VERSION(2) ...` a fixed distance from the end.
@@ -167,6 +171,7 @@ const ROWS_OVERRIDE: Storage = Storage {
     equality: Some(false),
     aggregates: Some(false),
     filter_cache: None,
+    vectors: None,
 };
 
 #[tokio::test]
@@ -181,6 +186,7 @@ async fn a_cluster_default_of_rows_is_overridden_per_index() {
         equality: Some(true),
         aggregates: None,
         filter_cache: None,
+        vectors: None,
     };
     e.set_storage("col", |_| on).await.unwrap().unwrap();
     assert_eq!(e.index_stats("col").await.unwrap().unwrap().storage, on);

@@ -3986,6 +3986,15 @@
           "filter_cache": {
             "type": "boolean",
             "description": "Whether its filtered queries use the server's filter-mask cache (M234)."
+          },
+          "vector_storage": {
+            "type": "string",
+            "enum": [
+              "f32",
+              "f16",
+              "i8"
+            ],
+            "description": "What its folded rows' dense vectors are stored as (M289). f16 and i8 round what a folded row answers and scores."
           }
         },
         "required": [
@@ -3993,6 +4002,7 @@
           "equality_filters",
           "block_aggregates",
           "filter_cache",
+          "vector_storage",
           "overrides"
         ],
         "additionalProperties": false,
@@ -4016,6 +4026,14 @@
           },
           "filter_cache": {
             "type": "boolean"
+          },
+          "vector_storage": {
+            "type": "string",
+            "enum": [
+              "f32",
+              "f16",
+              "i8"
+            ]
           }
         },
         "additionalProperties": false,
@@ -4051,6 +4069,18 @@
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "vector_storage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "f32",
+              "f16",
+              "i8",
+              null
             ]
           }
         },

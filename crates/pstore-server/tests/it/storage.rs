@@ -51,6 +51,10 @@ fn the_cluster_default_is_read_from_the_environment() {
             columnar: false,
             equality: false,
             aggregates: true,
+            vectors: pstore_format::narrow::Vectors {
+                elem: pstore_format::narrow::Elem::F32,
+                tail: 0,
+            },
         }
     );
     let c = Config::from_vars(vars(&[
@@ -65,6 +69,10 @@ fn the_cluster_default_is_read_from_the_environment() {
             columnar: true,
             equality: true,
             aggregates: false,
+            vectors: pstore_format::narrow::Vectors {
+                elem: pstore_format::narrow::Elem::F32,
+                tail: 0,
+            },
         }
     );
     // M234: the filter-mask cache's budget.
@@ -180,14 +188,14 @@ async fn an_index_overrides_the_cluster_default_and_says_so() {
     assert_eq!(
         storage(&api).await,
         json!({"block_layout": "rows", "equality_filters": true, "block_aggregates": true,
-               "filter_cache": true, "overrides": {}})
+               "filter_cache": true, "vector_storage": "f32", "overrides": {}})
     );
     assert_eq!(columnar(&store).await, [false]);
 
     let (s, b) = send(&api, "PATCH", "/v1/indexes/t", &patch).await;
     assert_eq!(s, StatusCode::OK, "{b}");
     let want = json!({"block_layout": "columnar", "equality_filters": true,
-                      "block_aggregates": true, "filter_cache": true,
+                      "block_aggregates": true, "filter_cache": true, "vector_storage": "f32",
                       "overrides": {"block_layout": "columnar"}});
     assert_eq!(b["storage"], want);
     assert!(b.get("read_only").is_none(), "{b}");

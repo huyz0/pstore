@@ -2154,6 +2154,15 @@ fn field_width_conflict(
     })
 }
 
+/// `blocks` with each stored vector's f32 tail the components `metric` adds (M289).
+pub(crate) fn with_tail(
+    mut blocks: pstore_format::BlockOptions,
+    metric: Metric,
+) -> pstore_format::BlockOptions {
+    blocks.vectors.tail = u8::try_from(metric.extra()).unwrap_or(u8::MAX);
+    blocks
+}
+
 /// `v` as `metric` stores it (M9d), or `None` when the metric cannot measure it: a zero
 /// vector under cosine has no direction, and -- code review -- a finite vector whose squared
 /// norm overflows `f32` would be stored as zeros under cosine and with a `-inf` component
@@ -3020,12 +3029,20 @@ impl<S: BlobStore> Engine<S> {
 
     /// What `index`'s next sealed segment's blocks are, by `head` (M231): its overrides over
     /// this engine's default.
+    ///
+    /// M289: with the f32 tail of each stored vector the index's metric adds, so a narrow
+    /// field keeps euclidean's extra component exact.
     fn blocks_of(&self, head: &Head, index: &str) -> pstore_format::BlockOptions {
-        head.storage
+        let b = head
+            .storage
             .get(index)
             .copied()
             .unwrap_or_default()
-            .over(self.params.blocks)
+            .over(self.params.blocks);
+        match head.schemas.get(index) {
+            Some(s) => with_tail(b, s.metric),
+            None => b,
+        }
     }
 
     /// Folds without each row's sparse pairs when `write` is false, as a build before M193

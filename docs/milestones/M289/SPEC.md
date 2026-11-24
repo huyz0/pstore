@@ -43,7 +43,8 @@ unchanged; no `D-` or `OQ-` decision is reopened.
   `vector_rows`, `vectors` and `scan`'s inline slices. What they return is f32, so the
   index, the query and the server above them are unchanged.
 - **What a client sees.** Under `f16` or `i8`, a folded row's stored vector is the rounded
-  one: `include_vectors`, exact scores and the rerank are over it; an unfolded row is answered
+  one: `include_vectors`, exact scores and the rerank are over it (under euclidean, the
+  rounded components with the f32 tail of the vector as written); an unfolded row is answered
   from the log, unrounded, as today. Exactly lossless where M195's declared type matches and
   the metric is dot product or euclidean (`[N]f16` under `f16`, `[N]i8` under `i8` or `f16`
   storage of values f16 holds); under cosine the stored vector is normalized and rounding it
@@ -125,3 +126,22 @@ and a byte for each index that sets an override.
 - M289.3: the bench example, `VERIFIED.md`, DELIVERY and remaining rows.
 
 ## Review
+Spec review: by the author, against M231's setting pattern and M195's contract; no reviewer
+subagent was run.
+
+Amended while the tests were written:
+- **i8's exponent is canonical.** The smallest exponent the written vector fits is not always
+  the smallest its decoded vector fits (a component rounding to -64 at `e` fits at `e - 1` as
+  -128 once decoded, i8's range being one wider below), so re-encoding changed the bytes. The
+  writer then doubles the codes and lowers `e` while every code is in -64..=63: the decoded
+  values are unchanged, and the written exponent is the decoded vector's own smallest.
+- **A tail as wide as the vector** (a field of one component under euclidean) stays f32.
+- **i8 has a fallback too** (code review): a field with a component past `2^127` is stored
+  f32 in that segment, as f16's is past its range, since its exponent would reach 122 and a
+  code of 64 decode to `2^128`, infinite in f32.
+- **Under row blocks `GET` answers `vector_storage: f32`** (code review): what the next fold
+  writes, whatever the setting says.
+- **Criterion 3's indexes are patched after their first fold**, since a `PATCH` needs the
+  index to exist: their first segment is f32 and their second narrow, and both answer alike.
+- **A patch value of another type** (`16`, `true`) is `400` as a malformed patch, as M231's
+  settings are; an unknown name is refused naming the setting.

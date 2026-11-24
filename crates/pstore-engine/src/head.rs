@@ -332,6 +332,9 @@ pub struct Storage {
     pub aggregates: Option<bool>,
     /// The server's filter-mask cache for this index's queries (M234).
     pub filter_cache: Option<bool>,
+    /// What its dense vectors are stored as (M289). Kept in a section of its own after the
+    /// overrides' bytes, whose two bits a setting are all taken.
+    pub vectors: Option<pstore_format::narrow::Elem>,
 }
 
 impl Storage {
@@ -348,6 +351,10 @@ impl Storage {
             columnar: self.columnar.unwrap_or(default.columnar),
             equality: self.equality.unwrap_or(default.equality),
             aggregates: self.aggregates.unwrap_or(default.aggregates),
+            vectors: pstore_format::narrow::Vectors {
+                elem: self.vectors.unwrap_or(default.vectors.elem),
+                tail: default.vectors.tail,
+            },
         }
     }
 
@@ -356,6 +363,26 @@ impl Storage {
     #[must_use]
     pub fn filter_cache_over(self, default: bool) -> bool {
         self.filter_cache.unwrap_or(default)
+    }
+
+    /// Its `vectors` code in HEAD's M289 section: 0 unset, 1 f32, 2 f16, 3 i8.
+    fn vectors_code(self) -> u8 {
+        match self.vectors {
+            None => 0,
+            Some(pstore_format::narrow::Elem::F32) => 1,
+            Some(pstore_format::narrow::Elem::F16) => 2,
+            Some(pstore_format::narrow::Elem::I8) => 3,
+        }
+    }
+
+    /// The `vectors` override a set code names; any other is corrupt.
+    fn vectors_of(code: u8) -> Result<pstore_format::narrow::Elem, EngineError> {
+        match code {
+            1 => Ok(pstore_format::narrow::Elem::F32),
+            2 => Ok(pstore_format::narrow::Elem::F16),
+            3 => Ok(pstore_format::narrow::Elem::I8),
+            _ => Err(EngineError::CorruptHead),
+        }
     }
 
     /// Its byte in HEAD: two bits a setting, 0 unset, 1 off, 2 on.
@@ -387,6 +414,7 @@ impl Storage {
             equality: get(2)?,
             aggregates: get(4)?,
             filter_cache: get(6)?,
+            vectors: None,
         })
     }
 }
@@ -836,18 +864,27 @@ impl Head {
             .collect();
         // M231: the storage overrides last, only those of indexes that exist, forcing the
         // progress count (0 when none) and so everything before it.
+        let exists = |n: &String| {
+            self.indexes.contains_key(n)
+                || self.schema_rejects.contains_key(n)
+                || self.quarantine.contains_key(n)
+        };
         let stored: Vec<(&String, u8)> = self
             .storage
             .iter()
-            .filter(|(n, s)| {
-                !s.is_default()
-                    && (self.indexes.contains_key(*n)
-                        || self.schema_rejects.contains_key(*n)
-                        || self.quarantine.contains_key(*n))
-            })
+            .filter(|(n, s)| s.byte() != 0 && exists(n))
             .map(|(n, s)| (n, s.byte()))
             .collect();
-        let progressed = !progress.is_empty() || !stored.is_empty();
+        // M289: the vector storage overrides after them, by the same rule, forcing their
+        // count (0 when none) and so everything before it.
+        let vectored: Vec<(&String, u8)> = self
+            .storage
+            .iter()
+            .filter(|(n, s)| s.vectors.is_some() && exists(n))
+            .map(|(n, s)| (n, s.vectors_code()))
+            .collect();
+        let overridden = !stored.is_empty() || !vectored.is_empty();
+        let progressed = !progress.is_empty() || overridden;
         // M198: the ANN sets before it, written whenever any ref's is known, forcing every
         // count before them.
         let ann = self.indexes.values().flatten().any(|r| r.ann.is_some()) || progressed;
@@ -1093,11 +1130,18 @@ impl Head {
                 put_progress(&mut out, p);
             }
         }
-        if !stored.is_empty() {
+        if overridden {
             out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
             for (name, b) in stored {
                 put_str(&mut out, name);
                 out.push(b);
+            }
+        }
+        if !vectored.is_empty() {
+            out.extend_from_slice(&(vectored.len() as u32).to_le_bytes());
+            for (name, code) in vectored {
+                put_str(&mut out, name);
+                out.push(code);
             }
         }
         out
@@ -1653,6 +1697,18 @@ impl Head {
             let name = c.string()?;
             let s = Storage::from_byte(c.u8()?)?;
             if s.is_default() || h.storage.insert(name, s).is_some() {
+                return Err(EngineError::CorruptHead);
+            }
+        }
+        // M289: and here, no vector storage override.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let e = Storage::vectors_of(c.u8()?)?;
+            let s = h.storage.entry(name).or_default();
+            if s.vectors.replace(e).is_some() {
                 return Err(EngineError::CorruptHead);
             }
         }
@@ -3658,6 +3714,7 @@ mod tests {
             equality: Some(false),
             aggregates: Some(true),
             filter_cache: Some(false),
+            vectors: None,
         };
         // M234: the fourth setting alone, each way.
         let cache_on = Storage {
@@ -3744,12 +3801,14 @@ mod tests {
             columnar: false,
             equality: false,
             aggregates: false,
+            vectors: pstore_format::narrow::Vectors::default(),
         };
         let s = Storage {
             columnar: Some(true),
             equality: None,
             aggregates: Some(false),
             filter_cache: Some(false),
+            vectors: None,
         };
         assert!(!s.filter_cache_over(true));
         assert!(Storage::default().filter_cache_over(true));
@@ -3759,6 +3818,7 @@ mod tests {
                 columnar: true,
                 equality: false,
                 aggregates: false,
+                vectors: pstore_format::narrow::Vectors::default(),
             }
         );
         assert_eq!(
@@ -3767,8 +3827,103 @@ mod tests {
                 columnar: true,
                 equality: true,
                 aggregates: false,
+                vectors: pstore_format::narrow::Vectors::default(),
             }
         );
+    }
+
+    /// M289: a vector storage override round-trips in its own section after M231's, alone or
+    /// beside M231's settings, takes the default's tail, and is refused malformed.
+    #[test]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "offsets computed from the encoding above"
+    )]
+    fn vector_storage_overrides_round_trip_in_their_own_section() -> Result<(), EngineError> {
+        use pstore_format::narrow::{Elem, Vectors};
+        let one = SegmentRef {
+            key: "k".to_owned(),
+            rows: 3,
+            dicts: None,
+            len: None,
+            ann: None,
+        };
+        let d = pstore_format::BlockOptions {
+            vectors: Vectors {
+                elem: Elem::F16,
+                tail: 1,
+            },
+            ..pstore_format::BlockOptions::default()
+        };
+        let i8s = Storage {
+            vectors: Some(Elem::I8),
+            ..Storage::default()
+        };
+        assert_eq!(
+            i8s.over(d).vectors,
+            Vectors {
+                elem: Elem::I8,
+                tail: 1
+            }
+        );
+        assert_eq!(Storage::default().over(d).vectors, d.vectors);
+        let both = Storage {
+            columnar: Some(false),
+            vectors: Some(Elem::F32),
+            ..Storage::default()
+        };
+        for base in [Head::default(), sample(), every_section()] {
+            let mut plain = base.clone();
+            plain.indexes.insert("idx".to_owned(), vec![one.clone()]);
+            plain.indexes.insert("other".to_owned(), vec![one.clone()]);
+            for s in [
+                i8s,
+                both,
+                Storage {
+                    vectors: Some(Elem::F16),
+                    ..Storage::default()
+                },
+            ] {
+                let mut with = plain.clone();
+                with.storage.insert("idx".to_owned(), s);
+                let bytes = with.encode();
+                assert_eq!(Head::decode(&bytes)?, with);
+                // Its own section: the last byte is the code, after M231's (maybe empty) one.
+                assert_eq!(*bytes.last().unwrap_or(&0), s.vectors_code());
+                with.storage.insert("other".to_owned(), both);
+                assert_eq!(Head::decode(&with.encode())?, with);
+            }
+            // An index HEAD does not hold writes nothing.
+            let mut ghost = plain.clone();
+            ghost.storage.insert("gone".to_owned(), i8s);
+            assert_eq!(hex(&ghost.encode()), hex(&plain.encode()));
+            // Malformed: an unset or unknown code, a name twice, a trailing byte.
+            let mut with = plain.clone();
+            with.storage.insert("idx".to_owned(), i8s);
+            let bytes = with.encode();
+            let at = bytes.len() - 1;
+            for bad in [0u8, 4, 0xff] {
+                let mut b = bytes.clone();
+                b[at] = bad;
+                assert!(Head::decode(&b).is_err(), "code {bad:#x}");
+            }
+            let entry = {
+                let mut e = Vec::new();
+                put_str(&mut e, "idx");
+                e.push(3);
+                e
+            };
+            let count_at = bytes.len() - entry.len() - 4;
+            let mut twice = bytes[..count_at].to_vec();
+            twice.extend_from_slice(&2_u32.to_le_bytes());
+            twice.extend_from_slice(&entry);
+            twice.extend_from_slice(&entry);
+            assert!(Head::decode(&twice).is_err(), "a name twice");
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+        }
+        Ok(())
     }
 
     /// M194 criterion 3: a copy `record_copy` evicts takes its times with it.

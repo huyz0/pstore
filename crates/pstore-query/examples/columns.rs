@@ -205,6 +205,7 @@ const ARMS: &[Arm] = &[
             columnar: false,
             equality: false,
             aggregates: false,
+            vectors: pstore_format::narrow::Vectors::default(),
         })
     }),
     ("M230 (row blocks, equality section)", |w| {
@@ -212,6 +213,7 @@ const ARMS: &[Arm] = &[
             columnar: false,
             equality: true,
             aggregates: false,
+            vectors: pstore_format::narrow::Vectors::default(),
         })
     }),
     ("M231 (columnar blocks)", |w| {

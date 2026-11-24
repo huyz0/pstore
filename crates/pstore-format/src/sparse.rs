@@ -646,7 +646,7 @@ fn read_impact(b: &[u8], max: f32, encoding: ImpactEncoding) -> f32 {
     clippy::cast_possible_truncation,
     reason = "every truncation here is a deliberate field width"
 )]
-fn f32_to_f16(x: f32) -> u16 {
+pub(crate) fn f32_to_f16(x: f32) -> u16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
@@ -686,7 +686,7 @@ fn f32_to_f16(x: f32) -> u16 {
     sign | ((e as u16) << 10) | ((rounded >> 13) & 0x3ff) as u16
 }
 
-fn f16_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = u32::from(h & 0x8000) << 16;
     let exp = u32::from((h >> 10) & 0x1f);
     let mant = u32::from(h & 0x3ff);

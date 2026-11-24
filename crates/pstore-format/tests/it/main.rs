@@ -22,6 +22,7 @@ mod k3;
 mod lance;
 mod lance21;
 mod multi_text;
+mod narrow;
 mod parquet;
 mod parquet_write;
 mod pre_tokenized;
