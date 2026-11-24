@@ -26,6 +26,7 @@ pub mod fde;
 pub mod geo;
 pub mod id;
 pub mod lance;
+pub mod narrow;
 pub mod parquet;
 mod reader;
 mod shared;
@@ -180,6 +181,49 @@ pub struct FieldLayout {
     pub rabitq: u16,
     /// Which section id carries its int8 codes.
     pub sq8: u16,
+    /// What its full precision components are stored as (M289): f32 for a sparse field and
+    /// every field before M289. On disk a narrow field's `kind` is [`narrow::Elem::kind`]'s
+    /// code and its `metric` byte its [`Self::tail`]; in memory `kind` stays 0, dense.
+    pub elem: narrow::Elem,
+    /// How many of each vector's last components are f32 under a narrow `elem` (M289).
+    pub tail: u8,
+}
+
+impl FieldLayout {
+    /// The bytes one of its vectors takes in its section (M289): `dims * 4` for f32.
+    #[must_use]
+    pub fn vector_len(&self) -> usize {
+        narrow::vector_len(self.elem, self.dims as usize, usize::from(self.tail))
+    }
+
+    /// One of its vectors back from exactly [`Self::vector_len`] bytes.
+    ///
+    /// # Errors
+    /// [`FormatError::Corrupt`] for another length or an i8 exponent out of range.
+    pub fn decode_vector(&self, raw: &[u8]) -> Result<Vec<f32>, FormatError> {
+        narrow::decode(self.elem, raw, self.dims as usize, usize::from(self.tail))
+            .ok_or(FormatError::Corrupt("a narrow vector"))
+    }
+
+    /// Its vectors back from `raw`, whole vectors of [`Self::vector_len`] bytes each; a
+    /// trailing partial vector is dropped, as [`decode_vectors`] drops one.
+    ///
+    /// # Errors
+    /// As [`Self::decode_vector`].
+    pub fn decode_vectors(&self, raw: &[u8]) -> Result<Vec<Vec<f32>>, FormatError> {
+        // Zero only for a field of no dimensions: a narrow one has at least one (the reader
+        // refuses a tail as wide as the vector).
+        let width = self.vector_len();
+        if width == 0 {
+            return Ok(Vec::new());
+        }
+        if self.elem == narrow::Elem::F32 {
+            return Ok(decode_vectors(raw, self.dims as usize));
+        }
+        raw.chunks_exact(width)
+            .map(|v| self.decode_vector(v))
+            .collect()
+    }
 }
 
 /// The index section's length, read from a segment's footer.
@@ -238,6 +282,13 @@ pub(crate) const VERSION_TYPED: u16 = 2;
 /// ⚠️ **A version, for VERSION_TYPED's reason**: a reader before M231 must refuse it at
 /// `open`, since it would read a columnar block as rows and fail or, worse, misread one.
 pub(crate) const VERSION_COLUMNAR: u16 = 3;
+/// A columnar segment (version 3's layout) with at least one dense field stored f16 or i8
+/// (M289), whose Fields table holds kinds 2 and 3.
+///
+/// ⚠️ **A version, for VERSION_TYPED's reason**: a reader before M289 reads the Fields table
+/// without checking a kind, and would slice an f16 section as f32s. Under version 4 it
+/// refuses at `open`. A segment with no narrow field stays version 3, byte for byte.
+pub(crate) const VERSION_NARROW: u16 = 4;
 
 /// An attribute value.
 ///

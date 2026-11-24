@@ -1792,8 +1792,9 @@ impl<S: BlobStore> Engine<S> {
                 &schema.fts,
                 &schema.texts,
                 &schema.trigram,
-                // M231: a reindex writes a new index, which overrides nothing yet.
-                self.params.blocks,
+                // M231: a reindex writes a new index, which overrides nothing yet; M289: with
+                // the f32 tail its metric adds.
+                crate::with_tail(self.params.blocks, schema.metric),
             )
             .await;
         written

@@ -1918,10 +1918,9 @@ pub(crate) async fn read_spans<S: BlobStore>(
                             pstore_format::sparse::decode_pairs(&raw)
                                 .ok_or(FormatError::Corrupt("sparse rows"))?,
                         ),
-                        f => pstore_format::VectorField::Dense(pstore_format::decode_vectors(
-                            &raw,
-                            f.map_or(0, |f| f.dims as usize),
-                        )),
+                        // M289: by the field's layout, narrow or f32.
+                        Some(f) => pstore_format::VectorField::Dense(f.decode_vectors(&raw)?),
+                        None => pstore_format::VectorField::Dense(Vec::new()),
                     };
                     out.push(((i, row), name.clone(), field));
                 }

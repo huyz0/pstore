@@ -60,6 +60,10 @@ pub struct BlockOptions {
     pub equality: bool,
     /// The `Aggregates` section: an aggregation reads a whole block's count and sum (M232).
     pub aggregates: bool,
+    /// What dense vectors are stored as (M289). Narrow only in a columnar segment: row
+    /// blocks are the layout a binary before M231 reads, and one before M289 could not read
+    /// a narrow field, so under them every field stays f32.
+    pub vectors: crate::narrow::Vectors,
 }
 
 impl Default for BlockOptions {
@@ -68,6 +72,7 @@ impl Default for BlockOptions {
             columnar: true,
             equality: true,
             aggregates: true,
+            vectors: crate::narrow::Vectors::default(),
         }
     }
 }
@@ -527,6 +532,8 @@ impl SegmentWriter {
                     vectors: Section::SparsePostings as u16,
                     rabitq: 0,
                     sq8: 0,
+                    elem: crate::narrow::Elem::F32,
+                    tail: 0,
                 });
                 continue;
             }
@@ -551,6 +558,34 @@ impl SegmentWriter {
                 continue;
             }
             fi += 1;
+            // M289: the element type, narrow only where every reader that can open this
+            // segment decodes it, and f16 only where every component is finite as one.
+            let tail = usize::from(self.options.vectors.tail).min(dims);
+            let elem = match self.options.vectors.elem {
+                _ if !self.options.columnar || !self.write_fields || tail >= dims => {
+                    crate::narrow::Elem::F32
+                }
+                crate::narrow::Elem::F16
+                    if !crate::narrow::fits_f16(
+                        docs.iter()
+                            .flat_map(|d| d.field(name).iter().map(Vec::as_slice)),
+                        tail,
+                    ) =>
+                {
+                    crate::narrow::Elem::F32
+                }
+                crate::narrow::Elem::I8
+                    if !crate::narrow::fits_i8(
+                        docs.iter()
+                            .flat_map(|d| d.field(name).iter().map(Vec::as_slice)),
+                        tail,
+                    ) =>
+                {
+                    crate::narrow::Elem::F32
+                }
+                e => e,
+            };
+            let width = crate::narrow::vector_len(elem, dims, tail);
             // Fixed width when every row holds exactly one vector, which is the dense case
             // and the one worth keeping cheap.
             let per_row = if docs.iter().all(|d| d.field(name).len() == 1) {
@@ -560,7 +595,7 @@ impl SegmentWriter {
             };
             let mut body: Vec<u8> = Vec::with_capacity(
                 docs.iter()
-                    .map(|d| d.field(name).len() * dims * 4)
+                    .map(|d| d.field(name).len() * width)
                     .sum::<usize>()
                     + if per_row == 0 {
                         (docs.len() + 1) * 8
@@ -575,7 +610,7 @@ impl SegmentWriter {
                 let mut offsets: Vec<u64> = Vec::with_capacity(docs.len() + 1);
                 for d in &docs {
                     offsets.push(at);
-                    at += (d.field(name).len() * dims * 4) as u64;
+                    at += (d.field(name).len() * width) as u64;
                 }
                 offsets.push(at);
                 for o in &offsets {
@@ -584,9 +619,7 @@ impl SegmentWriter {
             }
             for d in &docs {
                 for v in d.field(name) {
-                    for j in 0..dims {
-                        body.extend_from_slice(&v.get(j).copied().unwrap_or(0.0).to_le_bytes());
-                    }
+                    crate::narrow::encode(elem, v, dims, tail, &mut body);
                 }
             }
             match fi {
@@ -615,8 +648,15 @@ impl SegmentWriter {
                 } else {
                     0
                 },
+                elem,
+                tail: if elem == crate::narrow::Elem::F32 {
+                    0
+                } else {
+                    u8::try_from(tail).unwrap_or(u8::MAX)
+                },
             });
         }
+        let narrowed = fields.iter().any(|f| f.elem != crate::narrow::Elem::F32);
         // The meta region: directory first, then the block index, checksummed together and
         // addressed by the footer as one span. One suffix read brings back the footer and,
         // for any segment the writer produced, this whole region.
@@ -631,8 +671,15 @@ impl SegmentWriter {
             t.u32(fields.len() as u32);
             for f in &fields {
                 t.bytes(f.name.as_bytes());
-                t.u8(f.kind);
-                t.u8(f.metric);
+                // M289: a narrow field's kind names its element type, and its metric byte
+                // holds its f32 tail; an f32 field's are written as before.
+                if f.elem == crate::narrow::Elem::F32 {
+                    t.u8(f.kind);
+                    t.u8(f.metric);
+                } else {
+                    t.u8(f.elem.kind());
+                    t.u8(f.tail);
+                }
                 t.u32(f.dims);
                 t.u32(f.per_row);
                 t.u16(f.vectors);
@@ -916,7 +963,9 @@ impl SegmentWriter {
         // The footer is last and fixed-width, so `Range: -N` finds it without knowing the
         // object's length -- which is what makes an open possible from the key alone.
         out.raw(MAGIC);
-        out.u16(if self.options.columnar {
+        out.u16(if narrowed {
+            crate::VERSION_NARROW
+        } else if self.options.columnar {
             crate::VERSION_COLUMNAR
         } else if self.typed {
             crate::VERSION_TYPED

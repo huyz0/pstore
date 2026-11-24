@@ -79,6 +79,10 @@ async fn pair() -> (E, E) {
             columnar,
             equality: true,
             aggregates: false,
+            vectors: pstore_format::narrow::Vectors {
+                elem: pstore_format::narrow::Elem::F32,
+                tail: 0,
+            },
         })
     };
     let (late, whole) = (make(true), make(false));

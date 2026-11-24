@@ -135,6 +135,7 @@ mod upsert;
 mod upsert_columns;
 mod uuid_bytes;
 mod vector_search;
+mod vector_storage;
 mod vector_types;
 mod vectors_multi;
 mod vectors_named;
