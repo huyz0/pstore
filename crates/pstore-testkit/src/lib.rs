@@ -15,6 +15,7 @@ pub mod fake_s3;
 pub mod flaky;
 pub mod gated;
 pub mod no_suffix;
+pub mod ports;
 pub mod racy;
 pub mod sim;
 pub mod sweep;

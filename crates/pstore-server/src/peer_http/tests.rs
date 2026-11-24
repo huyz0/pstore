@@ -18,18 +18,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
-/// A TCP listener and a UDP socket on one free port, as a peer serves both. ⚠️ Binding UDP to
-/// whatever port TCP was given raced any other socket holding that number, and the unwrap
-/// failed with `AddrInUse` in CI; a port whose UDP half is taken is skipped instead, as
-/// `tests/it/peers.rs` already does.
+/// A TCP listener and a UDP socket on one free port, as a peer serves both: the shared search
+/// (M273), which holds each refused port so Windows does not hand it out again.
 pub(crate) async fn same_port() -> (tokio::net::TcpListener, std::net::UdpSocket) {
-    for _ in 0..64 {
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        if let Ok(udp) = std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
-            return (tcp, udp);
-        }
-    }
-    panic!("no port free for both TCP and UDP in 64 tries");
+    pstore_testkit::ports::same_port_tokio()
 }
 
 #[test]

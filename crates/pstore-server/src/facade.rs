@@ -7,6 +7,9 @@
 //!
 //! The shapes are the pinned SDK's, `turbopuffer` 3.1.0 (`types/namespace_*`). What the
 //! facade does not translate yet is refused naming the key, never ignored.
+//!
+//! M274: a conditional or by-filter write is two native calls, as a native client keying it
+//! makes them: the idempotency key's issue (M132), then the keyed write.
 
 use crate::auth::Principal;
 use crate::{Api, ApiError, ListParams};
@@ -227,6 +230,10 @@ fn translated_write(mut o: Map<String, Value>) -> Result<Value, ApiError> {
     }
     // A hint with no pstore meaning: pstore bounds buffered rows, not unfolded backlog.
     o.remove("disable_backpressure");
+    // M275: the vendor's type names as the native ones.
+    if let Some(schema) = o.remove("schema") {
+        out.insert("schema".into(), schema_declarations(schema));
+    }
     for (k, v) in o {
         if !WRITE_PASSED.contains(&k.as_str()) {
             return Err(bad(format!(
@@ -589,9 +596,130 @@ pub(crate) fn metadata_answer(native: &Value) -> Value {
             .unwrap_or_else(|| json!(0)),
         "created_at": native["created_at"],
         "updated_at": native["updated_at"],
-        "schema": native.pointer("/schema/attributes").cloned().unwrap_or(Value::Null),
+        "schema": schema_answer(native),
         "index": if updating { json!({"status": "updating"}) } else { json!({"status": "up-to-date"}) },
     })
+}
+
+/// A recorded attribute type's vendor name (M275): `uint64` is the vendor's `uint`; the rest
+/// share a name. A recorded type holds scalars and arrays of them alike, so it is answered as
+/// the scalar's name.
+fn vendor_type(native: &str) -> &str {
+    match native {
+        "uint64" => "uint",
+        other => other,
+    }
+}
+
+/// A vendor attribute type as the native declaration (M275): `uint` is `uint64`, and an array
+/// of a recordable kind is that kind, which holds arrays of it (M175). Any other name is
+/// passed as written, for the native write to accept or refuse.
+fn native_type(vendor: &str) -> &str {
+    match vendor.strip_prefix("[]").unwrap_or(vendor) {
+        "uint" => "uint64",
+        k @ ("uuid" | "datetime") => k,
+        _ => vendor,
+    }
+}
+
+/// The vendor's write `schema` with its type names as the native ones (M275): a name's value,
+/// or an object's `type`.
+fn schema_declarations(schema: Value) -> Value {
+    let Value::Object(m) = schema else {
+        return schema;
+    };
+    let named = |v: Value| match v {
+        Value::String(t) => Value::String(native_type(&t).to_owned()),
+        // `ann: true` is what pstore does by rule for every dense field (M198), so it asks for
+        // nothing; any other `ann` is passed, for the native write to refuse.
+        Value::Object(mut o) if o.get("ann") == Some(&Value::Bool(true)) => {
+            o.remove("ann");
+            named_object(o)
+        }
+        Value::Object(o) => named_object(o),
+        v => v,
+    };
+    Value::Object(m.into_iter().map(|(k, v)| (k, named(v))).collect())
+}
+
+/// [`schema_declarations`]' object form: `{"type": t}` alone is the native `t`, which declares
+/// a type only by its name; any other object keeps its keys, its `type` renamed.
+fn named_object(mut o: Map<String, Value>) -> Value {
+    match o.get("type") {
+        Some(Value::String(t)) if o.len() == 1 => Value::String(native_type(t).to_owned()),
+        Some(Value::String(t)) => {
+            let t = native_type(t).to_owned();
+            o.insert("type".into(), t.into());
+            Value::Object(o)
+        }
+        _ => Value::Object(o),
+    }
+}
+
+/// The native summary's `schema` as the vendor's (M275): every declaration pstore records,
+/// with no request of its own. Each dense field is typed `[N]f32`, `[N]f16` or `[N]i8` and
+/// ANN-indexed by rule (M198) under the index's metric; each text field carries its analyzer,
+/// and no `type`, since pstore does not record whether it holds strings or string arrays; a
+/// regex attribute `regex: true`; a recorded attribute its type; and `id` its kind. `null`
+/// before the first fold records a schema.
+pub(crate) fn schema_answer(native: &Value) -> Value {
+    let Some(sc) = native.get("schema").filter(|s| s.is_object()) else {
+        return Value::Null;
+    };
+    let mut out = Map::new();
+    let entry = |out: &mut Map<String, Value>, name: &str, k: &str, v: Value| {
+        if let Value::Object(e) = out
+            .entry(name.to_owned())
+            .or_insert_with(|| Value::Object(Map::new()))
+        {
+            e.insert(k.to_owned(), v);
+        }
+    };
+    let metric = sc["distance_metric"].clone();
+    let vector_type = |name: &str, width: &Value| {
+        sc.pointer(&format!("/vector_types/{name}"))
+            .cloned()
+            .unwrap_or_else(|| format!("[{width}]f32").into())
+    };
+    let dims = &sc["dims"];
+    if dims.as_u64().is_some_and(|d| d > 0) {
+        entry(&mut out, "vector", "type", vector_type("vector", dims));
+        entry(
+            &mut out,
+            "vector",
+            "ann",
+            json!({"distance_metric": metric}),
+        );
+    }
+    for (name, width) in sc["vectors"].as_object().into_iter().flatten() {
+        entry(&mut out, name, "type", vector_type(name, width));
+        entry(&mut out, name, "ann", json!({"distance_metric": metric}));
+    }
+    if let Some(text) = sc["text_field"].as_str().filter(|t| !t.is_empty()) {
+        entry(
+            &mut out,
+            text,
+            "full_text_search",
+            sc["full_text_search"].clone(),
+        );
+    }
+    for (name, fts) in sc["text_fields"].as_object().into_iter().flatten() {
+        entry(&mut out, name, "full_text_search", fts.clone());
+    }
+    for name in sc["regex"].as_array().into_iter().flatten() {
+        if let Some(name) = name.as_str() {
+            entry(&mut out, name, "regex", true.into());
+        }
+    }
+    for (name, ty) in sc["attributes"].as_object().into_iter().flatten() {
+        if let Some(ty) = ty.as_str() {
+            entry(&mut out, name, "type", vendor_type(ty).into());
+        }
+    }
+    if let Some(id) = sc["id"].as_str() {
+        entry(&mut out, "id", "type", vendor_type(id).into());
+    }
+    Value::Object(out)
 }
 
 /// A native list's answer as the vendor's.
@@ -831,6 +959,145 @@ pub(crate) async fn list<S: BlobStore + 'static>(
     translate(answer, |v| list_answer(&v)).await
 }
 
+/// The SDK's attempt number (M274): `x-stainless-retry-count`, `0` on a first attempt. A
+/// request without it, or with one that is not a number, is a first attempt.
+fn attempt_of(headers: &HeaderMap) -> u64 {
+    headers
+        .get("x-stainless-retry-count")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The most first attempts a server remembers (M274).
+pub(crate) const ATTEMPTS_MAX: usize = 4096;
+
+/// The idempotency keys this server gave first attempts of conditional and by-filter writes
+/// (M274), by two keyed 64-bit hashes of tenant, namespace and body; oldest evicted first.
+pub(crate) struct Attempts {
+    hashers: [std::hash::RandomState; 2],
+    inner: std::sync::Mutex<AttemptsInner>,
+}
+
+/// Two independently keyed 64-bit hashes: 128 bits, kept apart so no arithmetic packs them.
+type Digest = [u64; 2];
+
+#[derive(Default)]
+struct AttemptsInner {
+    keys: HashMap<Digest, String>,
+    order: std::collections::VecDeque<Digest>,
+}
+
+impl Default for Attempts {
+    fn default() -> Self {
+        Self {
+            hashers: [std::hash::RandomState::new(), std::hash::RandomState::new()],
+            inner: std::sync::Mutex::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Attempts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attempts")
+            .field("remembered", &self.lock().order.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Attempts {
+    /// The body's hash: two independently keyed 64-bit hashes of tenant, namespace and bytes.
+    fn digest(&self, tenant: u128, ns: &str, body: &[u8]) -> Digest {
+        use std::hash::BuildHasher;
+        self.hashers
+            .each_ref()
+            .map(|s| s.hash_one((tenant, ns, body)))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, AttemptsInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Remembers `key` for `digest`, evicting the oldest past [`ATTEMPTS_MAX`].
+    fn remember(&self, digest: Digest, key: String) {
+        let mut m = self.lock();
+        if m.keys.insert(digest, key).is_none() {
+            m.order.push_back(digest);
+        }
+        // One in at most, so one out at most: no loop a mutant can make endless.
+        if m.order.len() > ATTEMPTS_MAX
+            && let Some(old) = m.order.pop_front()
+        {
+            m.keys.remove(&old);
+        }
+    }
+
+    fn key(&self, digest: Digest) -> Option<String> {
+        self.lock().keys.get(&digest).cloned()
+    }
+}
+
+/// Whether a native write is evaluated against the rows at its fold (M274): a condition or a
+/// by-filter operation. A resend of any other writes the same rows.
+fn evaluated(native: &Value) -> bool {
+    WRITE_APPLIED
+        .iter()
+        .any(|k| native.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+/// `native` with the idempotency key its attempt needs (M274): a first attempt's fresh key,
+/// remembered; a resend's remembered one; or a refusal when a resend cannot be matched.
+async fn keyed<S: BlobStore + 'static>(
+    api: &Api<S>,
+    ns: &str,
+    headers: &HeaderMap,
+    attempt: u64,
+    body: &[u8],
+    mut native: Value,
+) -> Result<Value, ApiError> {
+    if !evaluated(&native) {
+        return Ok(native);
+    }
+    let tenant = crate::tenant_of(headers)?;
+    let keys = api.registry_mut().idempotency;
+    let digest = api.attempts.digest(tenant.0, ns, body);
+    let key = if attempt == 0 {
+        if !keys {
+            return Ok(native);
+        }
+        let random = crate::operation_id()?.0;
+        let key = api.engine(tenant).await.idempotency_key(random).await?;
+        api.attempts.remember(digest, key.to_string());
+        key.to_string()
+    } else {
+        match api.attempts.key(digest).filter(|_| keys) {
+            Some(key) => key,
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "retry_outcome_unknown",
+                    format!(
+                        "this is resend {attempt} of a conditional or by-filter write whose \
+                         first attempt this server cannot match{}; it may have applied, so \
+                         read the rows, then call again",
+                        if keys {
+                            ""
+                        } else {
+                            " (idempotency keys are off: PSTORE_APPLIED_WRITES=3)"
+                        }
+                    ),
+                ));
+            }
+        }
+    };
+    if let Value::Object(m) = &mut native {
+        m.insert("idempotency_key".into(), key.into());
+    }
+    Ok(native)
+}
+
 /// `POST /v2/namespaces/{ns}`: a write.
 pub(crate) async fn write<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
@@ -839,7 +1106,14 @@ pub(crate) async fn write<S: BlobStore + 'static>(
     axum::Extension(principal): axum::Extension<Principal>,
     body: Bytes,
 ) -> Response {
+    let attempt = attempt_of(&headers);
     let prepared = identity(&principal, headers).and_then(|h| write_body(&body).map(|b| (h, b)));
+    let prepared = match prepared {
+        Ok((h, native)) => keyed(&api, &ns, &h, attempt, &body, native)
+            .await
+            .map(|n| (h, n)),
+        Err(e) => Err(e),
+    };
     let answer = match prepared {
         Ok((headers, native)) => {
             crate::write_documents(
@@ -1113,6 +1387,38 @@ pub(crate) async fn poll_copy<S: BlobStore + 'static>(
 mod tests {
     use super::*;
 
+    /// M274: at most [`ATTEMPTS_MAX`] remembered, the oldest evicted first; a body's digest is
+    /// its tenant's and namespace's too.
+    #[test]
+    fn the_attempt_memory_is_bounded() {
+        let a = Attempts::default();
+        let d = |i: usize| a.digest(7, "docs", i.to_string().as_bytes());
+        for i in 0..ATTEMPTS_MAX {
+            a.remember(d(i), format!("k{i}"));
+        }
+        assert_eq!(a.key(d(0)).as_deref(), Some("k0"));
+        // Remembering a body again replaces its key without taking a second place.
+        a.remember(d(1), "k1'".to_owned());
+        a.remember(d(ATTEMPTS_MAX), "new".to_owned());
+        assert_eq!(a.key(d(0)), None, "the oldest evicted");
+        assert_eq!(a.key(d(1)).as_deref(), Some("k1'"));
+        assert_eq!(
+            a.key(d(ATTEMPTS_MAX)).as_deref(),
+            Some("new"),
+            "the newest kept"
+        );
+        assert_eq!(a.lock().keys.len(), ATTEMPTS_MAX);
+        assert_eq!(a.lock().order.len(), ATTEMPTS_MAX);
+        assert_ne!(d(1), a.digest(8, "docs", b"1"), "another tenant");
+        assert_ne!(d(1), a.digest(7, "other", b"1"), "another namespace");
+        assert_eq!(attempt_of(&HeaderMap::new()), 0);
+        let mut h = HeaderMap::new();
+        h.insert("x-stainless-retry-count", HeaderValue::from_static("3"));
+        assert_eq!(attempt_of(&h), 3);
+        h.insert("x-stainless-retry-count", HeaderValue::from_static("x"));
+        assert_eq!(attempt_of(&h), 0);
+    }
+
     fn query(body: &Value) -> Value {
         query_body(body.to_string().as_bytes()).unwrap()
     }
@@ -1331,5 +1637,24 @@ mod tests {
                 .as_bytes(),
         );
         assert!(refused.is_err(), "{refused:?}");
+    }
+
+    /// M275: only `ann: true` is dropped, as asking for nothing; any other `ann` reaches the
+    /// native write, which refuses it.
+    #[test]
+    fn only_a_true_ann_is_dropped() {
+        let out = schema_declarations(json!({
+            "v": {"type": "[3]f32", "ann": true},
+            "w": {"type": "[3]f32", "ann": false},
+            "n": {"type": "uint", "ann": {"distance_metric": "cosine_distance"}},
+        }));
+        assert_eq!(
+            out,
+            json!({
+                "v": "[3]f32",
+                "w": {"type": "[3]f32", "ann": false},
+                "n": {"type": "uint64", "ann": {"distance_metric": "cosine_distance"}},
+            })
+        );
     }
 }
