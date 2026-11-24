@@ -818,16 +818,16 @@ impl Segment {
             .collect()
     }
 
-    /// One row of the legacy `Vectors` section, by the layout of the field it holds: f32
-    /// unless that field is stored narrow (M289).
+    /// One row of the legacy `Vectors` section, by the layout of the field it holds (M289),
+    /// or f32 in a segment without a Fields table.
     fn decode_row(&self, raw: &[u8]) -> Result<Vec<f32>, FormatError> {
         match self
             .fields
             .iter()
-            .find(|f| f.kind == 0 && f.vectors == Section::Vectors as u16)
+            .find(|f| f.vectors == Section::Vectors as u16)
         {
-            Some(f) if f.elem != crate::narrow::Elem::F32 => f.decode_vector(raw),
-            _ => Ok(raw
+            Some(f) => f.decode_vector(raw),
+            None => Ok(raw
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
                 .collect()),

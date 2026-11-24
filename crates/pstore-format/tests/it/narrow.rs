@@ -211,11 +211,25 @@ async fn a_field_its_type_cannot_hold_stays_f32_in_that_segment() {
         "named".into(),
         VectorField::dense(vec![1.0, 65_520.0, 2.0, 3.0]),
     );
+    // And in the varying field: `vector` alone narrow.
+    docs[4].vectors.insert(
+        "multi".into(),
+        VectorField::Dense(vec![vec![70_000.0, 0.0, 0.0]]),
+    );
     let bytes = seal(&docs, options(Elem::F16, true));
     assert_eq!(version(&bytes), 4);
     let (s, key, seg) = open(bytes).await;
     assert_eq!(seg.field_layout("named").unwrap().elem, Elem::F32);
+    assert_eq!(seg.field_layout("multi").unwrap().elem, Elem::F32);
     assert_eq!(seg.field_layout(DEFAULT_FIELD).unwrap().elem, Elem::F16);
+    // The legacy readers decode `vector` by its own layout, not another field's.
+    let rows = seg.vector_rows(&s, &key, &[0, 7]).await.unwrap();
+    for r in [0usize, 7] {
+        assert_eq!(
+            vec![rows[&r].clone()],
+            expect(Elem::F16, &docs[r], DEFAULT_FIELD)
+        );
+    }
     let named = seg.field_vectors(&s, &key, "named").await.unwrap();
     assert_eq!(named[3], [vec![1.0, 65_520.0, 2.0, 3.0]]);
     // Alone, no field is narrow, and the segment is version 3.

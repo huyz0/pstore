@@ -215,26 +215,26 @@ fn fits(v: &[f32], e: i8) -> bool {
     v.iter().all(|x| (-128.0..=127.0).contains(&scaled(*x, e)))
 }
 
-/// The smallest exponent in `-127..=127` every component fits under. `fits` is monotone in
-/// `e`, so a guess from the largest magnitude is stepped down while the next fits and up
-/// while it does not.
+/// The smallest exponent in `-127..=127` every component fits under. The guess from the
+/// largest magnitude `m`, `ceil(log2(m / 127))`, always fits (`m / 2^guess <= 127`; below
+/// `127 * 2^-127`, and for a zero vector, whose `log2` is minus infinity, the clamp to -127
+/// is smaller still), and `m / 2^(guess - 2) > 254` never does, so only the next exponent
+/// down can also fit, where a component rounds to 127 or the least is -128. `fits` is
+/// monotone in `e`; the second step down is tried only as a margin for `log2`'s rounding.
+/// (`fits_i8` has refused a component that is not finite or past `2^127`.)
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the guess is clamped to -127..=127 first"
 )]
 pub(crate) fn exponent(v: &[f32]) -> i8 {
     let m = v.iter().map(|x| f64::from(x.abs())).fold(0.0f64, f64::max);
-    let guess = if m > 0.0 && m.is_finite() {
-        (m / 127.0).log2().ceil().clamp(-127.0, 127.0) as i8
-    } else {
-        -127
-    };
+    let guess = (m / 127.0).log2().ceil().clamp(-127.0, 127.0) as i8;
     let mut e = guess;
-    while e < 127 && !fits(v, e) {
-        e += 1;
-    }
-    while e > -127 && fits(v, e - 1) {
-        e -= 1;
+    for c in (-127..guess).rev().take(2) {
+        if !fits(v, c) {
+            break;
+        }
+        e = c;
     }
     e
 }

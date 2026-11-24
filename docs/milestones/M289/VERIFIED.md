@@ -13,6 +13,17 @@ failing there. Instead each mutation below was applied one at a time by a script
 of its crate run, and the source restored: **13 of 13 killed**. No `cargo mutants` run is
 claimed; CI's incremental mutants job on the PR is the gate.
 
+CI's first mutants run found four survivors, fixed in the PR: the exponent's step-down
+loop, under `-=` to `/=`, never ended (a timeout), so it tries at most two exponents
+below the guess from the largest magnitude, which always fits, and the step-up loop is gone
+(a guess made too large, `m * 127`, is now caught where the walk down used to repair it);
+the legacy row reader's `f32` guard and its `kind == 0 &&` matched an equivalent
+path, so it decodes by the `Vectors` field's layout whatever its type, and
+`a_field_its_type_cannot_hold_stays_f32_in_that_segment` reads `vector`'s rows while the
+other fields are f32; and `decode_vectors`' `dims == 0 ||` beside `width == 0`, the same
+test, is gone. Each of the four mutations, applied by hand, is now caught or
+cannot be written.
+
 - i8 ties rounded away from even; the canonical exponent loop removed; the exponent
   stepped down two at a time; the exponent check at `i8::MAX` instead of `i8::MIN`; f16's
   overflow fallback removed (`narrow.rs`).
@@ -61,7 +72,7 @@ claimed; CI's incremental mutants job on the PR is the gate.
    weakened. The two full-object `storage` answers in `storage::an_index_overrides_the_cluster_default_and_says_so`
    gained the new `"vector_storage": "f32"` member, and struct literals of `BlockOptions` and
    `Storage` in tests gained the new field at its old-behaviour value. The workspace suite,
-   without M127's two IPv6 tests the container cannot run: 3,048 passed, 0 failed.
+   without M127's two IPv6 tests the container cannot run: 3,050 passed, 0 failed.
    No request or round is added (no read path issues a new range), so `scripts/depth.sh` is
    not re-run here; CI runs it.
 6. The bench, below: `cargo run --release -p pstore-index --example vector_storage`.

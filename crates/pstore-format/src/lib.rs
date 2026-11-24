@@ -211,8 +211,10 @@ impl FieldLayout {
     /// # Errors
     /// As [`Self::decode_vector`].
     pub fn decode_vectors(&self, raw: &[u8]) -> Result<Vec<Vec<f32>>, FormatError> {
+        // Zero only for a field of no dimensions: a narrow one has at least one (the reader
+        // refuses a tail as wide as the vector).
         let width = self.vector_len();
-        if self.dims == 0 || width == 0 {
+        if width == 0 {
             return Ok(Vec::new());
         }
         if self.elem == narrow::Elem::F32 {
